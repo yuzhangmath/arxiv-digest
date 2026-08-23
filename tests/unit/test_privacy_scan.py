@@ -789,18 +789,18 @@ def test_history_scan_checks_every_commit_tree_path_alias(tmp_path: Path) -> Non
     for directory in ("a-copy", "z-distinctive-copy"):
         (public / directory / "notes.txt").write_text("public", encoding="utf-8")
     subprocess.run(("git", "init", "-q"), cwd=public, check=True)
+    for key, value in (
+        ("user.name", "Public Fixture"),
+        ("user.email", "public@example.invalid"),
+    ):
+        subprocess.run(
+            ("git", "config", "--local", key, value),
+            cwd=public,
+            check=True,
+        )
     subprocess.run(("git", "add", "."), cwd=public, check=True)
     subprocess.run(
-        (
-            "git",
-            "-c",
-            "user.name=Public Fixture",
-            "-c",
-            "user.email=public@example.invalid",
-            "commit",
-            "-qm",
-            "fixture",
-        ),
+        ("git", "commit", "-qm", "fixture"),
         cwd=public,
         check=True,
     )
@@ -1028,3 +1028,15 @@ def test_public_documentation_uses_confirmed_install_identity_and_no_email_impor
     )
     assert "There is no `.eml` import." in readme
     assert "import-eml" not in readme
+
+
+def test_ci_privacy_scan_uses_checkout_origin_exactly() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    workflow = (project_root / ".github/workflows/tests.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'python scripts/privacy_scan.py tree . --expected-remote '
+        '"${{ github.server_url }}/${{ github.repository }}"'
+    ) in workflow
