@@ -828,6 +828,57 @@ def test_oai_set_specs_map_to_categories_without_changing_exact_pairs() -> None:
     assert _category_from_set_spec("cs:cs.AI") == "cs.AI"
     assert _category_from_set_spec("physics:physics.acc-ph") == "physics.acc-ph"
     assert _category_from_set_spec("cs:SE") == "cs.SE"
+    assert _category_from_set_spec("cs:cs") == "cs"
+    assert _category_from_set_spec("cs:cs:AI") == "cs.AI"
+    assert _category_from_set_spec("math:math:AG") == "math.AG"
+    assert _category_from_set_spec("physics:astro-ph:CO") == "astro-ph.CO"
+    assert _category_from_set_spec("eess:eess:AS") == "eess.AS"
+
+
+def test_category_browsing_deduplicates_current_oai_hierarchy() -> None:
+    from arxiv_digest.application import _DefaultRuntime
+    from arxiv_digest.web.api import ApiRouter
+
+    runtime = object.__new__(_DefaultRuntime)
+    runtime._category_values = (
+        SimpleNamespace(set_spec="cs", display_name="Computer Science"),
+        SimpleNamespace(set_spec="cs:cs", display_name="Computer Science"),
+        SimpleNamespace(
+            set_spec="cs:cs:AI",
+            display_name="Artificial Intelligence",
+        ),
+        SimpleNamespace(
+            set_spec="physics:gr-qc",
+            display_name="General Relativity and Quantum Cosmology",
+        ),
+        SimpleNamespace(
+            set_spec="physics:gr-qc",
+            display_name="General Relativity and Quantum Cosmology",
+        ),
+    )
+    runtime._issued_category_pairs = set()
+
+    response = ApiRouter(
+        token=TOKEN,
+        host=HOST,
+        handlers={"categories": runtime._categories},
+    ).dispatch(_request("GET", "/api/v1/categories?q="))
+    result = _json(response)["data"]
+
+    assert response.status == 200
+    assert [
+        (item["category"], item["set_spec"])
+        for item in result["categories"]
+    ] == [
+        ("cs", "cs:cs"),
+        ("cs.AI", "cs:cs:AI"),
+        ("gr-qc", "physics:gr-qc"),
+    ]
+    assert runtime._issued_category_pairs == {
+        ("cs", "cs:cs"),
+        ("cs.AI", "cs:cs:AI"),
+        ("gr-qc", "physics:gr-qc"),
+    }
 
 
 def test_setup_authorizes_only_category_pairs_returned_to_the_browser() -> None:
@@ -1203,12 +1254,16 @@ def test_interests_api_projects_bounded_current_corpus_suggestions_without_savin
         corpus=corpus,
         corpus_hash="b" * 64,
     )
-    runtime._category_values = tuple(
-        SimpleNamespace(
-            set_spec=f"cs:ZZ{index:02d}",
-            display_name=f"Synthetic category {index:02d}",
-        )
-        for index in range(35)
+    runtime._category_values = (
+        SimpleNamespace(set_spec="cs", display_name="Computer Science"),
+        SimpleNamespace(set_spec="cs:cs", display_name="Computer Science"),
+        *(
+            SimpleNamespace(
+                set_spec=f"cs:ZZ{index:02d}",
+                display_name=f"Synthetic category {index:02d}",
+            )
+            for index in range(35)
+        ),
     )
     runtime._issued_category_pairs = set()
     runtime._suggestions = {}
@@ -1231,9 +1286,9 @@ def test_interests_api_projects_bounded_current_corpus_suggestions_without_savin
     assert result["suggestions_generated_at"] == "2026-08-22T12:00:00+00:00"
     assert len(result["suggestions"]["categories"]) == 30
     assert result["suggestions"]["categories"][0] == {
-        "category": "cs.ZZ00",
-        "set_spec": "cs:ZZ00",
-        "display_name": "Synthetic category 00",
+        "category": "cs",
+        "set_spec": "cs:cs",
+        "display_name": "Computer Science",
     }
     assert result["suggestions"]["seed_papers"][0]["arxiv_id"] == "2608.00002"
     assert result["suggestions"]["keywords"][0]["value"] == "property testing"

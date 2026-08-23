@@ -297,7 +297,7 @@ class OaiSource:
         self,
         client: ArxivHttpClient,
         *,
-        base_url: str = "https://export.arxiv.org/oai2",
+        base_url: str = "https://oaipmh.arxiv.org/oai",
         max_page_bytes: int = 16 * 1024 * 1024,
     ) -> None:
         self.client = client

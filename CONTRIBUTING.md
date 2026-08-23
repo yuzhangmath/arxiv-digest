@@ -6,11 +6,12 @@ paths, or identifying Git metadata to a contribution.
 
 ## Development setup
 
-Use Python 3.11 or a newer supported Python and Node.js 24.19.0:
+Open a terminal in the repository root. Use Python 3.11 or a newer supported
+Python and Node.js 24.19.0 to create the development environment:
 
 ```bash
 python -m venv .venv
-.venv/bin/python -m pip install ".[dev]"
+.venv/bin/python -m pip install --editable ".[dev]"
 ```
 
 Application tests deny non-loopback network access. Add deterministic local
@@ -18,7 +19,8 @@ fixtures for source behavior instead of contacting arXiv.
 
 ## Test changes
 
-Run the smallest relevant test while developing, then the offline suites:
+From the repository root, run the smallest relevant test while developing,
+then run the offline suites below one command at a time:
 
 ```bash
 .venv/bin/python -m build
@@ -27,10 +29,19 @@ node --test tests/js/*.test.mjs
 .venv/bin/python -m playwright install chromium webkit
 .venv/bin/python -m pytest tests/browser -q
 .venv/bin/python -m pytest tests/integration/test_package_contents.py -q
-.venv/bin/python scripts/privacy_scan.py tree . --expect-no-remote
+.venv/bin/python scripts/privacy_scan.py tree . --expected-remote-from-project
 .venv/bin/python scripts/privacy_scan.py archive dist/arxiv_digest-0.1.0.tar.gz
 .venv/bin/python scripts/privacy_scan.py archive dist/arxiv_digest-0.1.0-py3-none-any.whl
 ```
+
+The tree command above assumes that the checkout's sole `origin` is the
+maintainer SSH URL `git@github.com:yuzhangmath/arxiv-digest.git`. For a
+canonical public HTTPS clone, replace `--expected-remote-from-project` with
+`--expected-remote` followed by the exact canonical URL reported for `origin`
+(usually `https://github.com/yuzhangmath/arxiv-digest.git`; omit `.git` only
+when the recorded URL omits it). Reserve `--expect-no-remote` for an
+intentional release-audit copy with no Git remote; it is not the command for an
+ordinary clone.
 
 Browser changes must pass both Chromium and WebKit. Packaging changes must
 preserve the exact migration, static-asset, license, and notice inventories.

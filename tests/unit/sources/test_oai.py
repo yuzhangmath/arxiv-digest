@@ -383,7 +383,7 @@ def test_identify_uses_the_exact_oai_verb_through_the_http_client() -> None:
 
     assert identify.earliest_datestamp == date(2007, 5, 23)
     assert [request.full_url for request in opener.requests] == [
-        "https://export.arxiv.org/oai2?verb=Identify"
+        "https://oaipmh.arxiv.org/oai?verb=Identify"
     ]
     assert opener.requests[0].get_header("Accept") == "application/xml"
 
@@ -415,9 +415,9 @@ def test_list_sets_follows_opaque_tokens_without_repeating_parameters() -> None:
         "synthetic:spectral-forests",
     )
     assert [request.full_url for request in opener.requests] == [
-        "https://export.arxiv.org/oai2?verb=ListSets",
+        "https://oaipmh.arxiv.org/oai?verb=ListSets",
         (
-            "https://export.arxiv.org/oai2?"
+            "https://oaipmh.arxiv.org/oai?"
             "verb=ListSets&resumptionToken=opaque%2B%2Ftoken%3D%3D"
         ),
     ]
@@ -434,7 +434,7 @@ def test_first_page_sends_exact_unbounded_list_records_parameters() -> None:
     assert page.resumption_token == "opaque+/second=="
     assert [request.full_url for request in opener.requests] == [
         (
-            "https://export.arxiv.org/oai2?verb=ListRecords&"
+            "https://oaipmh.arxiv.org/oai?verb=ListRecords&"
             "metadataPrefix=arXivRaw&set=synthetic%3Aorbital-dynamics&"
             "from=2026-08-01"
         )
@@ -468,7 +468,7 @@ def test_sample_first_page_sends_an_inclusive_until_bound() -> None:
 
     assert [request.full_url for request in opener.requests] == [
         (
-            "https://export.arxiv.org/oai2?verb=ListRecords&"
+            "https://oaipmh.arxiv.org/oai?verb=ListRecords&"
             "metadataPrefix=syntheticRaw&set=synthetic%3Aquantum-gardens&"
             "from=2026-08-01&until=2026-08-08"
         )
@@ -487,7 +487,7 @@ def test_backfill_first_page_has_its_own_bounded_request_method() -> None:
     assert isinstance(page.records[0], OaiArticle)
     assert [request.full_url for request in opener.requests] == [
         (
-            "https://export.arxiv.org/oai2?verb=ListRecords&"
+            "https://oaipmh.arxiv.org/oai?verb=ListRecords&"
             "metadataPrefix=arXivRaw&set=synthetic%3Aorbital-dynamics&"
             "from=2025-08-01&until=2025-08-31"
         )
@@ -522,7 +522,7 @@ def test_next_page_sends_only_the_opaque_token_and_parses_a_legacy_id() -> None:
     )
     assert [request.full_url for request in opener.requests] == [
         (
-            "https://export.arxiv.org/oai2?"
+            "https://oaipmh.arxiv.org/oai?"
             "verb=ListRecords&resumptionToken=opaque%2B%2Fsecond%3D%3D"
         )
     ]
@@ -538,7 +538,7 @@ def test_get_record_uses_the_oai_identifier_and_parses_the_record() -> None:
     assert record.metadata.title == "Clockwork Petals in an Invented Vacuum"
     assert [request.full_url for request in opener.requests] == [
         (
-            "https://export.arxiv.org/oai2?verb=GetRecord&"
+            "https://oaipmh.arxiv.org/oai?verb=GetRecord&"
             "metadataPrefix=arXivRaw&"
             "identifier=oai%3AarXiv.org%3A2608.90004"
         )

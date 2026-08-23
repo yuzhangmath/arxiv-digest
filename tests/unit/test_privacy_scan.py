@@ -1014,12 +1014,17 @@ def test_public_documentation_uses_confirmed_install_identity_and_no_email_impor
         (project_root / "pyproject.toml").read_text(encoding="utf-8")
     )
     expected_commands = (
-        "pipx install git+https://github.com/yuzhangmath/arxiv-digest.git\n"
+        "pipx install "
+        "git+https://github.com/yuzhangmath/arxiv-digest.git@v0.1.0\n"
         "arxiv-digest init"
     )
 
     assert readme.index(expected_commands) < readme.index("## Contents")
-    install_url = expected_commands.splitlines()[0].removeprefix("pipx install git+")
+    install_target = expected_commands.splitlines()[0].removeprefix(
+        "pipx install git+"
+    )
+    install_url, install_tag = install_target.rsplit("@", 1)
+    assert install_tag == f"v{project['project']['version']}"
     assert install_url.removesuffix(".git") == project["project"]["urls"][
         "Repository"
     ]

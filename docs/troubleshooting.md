@@ -7,6 +7,7 @@ interests, identifiers, or local paths.
 
 - [Run redacted diagnostics](#run-redacted-diagnostics)
 - [The dashboard does not open](#the-dashboard-does-not-open)
+- [First-run setup cannot load live data](#first-run-setup-cannot-load-live-data)
 - [Synchronization is offline or partial](#synchronization-is-offline-or-partial)
 - [Historical dates are inferred](#historical-dates-are-inferred)
 - [PDF actions fail](#pdf-actions-fail)
@@ -15,6 +16,8 @@ interests, identifiers, or local paths.
 - [After an upgrade](#after-an-upgrade)
 
 ## Run redacted diagnostics
+
+Open a terminal and run:
 
 ```bash
 arxiv-digest doctor
@@ -28,10 +31,20 @@ not attach the database, profile, backup, or downloaded PDFs.
 
 ## The dashboard does not open
 
-Run `arxiv-digest` in a terminal. If a browser cannot be opened, the command
-prints a one-time loopback URL. Do not share that URL: its fragment contains a
-short-lived local session token. Start a new process instead of reusing an old
-URL. Only one application instance uses a data directory at a time.
+Open a terminal and run `arxiv-digest`. Keep the terminal open while using the
+dashboard. If a browser cannot be opened, the command prints a one-time
+loopback URL. Do not share that URL: its fragment contains a short-lived local
+session token. Start a new process instead of reusing an old URL. Only one
+application instance uses a data directory at a time.
+
+## First-run setup cannot load live data
+
+First-run setup needs a live connection to arXiv to list categories and build
+the candidate sample. Keep the terminal open. If the connection was
+interrupted, select **Retry**; an incomplete candidate-building attempt offers
+**Resume** or **Retry**. If the same error returns after connectivity is
+restored, select **Quit**, run `arxiv-digest doctor`, and share only its
+redacted output.
 
 ## Synchronization is offline or partial
 
@@ -61,8 +74,8 @@ you to reconfirm a destination.
 The launcher is optional. In Settings choose **Create/Recreate** or **Retry**.
 Choose **Not now** to clear a stored setup-time launcher error without touching
 the filesystem, or **Remove** to delete only the exact managed launcher. You
-can always reopen the app with `arxiv-digest`. There is no scheduled background
-startup.
+can always reopen the app by opening a terminal and running `arxiv-digest`.
+There is no scheduled background startup.
 
 ## A backup will not import
 
@@ -73,7 +86,15 @@ non-empty destination the app verifies a private pre-restore recovery backup.
 
 ## After an upgrade
 
-Run `arxiv-digest doctor`, then start `arxiv-digest` once. If the executable is
-missing, open a new terminal after `pipx ensurepath` and run `pipx list`. If the
-pipx environment itself is damaged, reinstall from the canonical HTTPS command
-in [Installation](installation.md); do not delete durable data as a first step.
+Open a terminal and run these commands one at a time. The second command keeps
+running while the dashboard is open:
+
+```bash
+arxiv-digest doctor
+arxiv-digest
+```
+
+If the executable is missing, open a new terminal after `pipx ensurepath` and
+run `pipx list`. If the pipx environment itself is damaged, reinstall from the
+canonical HTTPS command in [Installation](installation.md); do not delete
+durable data as a first step.

@@ -128,6 +128,34 @@ def test_get_returns_normalized_response_and_identifies_the_application() -> Non
     assert request.get_header("Accept") == "application/xml"
 
 
+def test_current_oai_endpoint_is_allowed() -> None:
+    opener = FakeOpener()
+    client = ArxivHttpClient(
+        user_agent="arxiv-digest/0.1",
+        contact_url="https://example.invalid/contact",
+        opener=opener,
+        policies={
+            Interface.OAI: RequestPolicy(
+                0,
+                1,
+                0,
+                1_024,
+                ("application/xml",),
+            )
+        },
+    )
+
+    client.get(
+        "https://oaipmh.arxiv.org/oai?verb=ListSets",
+        interface=Interface.OAI,
+        accept="application/xml",
+    )
+
+    assert [request.full_url for request in opener.requests] == [
+        "https://oaipmh.arxiv.org/oai?verb=ListSets"
+    ]
+
+
 def test_transport_open_uses_the_validated_request_timeout() -> None:
     class TimeoutOpener(FakeOpener):
         def __init__(self) -> None:

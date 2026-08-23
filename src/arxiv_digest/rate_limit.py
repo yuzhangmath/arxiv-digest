@@ -17,7 +17,9 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 _RETRYABLE_HTTP_STATUSES = frozenset({429, 502, 503, 504})
-_ARXIV_HOSTS = frozenset({"arxiv.org", "export.arxiv.org", "rss.arxiv.org"})
+_ARXIV_HOSTS = frozenset(
+    {"arxiv.org", "export.arxiv.org", "oaipmh.arxiv.org", "rss.arxiv.org"}
+)
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 _MAX_REQUEST_TIMEOUT_SECONDS = 120.0
 _RESPONSE_READ_CHUNK_BYTES = 64 * 1024

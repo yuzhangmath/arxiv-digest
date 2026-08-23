@@ -26,7 +26,8 @@ synthetic values whenever possible.
 ## Non-sensitive problems
 
 Ordinary bugs with no security or privacy impact may use the public issue
-tracker. Run `arxiv-digest doctor` and attach only its redacted output.
+tracker. Open a terminal, run `arxiv-digest doctor`, and attach only its
+redacted output.
 
 ## Scope and expectations
 

@@ -56,8 +56,9 @@ machine-local destination.
 
 ## Export a backup
 
-From Settings, choose **Export backup** and save the browser download. From a
-terminal, choose a new filename:
+From Settings, choose **Export backup** and save the browser download. To use
+the command line instead, select **Quit** in the dashboard, open a terminal,
+and choose a new filename:
 
 ```bash
 arxiv-digest export arxiv-digest-backup.zip
@@ -71,14 +72,16 @@ private as the interests and library it contains.
 
 Settings inspects an uploaded backup without changing state. Review the
 summary, reconfirm the local PDF destination, and confirm creation of a
-pre-restore recovery backup before restore. The terminal equivalent is:
+pre-restore recovery backup before restore. To use the terminal instead,
+select **Quit** in the dashboard, open a terminal, and run:
 
 ```bash
 arxiv-digest import arxiv-digest-backup.zip
 ```
 
-The app revalidates the archive immediately before restore and keeps the
-current state if inspection or restore validation fails.
+The command inspects the backup, asks you to choose the restored PDF
+destination, and then revalidates the archive immediately before restore. It
+keeps the current state if inspection or restore validation fails.
 
 ## What a portable backup excludes
 

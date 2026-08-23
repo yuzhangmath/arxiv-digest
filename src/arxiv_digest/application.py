@@ -229,16 +229,22 @@ def _category_from_set_spec(set_spec: str) -> str:
 
     if not isinstance(set_spec, str) or not set_spec.strip():
         raise ValueError("OAI set specification must be nonblank")
-    prefix, separator, suffix = set_spec.partition(":")
-    if not separator:
+    parts = set_spec.split(":")
+    if len(parts) == 1:
         return set_spec
-    if not suffix:
+    if any(not part for part in parts):
         raise ValueError("OAI set specification has no category component")
-    if "." in suffix or prefix.casefold() == "arxiv":
-        return suffix
-    if prefix in {"cs", "math", "stat", "econ", "q-bio", "q-fin"}:
-        return f"{prefix}.{suffix}"
-    return suffix
+    leaf = parts[-1]
+    if "." in leaf or parts[0].casefold() == "arxiv":
+        return leaf
+    if len(parts) >= 3:
+        return f"{parts[-2]}.{leaf}"
+    prefix = parts[0]
+    if prefix == leaf:
+        return leaf
+    if prefix in {"cs", "math", "stat", "econ", "eess", "q-bio", "q-fin"}:
+        return f"{prefix}.{leaf}"
+    return leaf
 
 
 class _DefaultRuntime:
@@ -1122,12 +1128,18 @@ class _DefaultRuntime:
             self._category_values = self._oai.list_sets()
         query = payload.get("q", "").casefold()
         items = []
+        seen: set[str] = set()
         for item in self._category_values:
+            if ":" not in item.set_spec:
+                continue
             category = _category_from_set_spec(item.set_spec)
             if query and query not in (
                 f"{category} {item.display_name} {item.set_spec}".casefold()
             ):
                 continue
+            if category in seen:
+                continue
+            seen.add(category)
             if len(items) == 200:
                 break
             items.append(
@@ -1359,6 +1371,8 @@ class _DefaultRuntime:
         seen: set[str] = set()
         values = []
         for item in self._category_values:
+            if ":" not in item.set_spec:
+                continue
             try:
                 category = _category_from_set_spec(item.set_spec)
             except ValueError:
