@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>Synthetic current announcements</title>
+  <updated>2026-08-22T01:30:00Z</updated>
+  <entry>
+    <id>https://arxiv.org/abs/2608.10001v1</id>
+    <updated>2026-08-22T00:15:00Z</updated>
+    <published>2026-08-22T00:00:00Z</published>
+    <title>  Lantern   Protocols for Quiet Networks  </title>
+    <summary>A fictional abstract about reliable lantern protocols.</summary>
+    <author><name>Nora Example</name></author>
+    <author><name>Quinn Sample</name></author>
+    <arxiv:primary_category term="cs.CL" />
+    <category term="cs.CL" />
+    <category term="stat.ML" />
+    <arxiv:comment>12 synthetic pages</arxiv:comment>
+    <arxiv:journal_ref>Journal of Fictional Systems 1 (2026)</arxiv:journal_ref>
+    <arxiv:doi>10.0000/example.10001</arxiv:doi>
+    <arxiv:announce_type>New</arxiv:announce_type>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/2608.10002v1</id>
+    <updated>2026-08-22T00:25:00Z</updated>
+    <published>2026-08-22T00:20:00Z</published>
+    <title>Cross-Category Clockwork</title>
+    <summary>A synthetic study of category-balanced clockwork.</summary>
+    <author><name>Robin Fiction</name></author>
+    <arxiv:primary_category term="stat.ML" />
+    <category term="stat.ML" />
+    <category term="cs.CL" />
+    <arxiv:announce_type>Cross</arxiv:announce_type>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/2608.10003v2</id>
+    <updated>2026-08-22T00:40:00Z</updated>
+    <published>2026-08-10T14:00:00Z</published>
+    <title>Revised Synthetic Orchards</title>
+    <summary>A fictional replacement concerning carefully revised orchards.</summary>
+    <author><name>Taylor Placeholder</name></author>
+    <arxiv:primary_category term="cs.CL" />
+    <category term="cs.CL" />
+    <arxiv:announce_type>Replace</arxiv:announce_type>
+  </entry>
+  <entry>
+    <id>https://arxiv.org/abs/2608.10004v3</id>
+    <updated>2026-08-22T00:55:00Z</updated>
+    <published>2026-07-01T12:00:00Z</published>
+    <title>Third Revision of Imaginary Bridges</title>
+    <summary>A fabricated replace-cross record for bridge metadata.</summary>
+    <author><name>Uma Invented</name></author>
+    <arxiv:primary_category term="math.OC" />
+    <category term="math.OC" />
+    <category term="cs.CL" />
+    <arxiv:announce_type>Replace-Cross</arxiv:announce_type>
+  </entry>
+</feed>

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"
+         xmlns:raw="http://arxiv.org/OAI/arXivRaw/">
+  <responseDate>2026-08-22T04:12:00Z</responseDate>
+  <request verb="ListRecords">https://export.arxiv.org/oai2</request>
+  <ListRecords>
+    <record>
+      <header>
+        <identifier>oai:arXiv.org:2601.90005</identifier>
+        <datestamp>2026-08-22</datestamp>
+        <setSpec>synthetic:orbital-dynamics</setSpec>
+      </header>
+      <metadata>
+        <raw:arXivRaw>
+          <raw:id>2601.90005</raw:id>
+          <raw:version version="v1">
+            <raw:date>Thu, 08 Jan 2026 05:00:00 GMT</raw:date>
+            <raw:size>5kb</raw:size>
+            <raw:source_type>D</raw:source_type>
+          </raw:version>
+          <raw:title>Paper Moons Over a Synthetic Estuary</raw:title>
+          <raw:authors>
+            <raw:author>
+              <raw:keyname>Drift</raw:keyname>
+              <raw:forenames>Aster</raw:forenames>
+            </raw:author>
+          </raw:authors>
+          <raw:categories>synthetic.orbital</raw:categories>
+          <raw:comments>Administrative metadata corrected in August.</raw:comments>
+          <raw:abstract>Paper moons provide a fictional test of timestamp separation.</raw:abstract>
+        </raw:arXivRaw>
+      </metadata>
+    </record>
+  </ListRecords>
+</OAI-PMH>

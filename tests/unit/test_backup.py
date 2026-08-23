@@ -1,0 +1,804 @@
+from __future__ import annotations
+
+import json
+import stat
+import warnings
+import zipfile
+from datetime import date, datetime, timezone
+from hashlib import sha256
+from pathlib import Path
+
+import pytest
+
+from arxiv_digest.models import CategoryConfig, PaperMetadata, PaperVersion
+from arxiv_digest.paths import AppPaths, resolve_paths
+from arxiv_digest.profile import PdfDestination, Profile, ProfileRepository
+from arxiv_digest.setup import SetupService
+from arxiv_digest.storage.database import open_database
+from arxiv_digest.storage.store import DownloadFileRecord, Store
+
+
+NOW = datetime(2026, 8, 22, 12, tzinfo=timezone.utc)
+
+
+def initialized_paths(tmp_path: Path) -> AppPaths:
+    paths = resolve_paths(
+        platform="linux",
+        home=tmp_path,
+        environ={
+            "ARXIV_DIGEST_TESTING": "1",
+            "ARXIV_DIGEST_TEST_ROOT": str(tmp_path / "isolated"),
+        },
+    )
+    paths.ensure()
+    destination = tmp_path / "Private PDF Destination"
+    destination.mkdir(parents=True)
+    open_database(paths.database_path).close()
+    repository = ProfileRepository(paths.profile_path, paths.profile_lock_path)
+    profile = Profile(
+        schema_version=1,
+        revision=1,
+        categories=("cs.SE",),
+        keywords=("fictional keyword",),
+        phrases=("synthetic phrase",),
+        authors=("Ada Example",),
+        seed_papers=("2608.41001",),
+        pdf_destination=PdfDestination("custom", destination),
+    )
+    SetupService(paths.database_path, repository).publish_profile(
+        profile,
+        (CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 1)),),
+        expected_revision=None,
+    )
+    store = Store(paths.database_path)
+    store.apply_event_batch(
+        PaperMetadata(
+            arxiv_id="2608.41001",
+            title="Portable Fictional Lattices",
+            authors=("Ada Example",),
+            abstract="A wholly synthetic backup fixture.",
+            primary_category="cs.SE",
+            categories=("cs.SE",),
+        ),
+        (PaperVersion(1, datetime(2026, 8, 1, tzinfo=timezone.utc)),),
+        (),
+    )
+    store.save_paper("2608.41001", 1)
+    local_pdf = destination / "2608.41001v1 - Portable Fictional Lattices.pdf"
+    local_pdf.write_bytes(b"%PDF-1.7\nsynthetic private local file\n")
+    store.record_download_file(
+        DownloadFileRecord(
+            arxiv_id="2608.41001",
+            version=1,
+            filename=local_pdf.name,
+            byte_count=local_pdf.stat().st_size,
+            sha256=sha256(local_pdf.read_bytes()).hexdigest(),
+            last_verified_at=NOW,
+        )
+    )
+    (paths.cache_dir / "raw-response.xml").write_text(
+        "private cache payload", encoding="utf-8"
+    )
+    paths.runtime_descriptor_path.write_text(
+        '{"token":"private-runtime-token"}', encoding="utf-8"
+    )
+    connection = open_database(paths.database_path)
+    connection.execute(
+        """UPDATE category_sync_state
+           SET completed_through_utc = ?, last_success_at = ?,
+               last_error_code = ?, last_error_message = ?
+           WHERE category = ?""",
+        (
+            "2026-08-20",
+            "2026-08-20T12:00:00Z",
+            "synthetic_error_code",
+            "private synchronization detail /private/source",
+            "cs.SE",
+        ),
+    )
+    connection.execute(
+        """INSERT INTO oai_tombstones(
+               oai_identifier, arxiv_id, oai_datestamp,
+               set_specs_json, observed_at
+           ) VALUES (?, ?, ?, ?, ?)""",
+        (
+            "oai:arXiv.org:2608.49998",
+            None,
+            "2026-08-19",
+            '["cs:SE"]',
+            "2026-08-20T12:00:00Z",
+        ),
+    )
+    connection.execute(
+        """INSERT INTO category_article_state(
+               category, arxiv_id, last_oai_datestamp, category_set_hash,
+               observed_categories_json, last_raw_sha256, last_seen_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "cs.SE",
+            "2608.41001",
+            "2026-08-20",
+            "1" * 64,
+            '["cs.SE"]',
+            "2" * 64,
+            "2026-08-20T12:00:00Z",
+        ),
+    )
+    connection.execute(
+        """INSERT INTO review_events(
+               event_id, arxiv_id, announced_version, effective_date,
+               date_basis, confidence, queue_revision, reviewed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            41,
+            "2608.41001",
+            1,
+            "2026-08-20",
+            "feed_mailing",
+            "current",
+            7,
+            None,
+        ),
+    )
+    connection.execute(
+        """INSERT INTO event_evidence(
+               evidence_id, event_id, source_key, source, confidence,
+               category, announce_type, mailing_date, announced_version,
+               list_position, oai_datestamp, raw_sha256, observed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            51,
+            41,
+            "atom:cs.SE:2026-08-20:0:2608.41001v1",
+            "atom",
+            "current",
+            "cs.SE",
+            "new",
+            "2026-08-20",
+            1,
+            0,
+            None,
+            "3" * 64,
+            "2026-08-20T12:00:00Z",
+        ),
+    )
+    connection.execute(
+        """INSERT INTO review_date_state(
+               effective_date, anchor_event_id, profile_revision,
+               last_finished_at, last_finished_revision
+           ) VALUES (?, ?, ?, ?, ?)""",
+        ("2026-08-20", 41, 1, None, None),
+    )
+    connection.execute(
+        """INSERT INTO enrichment_days(
+               category, mailing_date, source, status, fetched_at,
+               raw_sha256, error_code, error_message
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "cs.SE",
+            "2026-08-20",
+            "atom",
+            "failed",
+            "2026-08-20T12:00:00Z",
+            None,
+            "fixture_parse_error",
+            "private enrichment detail /private/source",
+        ),
+    )
+    connection.execute(
+        """INSERT INTO sync_runs(
+               category, run_kind, requested_from, started_at, status,
+               error_code, error_message
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "cs.SE",
+            "incremental",
+            "2026-08-20",
+            "2026-08-20T12:00:00Z",
+            "failed",
+            "fixture_network_error",
+            "private transient run detail /private/source",
+        ),
+    )
+    connection.execute(
+        "UPDATE state_meta SET queue_revision = 7 WHERE singleton = 1"
+    )
+    connection.execute(
+        "UPDATE application_settings SET launcher_operation = 'create_failed', "
+        "launcher_last_error_code = 'private-launcher-detail' WHERE singleton = 1"
+    )
+    connection.commit()
+    connection.close()
+    return paths
+
+
+def rewrite_archive_member(
+    source: Path,
+    destination: Path,
+    name: str,
+    payload: bytes,
+    *,
+    refresh_manifest: bool = True,
+) -> None:
+    with zipfile.ZipFile(source) as archive:
+        members = {item: archive.read(item) for item in archive.namelist()}
+    members[name] = payload
+    if refresh_manifest and name in {"profile.json", "state.jsonl"}:
+        manifest = json.loads(members["manifest.json"])
+        for item in manifest["members"]:
+            if item["name"] == name:
+                item["byte_count"] = len(payload)
+                item["sha256"] = sha256(payload).hexdigest()
+        members["manifest.json"] = (
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+    with zipfile.ZipFile(destination, "w") as archive:
+        for member_name in ("manifest.json", "profile.json", "state.jsonl"):
+            archive.writestr(member_name, members[member_name])
+
+
+def archive_payloads(path: Path) -> dict[str, bytes]:
+    with zipfile.ZipFile(path) as archive:
+        return {name: archive.read(name) for name in archive.namelist()}
+
+
+def write_member_list(
+    path: Path,
+    members: list[tuple[str | zipfile.ZipInfo, bytes]],
+) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in members:
+            archive.writestr(name, payload)
+
+
+def test_export_is_deterministic_portable_and_excludes_machine_local_state(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import export_backup
+
+    paths = initialized_paths(tmp_path)
+    first = tmp_path / "first.arxiv-digest-backup.zip"
+    second = tmp_path / "second.arxiv-digest-backup.zip"
+
+    export_backup(paths, first, clock=lambda: NOW)
+    export_backup(paths, second, clock=lambda: NOW)
+
+    assert first.read_bytes() == second.read_bytes()
+    assert stat.S_IMODE(first.stat().st_mode) == 0o600
+    with zipfile.ZipFile(first) as archive:
+        assert archive.namelist() == [
+            "manifest.json",
+            "profile.json",
+            "state.jsonl",
+        ]
+        manifest_payload = archive.read("manifest.json")
+        profile_payload = archive.read("profile.json")
+        state_payload = archive.read("state.jsonl")
+    manifest = json.loads(manifest_payload)
+    assert manifest == {
+        "application_version": "0.1.0",
+        "created_at": "2026-08-22T12:00:00Z",
+        "format_name": "arxiv-digest-backup",
+        "format_version": 1,
+        "members": [
+            {
+                "byte_count": len(profile_payload),
+                "name": "profile.json",
+                "sha256": sha256(profile_payload).hexdigest(),
+            },
+            {
+                "byte_count": len(state_payload),
+                "name": "state.jsonl",
+                "sha256": sha256(state_payload).hexdigest(),
+            },
+        ],
+    }
+    portable_profile = json.loads(profile_payload)
+    assert portable_profile == {
+        "authors": ["Ada Example"],
+        "categories": ["cs.SE"],
+        "keywords": ["fictional keyword"],
+        "phrases": ["synthetic phrase"],
+        "revision": 1,
+        "schema_version": 1,
+        "seed_papers": ["2608.41001"],
+    }
+    records = [json.loads(line) for line in state_payload.splitlines()]
+    assert any(record["record_type"] == "article" for record in records)
+    assert any(record["record_type"] == "saved_paper" for record in records)
+    assert {record["record_type"] for record in records} >= {
+        "article",
+        "oai_tombstone",
+        "version",
+        "author",
+        "category",
+        "category_sync",
+        "category_article_state",
+        "review_event",
+        "event_evidence",
+        "review_date_state",
+        "enrichment_day",
+        "saved_paper",
+    }
+    archive_bytes = first.read_bytes()
+    for excluded in (
+        str(paths.profile_path.parent).encode(),
+        str(tmp_path / "Private PDF Destination").encode(),
+        b"private cache payload",
+        b"private-runtime-token",
+        b"private-launcher-detail",
+        b"private synchronization detail",
+        b"private enrichment detail",
+        b"private transient run detail",
+        b"sync_run",
+        b"download_file",
+        b"%PDF-1.7",
+    ):
+        assert excluded not in archive_bytes
+
+
+def test_export_fsyncs_verified_archive_before_linking_and_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import arxiv_digest.backup as backup
+
+    paths = initialized_paths(tmp_path)
+    destination = tmp_path / "durable.zip"
+    calls = []
+    original_link = backup.os.link
+
+    monkeypatch.setattr(
+        backup,
+        "_fsync_file",
+        lambda path: calls.append(("file", Path(path).parent)),
+    )
+
+    def tracked_link(source, target):
+        calls.append(("link", Path(target).parent))
+        return original_link(source, target)
+
+    monkeypatch.setattr(backup.os, "link", tracked_link)
+    monkeypatch.setattr(
+        backup,
+        "_fsync_directory",
+        lambda path: calls.append(("directory", Path(path))),
+    )
+
+    backup.export_backup(paths, destination, clock=lambda: NOW)
+
+    assert calls == [
+        ("file", destination.parent),
+        ("link", destination.parent),
+        ("directory", destination.parent),
+    ]
+
+
+def test_inspection_parses_a_valid_backup_without_changing_local_state(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    archive = tmp_path / "portable.arxiv-digest-backup.zip"
+    from arxiv_digest.backup import export_backup
+
+    export_backup(paths, archive, clock=lambda: NOW)
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    inspection = inspect_backup(archive)
+
+    after = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert inspection.path == archive
+    assert inspection.archive_sha256 == sha256(archive.read_bytes()).hexdigest()
+    assert inspection.manifest.format_name == "arxiv-digest-backup"
+    assert inspection.profile.categories == ("cs.SE",)
+    assert inspection.profile.seed_papers == ("2608.41001",)
+    assert {record.record_type for record in inspection.records} >= {
+        "article",
+        "version",
+        "author",
+        "category",
+        "category_sync",
+        "saved_paper",
+    }
+
+
+def test_inspection_rejects_an_active_category_without_sync_state(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    valid = tmp_path / "valid.zip"
+    hostile = tmp_path / "hostile.zip"
+    export_backup(paths, valid, clock=lambda: NOW)
+    with zipfile.ZipFile(valid) as archive:
+        records = [
+            json.loads(line)
+            for line in archive.read("state.jsonl").splitlines()
+        ]
+    records = [
+        record
+        for record in records
+        if record["record_type"] != "category_sync"
+    ]
+    payload = b"".join(
+        (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        for record in records
+    )
+    rewrite_archive_member(valid, hostile, "state.jsonl", payload)
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(hostile)
+
+    assert raised.value.code == "cross_record_invalid"
+
+
+def test_inspection_rejects_a_seed_without_durable_article_metadata(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    valid = tmp_path / "valid.zip"
+    hostile = tmp_path / "hostile.zip"
+    export_backup(paths, valid, clock=lambda: NOW)
+    with zipfile.ZipFile(valid) as archive:
+        records = [
+            json.loads(line)
+            for line in archive.read("state.jsonl").splitlines()
+        ]
+    records = [
+        record
+        for record in records
+        if record["record_type"]
+        not in {"article", "version", "author", "category", "saved_paper"}
+    ]
+    payload = b"".join(
+        (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        for record in records
+    )
+    rewrite_archive_member(valid, hostile, "state.jsonl", payload)
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(hostile)
+
+    assert raised.value.code == "cross_record_invalid"
+
+
+@pytest.mark.parametrize(
+    ("start", "until"),
+    [
+        ("2026-07-01", None),
+        (None, "2026-07-31"),
+        ("2026-08-01", "2026-07-31"),
+    ],
+)
+def test_inspection_rejects_invalid_pending_backfill_bounds(
+    tmp_path: Path,
+    start: str | None,
+    until: str | None,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    valid = tmp_path / "valid.zip"
+    hostile = tmp_path / "hostile.zip"
+    export_backup(paths, valid, clock=lambda: NOW)
+    with zipfile.ZipFile(valid) as archive:
+        records = [
+            json.loads(line)
+            for line in archive.read("state.jsonl").splitlines()
+        ]
+    sync = next(
+        record for record in records if record["record_type"] == "category_sync"
+    )
+    sync["payload"]["pending_backfill_start"] = start
+    sync["payload"]["pending_backfill_until"] = until
+    payload = b"".join(
+        (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        for record in records
+    )
+    rewrite_archive_member(valid, hostile, "state.jsonl", payload)
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(hostile)
+
+    assert raised.value.code == "cross_record_invalid"
+
+
+def test_export_refuses_to_overwrite_an_existing_destination(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup
+
+    paths = initialized_paths(tmp_path)
+    destination = tmp_path / "existing.zip"
+    original = b"preexisting private bytes"
+    destination.write_bytes(original)
+
+    with pytest.raises(BackupError) as raised:
+        export_backup(paths, destination, clock=lambda: NOW)
+
+    assert raised.value.code == "destination_exists"
+    assert destination.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("hostile_kind", "expected_code"),
+    [
+        ("duplicate", "duplicate_member"),
+        ("traversal", "path_traversal"),
+        ("symlink", "symlink_member"),
+        ("encrypted", "encrypted_member"),
+        ("unknown", "unknown_member"),
+        ("bad_crc", "archive_invalid"),
+    ],
+)
+def test_inspection_rejects_hostile_zip_members(
+    tmp_path: Path,
+    hostile_kind: str,
+    expected_code: str,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    valid = tmp_path / "valid.zip"
+    hostile = tmp_path / f"{hostile_kind}.zip"
+    export_backup(paths, valid, clock=lambda: NOW)
+    members = archive_payloads(valid)
+    ordinary = [
+        (name, members[name])
+        for name in ("manifest.json", "profile.json", "state.jsonl")
+    ]
+    if hostile_kind == "duplicate":
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            write_member_list(
+                hostile,
+                ordinary + [("profile.json", members["profile.json"])],
+            )
+    elif hostile_kind == "traversal":
+        write_member_list(
+            hostile,
+            ordinary + [("../profile.json", b"unsafe")],
+        )
+    elif hostile_kind == "unknown":
+        write_member_list(hostile, ordinary + [("cache/raw.xml", b"unsafe")])
+    elif hostile_kind == "symlink":
+        symlink = zipfile.ZipInfo("profile.json")
+        symlink.create_system = 3
+        symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+        write_member_list(
+            hostile,
+            [
+                ("manifest.json", members["manifest.json"]),
+                (symlink, b"state.jsonl"),
+                ("state.jsonl", members["state.jsonl"]),
+            ],
+        )
+    elif hostile_kind == "encrypted":
+        payload = bytearray(valid.read_bytes())
+        for signature, flag_offset in (
+            (b"PK\x03\x04", 6),
+            (b"PK\x01\x02", 8),
+        ):
+            position = 0
+            while (position := payload.find(signature, position)) >= 0:
+                offset = position + flag_offset
+                flags = int.from_bytes(payload[offset : offset + 2], "little")
+                payload[offset : offset + 2] = (flags | 1).to_bytes(2, "little")
+                position += 4
+        hostile.write_bytes(payload)
+    else:
+        payload = bytearray(valid.read_bytes())
+        marker = members["state.jsonl"][:32]
+        position = payload.find(marker)
+        assert position >= 0
+        payload[position] ^= 1
+        hostile.write_bytes(payload)
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(hostile)
+
+    assert raised.value.code == expected_code
+
+
+def test_inspection_enforces_member_and_expanded_size_limits(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import (
+        BackupError,
+        BackupLimits,
+        export_backup,
+        inspect_backup,
+    )
+
+    paths = initialized_paths(tmp_path)
+    archive = tmp_path / "valid.zip"
+    export_backup(paths, archive, clock=lambda: NOW)
+
+    with pytest.raises(BackupError) as count_error:
+        inspect_backup(archive, limits=BackupLimits(max_members=2))
+    with pytest.raises(BackupError) as size_error:
+        inspect_backup(
+            archive,
+            limits=BackupLimits(
+                max_members=16,
+                max_member_bytes=1024 * 1024,
+                max_expanded_bytes=100,
+            ),
+        )
+
+    assert count_error.value.code == "archive_too_large"
+    assert size_error.value.code == "archive_too_large"
+
+
+def test_default_backup_limits_bound_each_semantic_member() -> None:
+    from arxiv_digest.backup import BackupLimits
+
+    limits = BackupLimits()
+
+    assert limits.max_manifest_bytes == 256 * 1024
+    assert limits.max_profile_bytes == 4 * 1024 * 1024
+    assert limits.max_state_bytes == 128 * 1024 * 1024
+    assert (
+        limits.max_manifest_bytes
+        + limits.max_profile_bytes
+        + limits.max_state_bytes
+        < limits.max_expanded_bytes
+    )
+
+
+@pytest.mark.parametrize(
+    ("member_name", "limit_name"),
+    [
+        ("manifest.json", "max_manifest_bytes"),
+        ("profile.json", "max_profile_bytes"),
+        ("state.jsonl", "max_state_bytes"),
+    ],
+)
+def test_inspection_enforces_semantic_member_size_limits(
+    tmp_path: Path,
+    member_name: str,
+    limit_name: str,
+) -> None:
+    from arxiv_digest.backup import (
+        BackupError,
+        BackupLimits,
+        export_backup,
+        inspect_backup,
+    )
+
+    paths = initialized_paths(tmp_path)
+    archive = tmp_path / "valid.zip"
+    export_backup(paths, archive, clock=lambda: NOW)
+    members = archive_payloads(archive)
+    semantic_limits = {
+        "max_manifest_bytes": 1024 * 1024,
+        "max_profile_bytes": 1024 * 1024,
+        "max_state_bytes": 1024 * 1024,
+    }
+    semantic_limits[limit_name] = len(members[member_name]) - 1
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(
+            archive,
+            limits=BackupLimits(
+                max_member_bytes=2 * 1024 * 1024,
+                max_expanded_bytes=4 * 1024 * 1024,
+                **semantic_limits,
+            ),
+        )
+
+    assert raised.value.code == "archive_too_large"
+
+
+def test_inspection_rejects_checksum_mismatch_and_unsupported_schemas(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    valid = tmp_path / "valid.zip"
+    export_backup(paths, valid, clock=lambda: NOW)
+    members = archive_payloads(valid)
+
+    checksum = tmp_path / "checksum.zip"
+    rewrite_archive_member(
+        valid,
+        checksum,
+        "profile.json",
+        members["profile.json"] + b" ",
+        refresh_manifest=False,
+    )
+    with pytest.raises(BackupError) as mismatch:
+        inspect_backup(checksum)
+    assert mismatch.value.code == "checksum_mismatch"
+
+    manifest_schema = tmp_path / "manifest-schema.zip"
+    manifest = json.loads(members["manifest.json"])
+    manifest["format_version"] = 2
+    rewrite_archive_member(
+        valid,
+        manifest_schema,
+        "manifest.json",
+        (
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode(),
+    )
+    with pytest.raises(BackupError) as manifest_error:
+        inspect_backup(manifest_schema)
+    assert manifest_error.value.code == "unsupported_schema"
+
+    record_schema = tmp_path / "record-schema.zip"
+    records = [
+        json.loads(line) for line in members["state.jsonl"].splitlines()
+    ]
+    records[0]["schema_version"] = 2
+    state_payload = b"".join(
+        (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        for record in records
+    )
+    rewrite_archive_member(valid, record_schema, "state.jsonl", state_payload)
+    with pytest.raises(BackupError) as record_error:
+        inspect_backup(record_schema)
+    assert record_error.value.code == "unsupported_schema"
+
+
+def test_restore_revalidates_the_archive_digest_after_inspection(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import (
+        BackupError,
+        export_backup,
+        inspect_backup,
+        restore_backup,
+    )
+
+    source = initialized_paths(tmp_path / "source")
+    archive = tmp_path / "portable.zip"
+    export_backup(source, archive, clock=lambda: NOW)
+    inspection = inspect_backup(archive)
+    with archive.open("ab") as handle:
+        handle.write(b"valid ZIP trailing bytes change the file identity")
+    target = resolve_paths(
+        platform="linux",
+        home=tmp_path,
+        environ={
+            "ARXIV_DIGEST_TESTING": "1",
+            "ARXIV_DIGEST_TEST_ROOT": str(tmp_path / "target"),
+        },
+    )
+    destination = tmp_path / "Confirmed PDFs"
+    destination.mkdir()
+
+    with pytest.raises(BackupError) as raised:
+        restore_backup(
+            target,
+            inspection,
+            PdfDestination("custom", destination),
+            clock=lambda: NOW,
+        )
+
+    assert raised.value.code == "archive_changed"
+    assert not target.profile_path.exists()
+    assert not target.database_path.exists()

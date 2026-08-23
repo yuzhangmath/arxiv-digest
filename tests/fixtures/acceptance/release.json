@@ -1,0 +1,36 @@
+{
+  "as_of": "2026-08-22",
+  "candidate_corpus": {
+    "categories": [
+      {"category": "synthetic.alpha", "set_spec": "synthetic:alpha"},
+      {"category": "synthetic.beta", "set_spec": "synthetic:beta"},
+      {"category": "synthetic.gamma", "set_spec": "synthetic:gamma"}
+    ],
+    "paper_count": 60,
+    "visible_count": 30,
+    "window_start": "2026-05-25",
+    "window_end": "2026-08-22",
+    "recurring_keyword": "orchard",
+    "recurring_phrase": "spectral garden",
+    "recurring_author": "Casey Crosscategory"
+  },
+  "explicit_profile": {
+    "custom_keyword": "handpicked invariant",
+    "custom_phrase": "deliberate custom phrase",
+    "custom_author": "Morgan Manual"
+  },
+  "backlog": {
+    "total": 200,
+    "dates": [
+      {"date": "2026-05-30", "count": 45},
+      {"date": "2026-06-15", "count": 110},
+      {"date": "2026-07-07", "count": 45}
+    ]
+  },
+  "synchronization": {
+    "initial_coverage_start": "2026-07-23",
+    "initial_completed_through": "2026-07-24",
+    "short_gap_dates": ["2026-07-25", "2026-07-26"],
+    "long_gap_completed_through": "2026-08-22"
+  }
+}

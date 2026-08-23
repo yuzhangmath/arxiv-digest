@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-08-22T04:08:00Z</responseDate>
+  <request verb="ListRecords">https://export.arxiv.org/oai2</request>
+  <ListRecords>
+    <record>
+      <header status="deleted">
+        <identifier>oai:arXiv.org:2608.90002</identifier>
+        <datestamp>2026-08-20</datestamp>
+        <setSpec>synthetic:orbital-dynamics</setSpec>
+      </header>
+    </record>
+  </ListRecords>
+</OAI-PMH>

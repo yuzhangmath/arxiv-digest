@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"
+         xmlns:raw="http://arxiv.org/OAI/arXivRaw/">
+  <responseDate>2026-08-22T04:09:00Z</responseDate>
+  <request verb="GetRecord">https://export.arxiv.org/oai2</request>
+  <GetRecord>
+    <record>
+      <header>
+        <identifier>oai:arXiv.org:2608.90004</identifier>
+        <datestamp>2026-08-19</datestamp>
+        <setSpec>synthetic:quantum-gardens</setSpec>
+      </header>
+      <metadata>
+        <raw:arXivRaw>
+          <raw:id>2608.90004</raw:id>
+          <raw:version version="v1">
+            <raw:date>Wed, 19 Aug 2026 12:34:56 GMT</raw:date>
+            <raw:size>6kb</raw:size>
+            <raw:source_type>I</raw:source_type>
+          </raw:version>
+          <raw:title>Clockwork Petals in an Invented Vacuum</raw:title>
+          <raw:authors>
+            <raw:author>
+              <raw:keyname>Fable</raw:keyname>
+              <raw:forenames>Rowan</raw:forenames>
+            </raw:author>
+          </raw:authors>
+          <raw:categories>synthetic.quantum synthetic.botany</raw:categories>
+          <raw:abstract>Clockwork petals bloom only inside this deterministic fixture.</raw:abstract>
+        </raw:arXivRaw>
+      </metadata>
+    </record>
+  </GetRecord>
+</OAI-PMH>

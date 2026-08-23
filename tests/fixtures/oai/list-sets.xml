@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<oai:OAI-PMH xmlns:oai="http://www.openarchives.org/OAI/2.0/">
+  <oai:responseDate>2026-08-22T04:06:00Z</oai:responseDate>
+  <oai:request verb="ListSets">https://export.arxiv.org/oai2</oai:request>
+  <oai:ListSets>
+    <oai:set>
+      <oai:setSpec>synthetic:orbital-dynamics</oai:setSpec>
+      <oai:setName>Synthetic Orbital Dynamics</oai:setName>
+    </oai:set>
+    <oai:set>
+      <oai:setSpec>synthetic:quantum-gardens</oai:setSpec>
+      <oai:setName>Synthetic Quantum Gardens</oai:setName>
+    </oai:set>
+    <oai:resumptionToken cursor="0">opaque+/token==</oai:resumptionToken>
+  </oai:ListSets>
+</oai:OAI-PMH>

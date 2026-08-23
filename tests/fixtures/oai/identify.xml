@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-08-22T04:05:06Z</responseDate>
+  <request verb="Identify">https://export.arxiv.org/oai2</request>
+  <Identify>
+    <repositoryName>Synthetic Paper Observatory</repositoryName>
+    <baseURL>https://export.arxiv.org/oai2</baseURL>
+    <protocolVersion>2.0</protocolVersion>
+    <adminEmail>contact@example.invalid</adminEmail>
+    <earliestDatestamp>2007-05-23</earliestDatestamp>
+    <deletedRecord>persistent</deletedRecord>
+    <granularity>YYYY-MM-DD</granularity>
+  </Identify>
+</OAI-PMH>

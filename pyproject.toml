@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arxiv-digest"
+version = "0.1.0"
+description = "A local, explainable arXiv digest and review queue"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["beautifulsoup4>=4.12,<5"]
+
+[project.urls]
+Repository = "https://github.com/yuzhangmath/arxiv-digest"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "pipx>=1.7,<2",
+  "playwright>=1.46,<2",
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+arxiv-digest = "arxiv_digest.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+arxiv_digest = [
+  "storage/migrations/*.sql",
+  "web/static/*",
+  "web/static/vendor/katex/*",
+  "web/static/vendor/katex/fonts/*",
+]
+
+[tool.setuptools.data-files]
+"share/arxiv-digest" = ["THIRD_PARTY_NOTICES.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

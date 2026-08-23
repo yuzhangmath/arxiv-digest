@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<oai:OAI-PMH
+    xmlns:oai="http://www.openarchives.org/OAI/2.0/"
+    xmlns:raw="http://arxiv.org/OAI/arXivRaw/">
+  <oai:responseDate>2026-08-22T04:07:00Z</oai:responseDate>
+  <oai:request verb="ListRecords" metadataPrefix="arXivRaw"
+      set="synthetic:orbital-dynamics">https://export.arxiv.org/oai2</oai:request>
+  <oai:ListRecords>
+    <oai:record>
+      <oai:header>
+        <oai:identifier>oai:arXiv.org:2608.90001</oai:identifier>
+        <oai:datestamp>2026-08-21</oai:datestamp>
+        <oai:setSpec>synthetic:orbital-dynamics</oai:setSpec>
+        <oai:setSpec>synthetic:quantum-gardens</oai:setSpec>
+      </oai:header>
+      <oai:metadata>
+        <raw:arXivRaw>
+          <raw:id>2608.90001</raw:id>
+          <raw:submitter>Fictional Submitter</raw:submitter>
+          <raw:version version="v1">
+            <raw:date>Fri, 01 Aug 2025 10:00:00 GMT</raw:date>
+            <raw:size>7kb</raw:size>
+            <raw:source_type>D</raw:source_type>
+          </raw:version>
+          <raw:version version="v2">
+            <raw:date>Sat, 22 Aug 2026 03:04:05 GMT</raw:date>
+            <raw:size>9kb</raw:size>
+            <raw:source_type>I</raw:source_type>
+          </raw:version>
+          <raw:title>
+            Phase Gardens Across Imaginary Orbits
+          </raw:title>
+          <raw:authors>
+            <raw:author>
+              <raw:keyname>Quasar</raw:keyname>
+              <raw:forenames>Iona</raw:forenames>
+            </raw:author>
+            <raw:author>
+              <raw:keyname>Ember</raw:keyname>
+              <raw:forenames>Sol</raw:forenames>
+              <raw:suffix>III</raw:suffix>
+            </raw:author>
+          </raw:authors>
+          <raw:categories>synthetic.orbital synthetic.quantum</raw:categories>
+          <raw:comments>Eleven fictional pages</raw:comments>
+          <raw:journal-ref>Journal of Imaginary Dynamics 1 (2026)</raw:journal-ref>
+          <raw:doi>10.0000/fictional.2608.90001</raw:doi>
+          <raw:abstract>
+            We examine phase gardens whose orbits exist only in this fixture.
+          </raw:abstract>
+        </raw:arXivRaw>
+      </oai:metadata>
+    </oai:record>
+    <oai:resumptionToken cursor="0" completeListSize="2">opaque+/second==</oai:resumptionToken>
+  </oai:ListRecords>
+</oai:OAI-PMH>

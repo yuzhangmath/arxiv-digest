@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<oai:OAI-PMH xmlns:oai="http://www.openarchives.org/OAI/2.0/"
+             xmlns:archive="http://arxiv.org/OAI/arXivRaw/">
+  <oai:responseDate>2026-08-22T04:08:00Z</oai:responseDate>
+  <oai:request verb="ListRecords">https://export.arxiv.org/oai2</oai:request>
+  <oai:ListRecords>
+    <oai:record>
+      <oai:header>
+        <oai:identifier>oai:arXiv.org:astro-ph/9912345</oai:identifier>
+        <oai:datestamp>2026-08-22</oai:datestamp>
+        <oai:setSpec>synthetic:spectral-forests</oai:setSpec>
+      </oai:header>
+      <oai:metadata>
+        <archive:arXivRaw>
+          <archive:id>astro-ph/9912345</archive:id>
+          <archive:version version="v1">
+            <archive:date>Tue, 14 Dec 1999 09:30:00 GMT</archive:date>
+            <archive:size>4kb</archive:size>
+            <archive:source_type>D</archive:source_type>
+          </archive:version>
+          <archive:title>Lantern Spectra in a Fictional Forest</archive:title>
+          <archive:authors>
+            <archive:author>
+              <archive:keyname>Nightjar</archive:keyname>
+              <archive:forenames>Mira</archive:forenames>
+            </archive:author>
+          </archive:authors>
+          <archive:categories>synthetic.legacy</archive:categories>
+          <archive:abstract>A legacy-shaped identifier illuminates only synthetic trees.</archive:abstract>
+        </archive:arXivRaw>
+      </oai:metadata>
+    </oai:record>
+    <oai:resumptionToken />
+  </oai:ListRecords>
+</oai:OAI-PMH>

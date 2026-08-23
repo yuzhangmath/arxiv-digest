@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-08-22T04:09:00Z</responseDate>
+  <request verb="ListRecords">https://export.arxiv.org/oai2</request>
+  <error code="badResumptionToken">The synthetic token is no longer valid.</error>
+</OAI-PMH>
