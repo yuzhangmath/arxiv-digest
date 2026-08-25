@@ -146,6 +146,7 @@ export function renderReviewHome(
   summary,
   {
     synchronizing = false,
+    synchronizationPhase = "daily_list",
     dailyListRetry,
     dailyListProgress,
     start,
@@ -156,14 +157,14 @@ export function renderReviewHome(
   } = {},
 ) {
   const retry = normalizedDailyListRetry(dailyListRetry);
+  const enrichment = synchronizing && synchronizationPhase === "enrichment";
+  const recovering = synchronizing && !enrichment;
   let view = container.querySelector(".review-home");
   if (!view) {
     container.replaceChildren();
     view = element(document, "section", undefined, "review-home");
     const heading = element(document, "h1", "Review");
     const paragraph = element(document, "p", undefined, "review-home-status");
-    paragraph.setAttribute("role", "status");
-    paragraph.setAttribute("aria-live", "polite");
     const activity = element(
       document,
       "div",
@@ -184,7 +185,15 @@ export function renderReviewHome(
       undefined,
       "review-sync-progress-text",
     );
-    activity.append(progress, progressText);
+    const phaseStatus = element(
+      document,
+      "p",
+      undefined,
+      "review-sync-phase-status",
+    );
+    phaseStatus.setAttribute("role", "status");
+    phaseStatus.setAttribute("aria-live", "polite");
+    activity.append(progress, progressText, phaseStatus);
     view.append(heading, paragraph, activity);
     container.append(view);
   }
@@ -195,18 +204,28 @@ export function renderReviewHome(
     nonnegativeCount(dailyListProgress?.pending_dates) > 0 ||
     nonnegativeCount(dailyListProgress?.unavailable_dates) > 0;
   const message = reviewHomeText(summary, {
-    synchronizing,
+    synchronizing: recovering,
     coverageIncomplete,
   });
   if (paragraph.textContent !== message) paragraph.textContent = message;
   const activity = view.querySelector(".review-sync-activity");
   const progress = activity.querySelector("progress");
   const progressText = activity.querySelector(".review-sync-progress-text");
+  const phaseStatus = activity.querySelector(".review-sync-phase-status");
   const retrying = retry.status === "running";
   const coverageText = dailyListProgressText(dailyListProgress);
   activity.hidden = !synchronizing && !retrying;
-  view.setAttribute("aria-busy", synchronizing || retrying ? "true" : "false");
-  if (coverageText) {
+  view.setAttribute("aria-busy", recovering || retrying ? "true" : "false");
+  if (enrichment) {
+    progress.removeAttribute?.("value");
+    progress.removeAttribute?.("max");
+    progress.setAttribute("aria-label", "Syncing recent paper data…");
+    progressText.textContent = "";
+    if (phaseStatus.textContent !== "Syncing recent paper data…") {
+      phaseStatus.textContent = "Syncing recent paper data…";
+    }
+  } else if (coverageText) {
+    if (phaseStatus.textContent !== "") phaseStatus.textContent = "";
     const total = nonnegativeCount(dailyListProgress?.target_dates);
     const checked = Math.min(
       nonnegativeCount(dailyListProgress?.checked_dates),
@@ -217,6 +236,7 @@ export function renderReviewHome(
     progress.setAttribute("aria-label", coverageText);
     progressText.textContent = coverageText;
   } else if (retrying) {
+    if (phaseStatus.textContent !== "") phaseStatus.textContent = "";
     progress.setAttribute("value", retry.completed);
     progress.setAttribute("max", retry.total);
     progress.setAttribute(
@@ -225,6 +245,7 @@ export function renderReviewHome(
     );
     progressText.textContent = "";
   } else {
+    if (phaseStatus.textContent !== "") phaseStatus.textContent = "";
     progress.removeAttribute?.("value");
     progress.removeAttribute?.("max");
     progress.setAttribute("aria-label", "Synchronization in progress");
@@ -392,16 +413,12 @@ export function reviewDestination(page, action) {
     "next-page": { date: day, anchor_event_id: page?.next_anchor_event_id ?? null },
     "previous-date": { date: page?.previous_date ?? null, anchor_event_id: null },
     "next-date": { date: page?.next_date ?? null, anchor_event_id: null },
-    "next-unreviewed": { date: page?.next_unreviewed_date ?? null, anchor_event_id: null },
   };
   if (!Object.hasOwn(destinations, action) || !destinations[action].date) return null;
   if (
     (action === "previous-page" || action === "next-page") &&
     destinations[action].anchor_event_id === null
   ) {
-    return null;
-  }
-  if (action === "next-unreviewed" && destinations[action].date === day) {
     return null;
   }
   return Object.freeze(destinations[action]);
@@ -462,6 +479,9 @@ export function renderReviewView(document, container, page, actions = {}) {
   if (cards.length > 20) throw new RangeError("Review pages cannot exceed 20 cards");
   const day = dayOf(page);
   const totalCards = Number(page?.total_cards ?? cards.length);
+  const pageNumber = Number(page?.page_number ?? 1);
+  const pageCount = Number(page?.page_count ?? 1);
+  const isLastPage = page?.next_anchor_event_id == null && pageNumber >= pageCount;
   const totalNoun = totalCards === 1
     ? "paper announcement"
     : "paper announcements";
@@ -477,7 +497,7 @@ export function renderReviewView(document, container, page, actions = {}) {
     element(
       document,
       "p",
-      `${totalCards} ${reviewState} ${totalNoun} for this date · Page ${Number(page?.page_number ?? 1)} of ${Number(page?.page_count ?? 1)}`,
+      `${totalCards} ${reviewState} ${totalNoun} for this date · Page ${pageNumber} of ${pageCount}`,
       "page-count",
     ),
   );
@@ -493,7 +513,6 @@ export function renderReviewView(document, container, page, actions = {}) {
     ),
     navigationButton(document, "Previous date", reviewDestination(page, "previous-date"), actions.navigate, actions.failure),
     navigationButton(document, "Next date", reviewDestination(page, "next-date"), actions.navigate, actions.failure),
-    navigationButton(document, "Next unreviewed", reviewDestination(page, "next-unreviewed"), actions.navigate, actions.failure),
   );
   view.append(dateNavigation);
 
@@ -503,7 +522,6 @@ export function renderReviewView(document, container, page, actions = {}) {
     navigationButton(document, "Previous page", reviewDestination(page, "previous-page"), actions.navigate, actions.failure),
     navigationButton(document, "Next page", reviewDestination(page, "next-page"), actions.navigate, actions.failure),
   );
-  view.append(pageNavigation);
 
   for (const [tier, label] of TIERS) {
     const tierCards = cards.filter((item) => tierOf(item) === tier);
@@ -515,8 +533,9 @@ export function renderReviewView(document, container, page, actions = {}) {
     }
     view.append(section);
   }
+  view.append(pageNavigation);
 
-  if (reviewState !== "reviewed") {
+  if (reviewState !== "reviewed" && isLastPage) {
     const finishStatus = element(document, "p", "", "finish-status");
     finishStatus.setAttribute("role", "status");
     finishStatus.setAttribute("aria-live", "polite");

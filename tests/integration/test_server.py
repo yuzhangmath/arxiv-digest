@@ -4,6 +4,7 @@ import base64
 import http.client
 import json
 import socket
+import time
 from threading import Event, Thread
 
 import pytest
@@ -359,7 +360,13 @@ def test_server_wires_authenticated_tab_leases_and_graceful_quit() -> None:
         status, quit_response = mutate("/api/v1/application/quit", b"{}")
         assert status == 200
         assert quit_response["data"] == {"quitting": True}
-        assert lifecycle.should_stop() is True
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if lifecycle.should_stop():
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("lifecycle did not stop after the quit response")
     finally:
         server.stop()
 

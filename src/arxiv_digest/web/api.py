@@ -266,7 +266,7 @@ _ROUTES = (
     _R("GET", "/api/v1/review/summary", "review_summary"),
     _R("POST", "/api/v1/review/finish", "review_finish_all", body_kind="json", required=("snapshot_revision", "profile_revision", "projection_revision"), validators={"snapshot_revision": _is_int, "profile_revision": _is_positive_int, "projection_revision": _is_int}),
     _R("GET", "/api/v1/review/calendar", "review_calendar", query_required=("start", "end"), query_validators={"start": _is_iso_date, "end": _is_iso_date}),
-    _R("GET", "/api/v1/review/date", "review_date", query_required=("date",), query_optional=("anchor_event_id",), query_validators={"date": _is_iso_date, "anchor_event_id": _is_offset_text}),
+    _R("GET", "/api/v1/review/date", "review_date", query_required=("date",), query_optional=("anchor_event_id", "from_start"), query_validators={"date": _is_iso_date, "anchor_event_id": _is_offset_text, "from_start": lambda value: value in {"true", "false"}}),
     _R("PUT", "/api/v1/review/date/position", "review_position", body_kind="json", required=("date", "snapshot_revision", "profile_revision", "projection_revision", "anchor_event_id"), validators={"date": _is_iso_date, "snapshot_revision": _is_int, "profile_revision": _is_positive_int, "projection_revision": _is_int, "anchor_event_id": _is_positive_int}),
     _R("POST", "/api/v1/review/date/finish", "review_finish", body_kind="json", required=("date", "snapshot_revision", "profile_revision", "projection_revision"), validators={"date": _is_iso_date, "snapshot_revision": _is_int, "profile_revision": _is_positive_int, "projection_revision": _is_int}),
     _R("GET", "/api/v1/library", "library", query_optional=("q", "offset"), query_validators={"q": _is_optional_text, "offset": _is_offset_text}),
@@ -334,7 +334,6 @@ def _review_event_label(event: Any) -> str | None:
     for announce_type, label in (
         (AnnounceType.REPLACE, "Replacement"),
         (AnnounceType.REPLACE_CROSS, "Replacement cross-list"),
-        (AnnounceType.NEW, "New submission"),
         (AnnounceType.CROSS, "Cross-list"),
     ):
         if announce_type in announce_types:
@@ -343,13 +342,11 @@ def _review_event_label(event: Any) -> str | None:
 
 
 def _review_version_label(event: Any) -> str:
-    from arxiv_digest.models import VersionResolution
-
-    if event.version_resolution is VersionResolution.ATOM_CONFIRMED:
-        return f"Announced v{event.announced_version} — Atom-confirmed"
-    if event.version_resolution is VersionResolution.CHRONOLOGY_MATCHED:
-        return f"Version v{event.announced_version} — matched by chronology"
-    return "Version not confirmed"
+    if event.announced_version is None:
+        return "Version not confirmed"
+    if event.announced_version == 1:
+        return ""
+    return f"Version v{event.announced_version}"
 
 
 def project_review_page(payload: ReviewPagePayload) -> dict[str, JsonValue]:
@@ -374,6 +371,7 @@ def project_review_page(payload: ReviewPagePayload) -> dict[str, JsonValue]:
                 },
                 key=str.casefold,
             ),
+            "subjects": list(paper.categories),
             "resolved_announcement_version": event.announced_version,
             "latest_known_version": payload.latest_known_versions.get(
                 paper.arxiv_id,
@@ -418,11 +416,6 @@ def project_review_page(payload: ReviewPagePayload) -> dict[str, JsonValue]:
             None if page.previous_date is None else page.previous_date.isoformat()
         ),
         "next_date": None if page.next_date is None else page.next_date.isoformat(),
-        "next_unreviewed_date": (
-            None
-            if page.next_unreviewed_date is None
-            else page.next_unreviewed_date.isoformat()
-        ),
         "page_number": page.page_number,
         "page_count": page.page_count,
         "total_cards": page.total_cards,
@@ -745,6 +738,8 @@ class ApiRouter:
             payload["offset"] = int(payload["offset"])
         if "anchor_event_id" in payload:
             payload["anchor_event_id"] = int(payload["anchor_event_id"])
+        if "from_start" in payload:
+            payload["from_start"] = payload["from_start"] == "true"
         if (
             route.operation == "review_calendar"
             and payload["start"] > payload["end"]

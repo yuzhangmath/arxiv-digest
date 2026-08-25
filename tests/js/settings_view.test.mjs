@@ -320,7 +320,7 @@ test("settings actions use the exact scoped API routes and require destructive c
   assert.equal(calls[3].options.body, undefined);
 });
 
-test("settings separates metadata, confirmed coverage, version resolution, cache, Library, and PDF state", () => {
+test("settings keeps canonical version-resolution accounting internal", () => {
   const root = new FakeNode("main");
   const calls = [];
   renderSettingsView(
@@ -414,7 +414,11 @@ test("settings separates metadata, confirmed coverage, version resolution, cache
 
   assert.match(root.textContent, /Metadata synchronization/i);
   assert.match(root.textContent, /Historical daily-list coverage/i);
-  assert.match(root.textContent, /Canonical-event version resolution/i);
+  assert.doesNotMatch(root.textContent, /Canonical-event version resolution/i);
+  assert.doesNotMatch(root.textContent, /Canonical events/i);
+  assert.doesNotMatch(root.textContent, /Atom-confirmed/i);
+  assert.doesNotMatch(root.textContent, /Chronology-matched/i);
+  assert.doesNotMatch(root.textContent, /Unconfirmed/i);
   assert.match(root.textContent, /Synchronization offline/i);
   assert.match(root.textContent, /cached Review and Library remain available/i);
   assert.match(root.textContent, /Metadata synchronized through 2026-08-21/);
@@ -425,9 +429,6 @@ test("settings separates metadata, confirmed coverage, version resolution, cache
   assert.match(root.textContent, /2 pending/i);
   assert.match(root.textContent, /1 unavailable/i);
   assert.match(root.textContent, /catchup_layout_changed/);
-  assert.match(root.textContent, /Atom-confirmed: 8/);
-  assert.match(root.textContent, /Chronology-matched: 9/);
-  assert.match(root.textContent, /Unconfirmed: 3/);
   assert.match(root.textContent, /Candidate cache: ready/i);
   assert.match(root.textContent, /Saved Library papers: 12/i);
   assert.match(root.textContent, /Downloaded PDFs present: 5/i);

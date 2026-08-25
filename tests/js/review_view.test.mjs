@@ -193,6 +193,83 @@ test("review home renders disjoint daily-list coverage progress numerically", ()
   );
 });
 
+test("enrichment shows settled review controls with recent-data activity", () => {
+  const root = new FakeNode("main");
+  const document = new FakeDocument();
+  const summary = {
+    unreviewed_papers: 3,
+    unreviewed_dates: 2,
+    oldest_unreviewed_date: "2026-08-01",
+  };
+  const view = renderReviewHome(document, root, summary, {
+    synchronizing: true,
+    synchronizationPhase: "enrichment",
+    dailyListRetry: { status: "idle", completed: 0, total: 2 },
+    dailyListProgress: {
+      target_dates: 25,
+      checked_dates: 25,
+      dates_with_papers: 17,
+      empty_dates: 8,
+      failed_dates: 0,
+      pending_dates: 0,
+    },
+  });
+
+  const progress = descendants(view, "progress")[0];
+  assert.equal(view.getAttribute("aria-busy"), "false");
+  assert.equal(progress.getAttribute("value"), null);
+  assert.equal(progress.getAttribute("max"), null);
+  assert.equal(
+    progress.getAttribute("aria-label"),
+    "Syncing recent paper data…",
+  );
+  assert.match(view.textContent, /Syncing recent paper data…/);
+  assert.doesNotMatch(view.textContent, /count may increase/);
+  assert.equal(findButton(root, "Start review").disabled, false);
+  assert.equal(findButton(root, "Mark all as reviewed").disabled, false);
+  assert.equal(findButton(root, "Retry 2 failed daily-list dates").disabled, true);
+});
+
+test("enrichment uses one persistent polite phase announcement", () => {
+  const root = new FakeNode("main");
+  const document = new FakeDocument();
+  const summary = {
+    unreviewed_papers: 1,
+    unreviewed_dates: 1,
+    oldest_unreviewed_date: "2026-08-01",
+  };
+  const recovering = renderReviewHome(document, root, summary, {
+    synchronizing: true,
+    synchronizationPhase: "daily_list",
+  });
+  const summaryNode = recovering.querySelector(".review-home-status");
+  const phaseStatus = recovering.querySelector(".review-sync-phase-status");
+  assert.equal(summaryNode.getAttribute("role"), null);
+  assert.equal(phaseStatus.getAttribute("role"), "status");
+  assert.equal(phaseStatus.getAttribute("aria-live"), "polite");
+  assert.equal(phaseStatus.textContent, "");
+
+  const enriching = renderReviewHome(document, root, summary, {
+    synchronizing: true,
+    synchronizationPhase: "enrichment",
+  });
+  assert.equal(enriching, recovering);
+  assert.equal(enriching.querySelector(".review-sync-phase-status"), phaseStatus);
+  assert.equal(phaseStatus.textContent, "Syncing recent paper data…");
+  assert.equal(
+    descendants(enriching, "p").filter(
+      (node) => node.getAttribute("role") === "status",
+    ).length,
+    1,
+  );
+
+  renderReviewHome(document, root, summary, {
+    synchronizing: true,
+    synchronizationPhase: "enrichment",
+  });
+  assert.equal(enriching.querySelector(".review-sync-phase-status"), phaseStatus);
+});
+
 test("review summary describes one late paper as added to a previously finished date", () => {
   assert.equal(
     reviewSummaryText({
@@ -486,11 +563,15 @@ test("review uses server-provided dates, tiers, anchors, and a maximum of 20 car
   findButton(root, "Back to Review overview").click();
   findButton(root, "Previous date").click();
   findButton(root, "Next date").click();
-  findButton(root, "Next unreviewed").click();
+  assert.equal(
+    descendants(root, "button").some(
+      (control) => control.textContent === "Next unreviewed",
+    ),
+    false,
+  );
   assert.deepEqual(navigated, [
     { date: "2026-07-31", anchor_event_id: null },
     { date: "2026-09-01", anchor_event_id: null },
-    { date: "2026-09-04", anchor_event_id: null },
   ]);
   assert.equal(overviews, 1);
   assert.deepEqual(reviewDestination(page, "next-page"), {
@@ -601,6 +682,31 @@ test("next page is disabled when there is no next anchor", () => {
   assert.equal(findButton(root, "Next page").disabled, true);
 });
 
+test("page navigation follows the paper sections on every review page", () => {
+  const root = new FakeNode("main");
+  const view = renderReviewView(new FakeDocument(), root, {
+    day: "2026-08-21",
+    page_number: 2,
+    page_count: 3,
+    previous_anchor_event_id: 1,
+    next_anchor_event_id: 41,
+    cards: [item(21, "top"), item(22, "other")],
+  });
+
+  const pageNavigationIndex = view.children.findIndex(
+    (node) => node.className === "page-navigation",
+  );
+  const lastPaperSectionIndex = view.children.findLastIndex(
+    (node) => node.className.split(/\s+/).includes("ranking-tier"),
+  );
+  const exitNavigationIndex = view.children.findIndex(
+    (node) => node.className === "review-exit-navigation",
+  );
+
+  assert.equal(pageNavigationIndex, lastPaperSectionIndex + 1);
+  assert.ok(pageNavigationIndex < exitNavigationIndex);
+});
+
 test("date navigation shows pending feedback and restores a failed control", async () => {
   const root = new FakeNode("main");
   let rejectNavigation;
@@ -650,10 +756,28 @@ test("review rejects oversized pages rather than hiding cards", () => {
   );
 });
 
-test("next unreviewed is disabled when the backlog still points to this date", () => {
+test("finish date is hidden before the last page of a review date", () => {
+  const root = new FakeNode("main");
+  renderReviewView(new FakeDocument(), root, {
+    day: "2026-08-21",
+    page_number: 1,
+    page_count: 2,
+    next_anchor_event_id: 21,
+    cards: [item(1)],
+  });
+
+  assert.equal(
+    descendants(root, "button").some(
+      (control) => control.textContent === "Finish date",
+    ),
+    false,
+  );
+});
+
+test("review destinations do not expose a global next-unreviewed action", () => {
   const page = {
     day: "2026-08-21",
-    next_unreviewed_date: "2026-08-21",
+    next_unreviewed_date: "2026-09-01",
   };
 
   assert.equal(reviewDestination(page, "next-unreviewed"), null);

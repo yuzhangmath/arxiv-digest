@@ -490,14 +490,15 @@ def test_dashboard_views_are_accessible_and_responsive(width: int) -> None:
         assert page.get_by_text(
             "Metadata synchronized through 2026-08-21.", exact=True
         ).is_visible()
-        assert page.get_by_text(
-            "Canonical events: 20.", exact=True
-        ).is_visible()
-        assert page.get_by_text(
-            "Atom-confirmed: 17 · Chronology-matched: 2 · Unconfirmed: 1.",
-            exact=True,
-        ).is_visible()
         settings_text = page.locator("#settings").inner_text()
+        for internal_label in (
+            "Canonical-event version resolution",
+            "Canonical events",
+            "Atom-confirmed",
+            "Chronology-matched",
+            "Unconfirmed",
+        ):
+            assert internal_label not in settings_text
         assert "current daily feed" not in settings_text
         assert "inferred from version history" not in settings_text
         assert "Historical coverage backfill" not in settings_text

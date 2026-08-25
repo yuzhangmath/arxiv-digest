@@ -46,7 +46,7 @@
     "profile_revision": 5,
     "projection_revision": 9,
     "unconfirmed_latest_version": 4,
-    "next_unreviewed_date": "2026-09-01",
+    "next_later_unreviewed_date": "2026-09-01",
     "readded_coverage_start": "2026-08-24"
   }
 }

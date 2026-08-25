@@ -195,6 +195,13 @@ def test_initialized_doctor_reports_only_allowlisted_aggregate_state(
         "sync_error",
     )
     assert "sync_error" in rendered
+    for internal_label in (
+        "Canonical events",
+        "Atom-confirmed events",
+        "Chronology-matched events",
+        "Unconfirmed events",
+    ):
+        assert internal_label not in rendered
     for secret in (
         str(tmp_path),
         str(secret_destination),

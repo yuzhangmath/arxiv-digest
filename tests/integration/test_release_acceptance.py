@@ -50,7 +50,7 @@ from arxiv_digest.sources.oai import OaiIdentify, OaiPage, oai_observations
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import DownloadFileRecord, Store
 from arxiv_digest.sync import SyncService
-from arxiv_digest.web.lifecycle import INACTIVITY_SECONDS, LifecycleController
+from arxiv_digest.web.lifecycle import LifecycleController
 from arxiv_digest.web.server import LoopbackServer
 
 
@@ -1129,10 +1129,10 @@ class _FakeMonotonic:
         self.value += seconds
 
 
-def test_server_quit_requires_authentication_and_idle_policy_is_thirty_minutes() -> None:
+def test_server_quit_requires_authentication_and_idle_policy_is_three_minutes() -> None:
     clock = _FakeMonotonic()
     idle = LifecycleController(clock=clock)
-    clock.advance(INACTIVITY_SECONDS - 1)
+    clock.advance(3 * 60 - 1)
     assert idle.should_stop() is False
     clock.advance(1)
     assert idle.should_stop() is True

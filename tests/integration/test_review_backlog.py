@@ -167,11 +167,13 @@ def test_two_hundred_papers_remain_reachable_across_review_navigation(
         projection_revision=first.projection_revision,
         finished_at=datetime(2026, 8, 22, 13, tzinfo=timezone.utc),
     )
-    assert service.next_unreviewed().day == date(2026, 8, 3)
+    assert service.next_later_unreviewed_date(date(2026, 7, 30)) == date(
+        2026, 8, 3
+    )
 
     jumped = service.open_date(date(2026, 8, 7))
     assert jumped.previous_date == date(2026, 8, 3)
-    assert jumped.next_unreviewed_date == date(2026, 8, 3)
+    assert service.next_later_unreviewed_date(jumped.day) is None
     reached_middle, middle_revision = _walk_date(
         service, date(2026, 8, 3), min(expected[date(2026, 8, 3)])
     )
@@ -182,6 +184,9 @@ def test_two_hundred_papers_remain_reachable_across_review_navigation(
         profile_revision=jumped.profile_revision,
         projection_revision=jumped.projection_revision,
         finished_at=datetime(2026, 8, 22, 14, tzinfo=timezone.utc),
+    )
+    assert service.next_later_unreviewed_date(date(2026, 8, 3)) == date(
+        2026, 8, 7
     )
     reached_last, last_revision = _walk_date(
         service, date(2026, 8, 7), min(expected[date(2026, 8, 7)])
@@ -196,4 +201,4 @@ def test_two_hundred_papers_remain_reachable_across_review_navigation(
     )
 
     assert service.summary().unreviewed_papers == 0
-    assert service.next_unreviewed() is None
+    assert service.next_later_unreviewed_date(date(2026, 8, 7)) is None

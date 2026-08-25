@@ -81,6 +81,7 @@ class FixtureApplication:
         self.library_empty = False
         self.sync_starts_running = False
         self.sync_running = False
+        self.sync_phase = "daily_list"
         self.sync_status_requests = 0
         self.sync_status_failures = 0
         self.sync_status_gate: threading.Event | None = None
@@ -110,7 +111,7 @@ class FixtureApplication:
         self.review_summary_returned = threading.Event()
         self.review_summary_failures = 0
         self.review_finish_requests = 0
-        self.review_finish_next_unreviewed_date: str | None = None
+        self.review_finish_next_later_unreviewed_date: str | None = None
         self.review_finish_gate: threading.Event | None = None
         self.review_finish_entered = threading.Event()
         self.review_finish_failures = 0
@@ -276,6 +277,7 @@ class FixtureApplication:
                 self.sync_status_failures -= 1
                 raise RuntimeError("synthetic synchronization status failure")
             running = self.sync_running
+            sync_phase = self.sync_phase
             retryable_dates = set(self.settings_retryable_failed_daily_list_dates)
             retry_total = (
                 len(retryable_dates)
@@ -301,12 +303,17 @@ class FixtureApplication:
                     "status": "running",
                     "complete": False,
                     "failed": False,
+                    "phase": sync_phase,
                 }
                 if running
                 else None
             ),
             "daily_list_retry": {
-                "status": "running" if running and retry_total else "idle",
+                "status": (
+                    "running"
+                    if running and sync_phase == "daily_list" and retry_total
+                    else "idle"
+                ),
                 "completed": retry_completed if running else 0,
                 "total": retry_total if running else len(retryable_dates),
             },
@@ -320,6 +327,7 @@ class FixtureApplication:
         with self.lock:
             if self.sync_starts_running:
                 self.sync_running = True
+                self.sync_phase = "daily_list"
                 if payload.get("retry_failed_dates") is True:
                     self.daily_list_retry_total = len(
                         set(self.settings_retryable_failed_daily_list_dates)
@@ -490,7 +498,6 @@ class FixtureApplication:
         return {
             "reviewed_count": 200,
             "through_revision": 77,
-            "next_unreviewed_date": None,
         }
 
     def finish_review_date(
@@ -511,7 +518,9 @@ class FixtureApplication:
         return {
             "reviewed_count": 20,
             "through_revision": 77,
-            "next_unreviewed_date": self.review_finish_next_unreviewed_date,
+            "next_later_unreviewed_date": (
+                self.review_finish_next_later_unreviewed_date
+            ),
         }
 
     def save_to_library(self, payload: dict[str, object]) -> dict[str, bool]:
@@ -528,6 +537,7 @@ class FixtureApplication:
         day = str(payload["date"])
         with self.lock:
             self.review_date_requests += 1
+            self.dashboard_calls.append(("review_date", dict(payload)))
             request_number = self.review_date_requests
             recovered_metadata = (
                 self.review_metadata_tracks_sync and not self.sync_running
@@ -543,8 +553,13 @@ class FixtureApplication:
         active_support = self._active_support(day)
         if not active_support:
             raise KeyError(day)
+        from_start = payload.get("from_start") is True
         requested_anchor = payload.get("anchor_event_id")
-        anchor = int(requested_anchor or self.saved_anchor or 1)
+        anchor = (
+            1
+            if from_start
+            else int(requested_anchor or self.saved_anchor or 1)
+        )
         page_number = min(10, max(1, (anchor - 1) // 20 + 1))
         start = (page_number - 1) * 20 + 1
         cards = []
@@ -580,16 +595,15 @@ class FixtureApplication:
                     "version_label": (
                         "Version not confirmed"
                         if is_carlsson and not carlsson_is_resolved
-                        else "Version v2 — matched by chronology"
-                        if is_carlsson
-                        else "Announced v2 — Atom-confirmed"
+                        else "Version v2"
                     ),
                     "title": title,
                     "authors": ["Ada Example"],
                     "abstract": "An accessible collapsed abstract.",
                     "daily_list_date": day,
                     "support_categories": active_support,
-                    "event_label": "Revision" if is_carlsson else None,
+                    "subjects": list(self.review_support_categories),
+                    "event_label": "Replacement" if is_carlsson else None,
                     "newly_discovered": event_id == start,
                     "reviewed": False,
                     "tier": tier,
@@ -615,7 +629,6 @@ class FixtureApplication:
             "next_anchor_event_id": None if page_number == 10 else start + 20,
             "previous_date": "2026-06-30",
             "next_date": "2026-08-31",
-            "next_unreviewed_date": "2026-09-01",
             "page_number": page_number,
             "page_count": 10,
             "total_cards": 200,
@@ -671,12 +684,26 @@ class FixtureApplication:
             return []
         return [
             {
-                "date": "2026-08-03",
-                "count": 4,
+                "day": "2026-08-01",
+                "total_papers": 14,
+                "unreviewed_papers": 0,
+                "newly_discovered": 0,
+                "finished": True,
+            },
+            {
+                "day": "2026-08-02",
+                "total_papers": 16,
+                "unreviewed_papers": 16,
+                "newly_discovered": 0,
+                "finished": False,
+            },
+            {
+                "day": "2026-08-03",
                 "total_papers": 4,
                 "unreviewed_papers": 2,
-                "status": "partial",
-            }
+                "newly_discovered": 1,
+                "finished": False,
+            },
         ]
 
     def interests(self, payload: dict[str, object]) -> dict[str, object]:
@@ -1601,9 +1628,39 @@ def test_review_reports_initial_sync_and_refreshes_when_papers_arrive() -> None:
         assert page.get_by_text(progress_text, exact=True).is_visible()
 
         with application.lock:
+            application.sync_phase = "enrichment"
+            application.daily_list_checked_dates = 32
+            application.daily_list_dates_with_papers = 20
+            application.daily_list_empty_dates = 10
+            application.daily_list_failed_dates = 2
+            application.daily_list_pending_dates = 0
+
+        recent_data = page.get_by_text(
+            "Syncing recent paper data…",
+            exact=True,
+        )
+        recent_data.wait_for(timeout=5_000)
+        enrichment_progress = page.get_by_role(
+            "progressbar",
+            name="Syncing recent paper data…",
+            exact=True,
+        )
+        assert enrichment_progress.get_attribute("value") is None
+        assert enrichment_progress.get_attribute("max") is None
+        assert page.locator(".review-home").get_attribute("aria-busy") == "false"
+        assert page.get_by_role("button", name="Start review").is_enabled()
+        assert page.get_by_role(
+            "button", name="Mark all as reviewed"
+        ).is_enabled()
+        assert page.get_by_text(
+            "Synchronization is still in progress",
+            exact=False,
+        ).count() == 0
+
+        with application.lock:
             application.sync_running = False
 
-        progress.wait_for(state="hidden", timeout=5_000)
+        enrichment_progress.wait_for(state="hidden", timeout=5_000)
         assert application.sync_status_requests >= 2
 
 
@@ -1854,21 +1911,27 @@ def test_late_failed_review_render_does_not_cross_into_library() -> None:
 def test_review_polling_preserves_focus_and_exposes_live_status() -> None:
     with running_fixture() as (server, application), browser_page("chromium") as page:
         application.sync_running = True
+        application.sync_phase = "enrichment"
         application.review_ready = True
 
         page.goto(server.launch_url("review"))
         start = page.get_by_role("button", name="Start review", exact=True)
         start.wait_for()
-        summary = page.get_by_text(
-            "Synchronization is still in progress", exact=False
+        phase_status = page.get_by_text(
+            "Syncing recent paper data…", exact=True
         )
-        assert summary.get_attribute("role") == "status"
-        assert summary.get_attribute("aria-live") == "polite"
+        assert phase_status.get_attribute("role") == "status"
+        assert phase_status.get_attribute("aria-live") == "polite"
+        assert page.locator(".review-home-status").get_attribute("role") is None
+        phase_status.evaluate("node => { window.__reviewPhaseStatus = node; }")
 
         start.focus()
         page.wait_for_timeout(1_400)
 
         assert page.evaluate("document.activeElement?.textContent") == "Start review"
+        assert phase_status.evaluate(
+            "node => node === window.__reviewPhaseStatus"
+        )
         assert application.sync_status_requests >= 2
 
 
@@ -1963,6 +2026,29 @@ def test_review_sync_progress_becomes_determinate_when_targets_are_known(
         assert home.get_attribute("aria-busy") == "false"
 
 
+def test_enrichment_activity_remains_clear_with_reduced_motion() -> None:
+    with running_fixture() as (server, application), browser_page("chromium") as page:
+        application.sync_running = True
+        application.sync_phase = "enrichment"
+        application.review_ready = True
+        page.emulate_media(reduced_motion="reduce")
+
+        page.goto(server.launch_url("review"))
+
+        assert page.evaluate(
+            "window.matchMedia('(prefers-reduced-motion: reduce)').matches"
+        )
+        page.get_by_text("Syncing recent paper data…", exact=True).wait_for()
+        progress = page.get_by_role(
+            "progressbar",
+            name="Syncing recent paper data…",
+            exact=True,
+        )
+        assert progress.is_visible()
+        assert progress.get_attribute("value") is None
+        assert page.locator(".review-home").get_attribute("aria-busy") == "false"
+
+
 def test_review_start_is_independent_of_failed_daily_list_retry() -> None:
     with running_fixture() as (server, application), browser_page("chromium") as page:
         application.settings_retryable_failed_daily_list_dates = [
@@ -2047,7 +2133,7 @@ def test_open_review_date_refreshes_once_when_synchronization_finishes(
         page.get_by_role("heading", name="Review 2026-07-31").wait_for()
         unresolved = page.locator("article .paper-labels").nth(1)
         assert "Version not confirmed" in unresolved.inner_text()
-        assert "arXiv daily-list date: 2026-07-31" in unresolved.inner_text()
+        assert "daily-list date" not in unresolved.inner_text()
 
         save = page.locator("article").first.get_by_role(
             "button", name="Save", exact=True
@@ -2061,9 +2147,7 @@ def test_open_review_date_refreshes_once_when_synchronization_finishes(
         with application.lock:
             application.sync_running = False
 
-        page.get_by_text(
-            "Version v2 — matched by chronology", exact=False
-        ).wait_for(timeout=5_000)
+        unresolved.get_by_text("Version v2", exact=False).wait_for(timeout=5_000)
         page.get_by_text(
             "Review updated after synchronization finished.", exact=True
         ).wait_for()
@@ -2079,6 +2163,7 @@ def test_finishing_date_wins_over_inflight_terminal_sync_refresh() -> None:
         application.review_date_gate_request = 2
         application.review_date_gate = threading.Event()
         application.review_finish_gate = threading.Event()
+        application.saved_anchor = 181
 
         try:
             page.goto(server.launch_url("review"))
@@ -2159,30 +2244,28 @@ def test_review_home_page_navigation_safe_metadata_and_resume(engine: str) -> No
         ) == 1
         second_labels = page.locator("article .paper-labels").nth(1).inner_text()
         assert second_labels.startswith(
-            "Version not confirmed · arXiv daily-list date: 2026-07-31 · Revision"
+            "Version not confirmed · Replacement · Subjects: math.AG, math.CO"
         )
         assert "Announced v2" not in second_labels
-        assert "Recovered under: math.AG" in second_labels
+        assert "daily-list date" not in second_labels
+        assert "Recovered under" not in second_labels
         assert "Submission date" not in second_labels
         assert "Inferred from version history" not in second_labels
         second = page.locator("article").nth(1)
         assert second.get_by_role(
-            "link", name="Abstract on arXiv (latest version)", exact=True
-        ).get_attribute("href").endswith("/abs/2608.00002")
+            "link", name="Abstract on arXiv", exact=True
+        ).get_attribute("href").endswith("/abs/2608.00002v4")
         assert second.get_by_role(
-            "link", name="PDF on arXiv (latest version)", exact=True
-        ).get_attribute("href").endswith("/pdf/2608.00002.pdf")
+            "link", name="PDF on arXiv", exact=True
+        ).get_attribute("href").endswith("/pdf/2608.00002v4.pdf")
         second.get_by_role(
             "button",
-            name="Download latest v4 — announcement version unconfirmed",
+            name="Download PDF",
             exact=True,
         ).wait_for()
         second.get_by_role(
             "button",
-            name=(
-                "Save unpinned + download latest v4 — "
-                "announcement version unconfirmed"
-            ),
+            name="Save + PDF",
             exact=True,
         ).wait_for()
         for tier in ("Top", "Possible", "Other"):
@@ -2190,17 +2273,43 @@ def test_review_home_page_navigation_safe_metadata_and_resume(engine: str) -> No
         assert page.locator("script", has_text="not markup").count() == 0
         assert page.get_by_text("<script>not markup</script>", exact=False).count() >= 1
         first = page.locator("article").first
+        abstract_box = first.get_by_role(
+            "link", name="Abstract on arXiv", exact=True
+        ).bounding_box()
+        pdf_box = first.get_by_role(
+            "link", name="PDF on arXiv", exact=True
+        ).bounding_box()
+        assert abstract_box is not None
+        assert pdf_box is not None
+        assert pdf_box["x"] >= abstract_box["x"] + abstract_box["width"] + 12
         ranking = first.locator("details.ranking-explanation")
         first.get_by_text("Why this ranking", exact=True).wait_for()
         assert ranking.get_attribute("open") is None
-        first.get_by_text("Announced v2 — Atom-confirmed").wait_for()
+        first.get_by_text("Version v2", exact=False).wait_for()
         first.get_by_text("Newly discovered").wait_for()
         first.get_by_text("Why this ranking", exact=True).click()
         assert ranking.get_attribute("open") is not None
         first.get_by_text("Why this ranking", exact=True).click()
         assert ranking.get_attribute("open") is None
 
-        page.get_by_role("button", name="Next page").click()
+        page_navigation = page.get_by_role(
+            "navigation", name="Pages for this date", exact=True
+        )
+        assert page_navigation.evaluate(
+            """
+            navigation => {
+              const papers = [...document.querySelectorAll("article.paper-card")];
+              const lastPaper = papers.at(-1);
+              return lastPaper !== undefined && Boolean(
+                lastPaper.compareDocumentPosition(navigation) &
+                  Node.DOCUMENT_POSITION_FOLLOWING
+              );
+            }
+            """
+        )
+        page_navigation.get_by_role(
+            "button", name="Next page", exact=True
+        ).click()
         page.get_by_text("Page 2 of 10").wait_for()
         assert application.saved_anchor == 21
         assert (
@@ -2224,11 +2333,9 @@ def test_review_home_page_navigation_safe_metadata_and_resume(engine: str) -> No
         assert page.evaluate("document.activeElement?.textContent") == (
             "Review 2026-08-31"
         )
-        page.get_by_role("button", name="Next unreviewed").click()
-        page.get_by_role("heading", name="Review 2026-09-01").wait_for()
+        assert page.get_by_role("button", name="Next unreviewed").count() == 0
 
-        page.get_by_role("button", name="Finish date").click()
-        assert page.get_by_role("button", name="Confirm finish").is_visible()
+        assert page.get_by_role("button", name="Finish date").count() == 0
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
@@ -2303,8 +2410,8 @@ def test_review_date_navigation_updates_and_clears_history() -> None:
         page.get_by_role("button", name="Calendar").click()
         page.get_by_role("heading", name="Calendar", exact=True).wait_for()
         page.get_by_role(
-            "listitem",
-            name="2026-08-03: 4 paper announcements, partial",
+            "button",
+            name="2026-08-03: 4 papers, partial",
         ).click()
         page.get_by_role("heading", name="Review 2026-08-03").wait_for()
 
@@ -2348,24 +2455,35 @@ def test_stale_next_date_recovers_without_an_unhandled_browser_error() -> None:
         assert page_errors == []
 
 
-def test_finishing_a_date_uses_snapshot_revisions_and_opens_next_unreviewed() -> None:
+def test_finishing_a_date_opens_the_next_later_date_from_its_beginning() -> None:
     with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.review_finish_next_unreviewed_date = "2026-09-01"
+        application.review_finish_next_later_unreviewed_date = "2026-09-01"
+        application.saved_anchor = 181
         page.goto(server.launch_url("review"))
         page.get_by_role("button", name="Start review").click()
         page.get_by_role("heading", name="Review 2026-07-31").wait_for()
+        with application.lock:
+            application.saved_anchor = 21
 
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.get_by_role("button", name="Finish date", exact=True).click()
         page.get_by_role("button", name="Confirm finish", exact=True).click()
 
         page.get_by_role(
             "heading", name="Review 2026-09-01", exact=True
         ).wait_for()
+        page.get_by_text("Page 1 of 10", exact=False).wait_for()
         page.get_by_text(
             "Finished review for 2026-07-31. Opening 2026-09-01.", exact=True
         ).wait_for()
         assert page.url.endswith("?view=review")
         assert page.evaluate("history.state") == {"view": "review"}
+        assert page.evaluate("document.activeElement?.textContent") == (
+            "Review 2026-09-01"
+        )
+        assert page.locator(".review-view h1").evaluate(
+            "node => node.getBoundingClientRect().top"
+        ) < 100
         assert (
             "review_finish",
             {
@@ -2375,11 +2493,33 @@ def test_finishing_a_date_uses_snapshot_revisions_and_opens_next_unreviewed() ->
                 "projection_revision": 9,
             },
         ) in application.dashboard_calls
+        assert (
+            "review_date",
+            {"date": "2026-09-01", "from_start": True},
+        ) in application.dashboard_calls
+
+
+def test_finishing_without_a_later_date_returns_to_the_review_overview() -> None:
+    with running_fixture() as (server, application), browser_page("chromium") as page:
+        application.review_finish_next_later_unreviewed_date = None
+        application.saved_anchor = 181
+        page.goto(server.launch_url("review"))
+        page.get_by_role("button", name="Start review").click()
+        page.get_by_role("heading", name="Review 2026-07-31").wait_for()
+
+        page.get_by_role("button", name="Finish date", exact=True).click()
+        page.get_by_role("button", name="Confirm finish", exact=True).click()
+
+        page.get_by_role("heading", name="Review", exact=True).wait_for()
+        page.get_by_role("button", name="Start review", exact=True).wait_for()
+        assert page.locator(".review-view").count() == 0
+        assert page.url.endswith("?view=review")
 
 
 def test_successful_date_finish_is_not_retried_when_overview_refresh_fails() -> None:
     with running_fixture() as (server, application), browser_page("chromium") as page:
         application.review_finish_refresh_failures = 1
+        application.saved_anchor = 181
         page.goto(server.launch_url("review"))
         page.get_by_role("button", name="Start review", exact=True).click()
         page.get_by_role("heading", name="Review 2026-07-31").wait_for()
@@ -2406,6 +2546,7 @@ def test_successful_date_finish_is_not_retried_when_overview_refresh_fails() -> 
 def test_late_date_finish_cannot_replace_library_or_leak_success_status() -> None:
     with running_fixture() as (server, application), browser_page("chromium") as page:
         application.review_finish_gate = threading.Event()
+        application.saved_anchor = 181
 
         try:
             page.goto(server.launch_url("review"))
@@ -2439,6 +2580,7 @@ def test_late_failed_date_finish_does_not_leak_status_into_library() -> None:
     with running_fixture() as (server, application), browser_page("chromium") as page:
         application.review_finish_gate = threading.Event()
         application.review_finish_failures = 1
+        application.saved_anchor = 181
 
         try:
             page.goto(server.launch_url("review"))
@@ -2519,11 +2661,15 @@ def test_calendar_navigation_opens_and_keeps_the_selected_date(engine: str) -> N
             "sessionStorage.getItem('arxiv-digest.session-token')"
         ) == server.token
         calendar_day = page.get_by_role(
-            "listitem",
-            name="2026-08-03: 4 paper announcements, partial",
+            "button",
+            name="2026-08-03: 4 papers, partial",
         )
-        assert "4 paper announcements" in calendar_day.inner_text()
-        calendar_day.click()
+        assert "4 papers" in calendar_day.inner_text()
+        assert "Partial" in calendar_day.inner_text()
+        assert calendar_day.get_attribute("role") is None
+        assert calendar_day.locator("xpath=..").get_attribute("role") == "listitem"
+        calendar_day.focus()
+        page.keyboard.press("Enter")
         page.get_by_role("heading", name="Review 2026-08-03").wait_for()
         page.wait_for_timeout(250)
 
@@ -2531,6 +2677,66 @@ def test_calendar_navigation_opens_and_keeps_the_selected_date(engine: str) -> N
             "heading", name="Review 2026-08-03"
         ).is_visible()
         assert "view=review" in page.url
+
+
+def test_calendar_outlines_distinguish_review_states_in_light_and_dark() -> None:
+    with running_fixture() as (server, _application), browser_page("chromium") as page:
+        page.goto(server.launch_url("calendar"))
+        page.get_by_role("heading", name="Calendar", exact=True).wait_for()
+        cards = {
+            "reviewed": page.get_by_role(
+                "button", name="2026-08-01: 14 papers, reviewed"
+            ),
+            "unreviewed": page.get_by_role(
+                "button", name="2026-08-02: 16 papers, unreviewed"
+            ),
+            "partial": page.get_by_role(
+                "button", name="2026-08-03: 4 papers, partial"
+            ),
+        }
+        assert "✓ Reviewed" in cards["reviewed"].inner_text()
+        assert "Unreviewed" in cards["unreviewed"].inner_text()
+        assert "Partial" in cards["partial"].inner_text()
+
+        theme_colors: dict[str, dict[str, str]] = {}
+        for color_scheme in ("light", "dark"):
+            page.emulate_media(color_scheme=color_scheme)
+            styles = {
+                status: card.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return {
+                            borderColor: style.borderTopColor,
+                            borderStyle: style.borderTopStyle,
+                            borderWidth: style.borderTopWidth,
+                            color: style.color,
+                            opacity: style.opacity,
+                        };
+                    }"""
+                )
+                for status, card in cards.items()
+            }
+            assert styles["reviewed"]["borderStyle"] == "solid"
+            assert styles["reviewed"]["borderWidth"] == "1px"
+            assert styles["reviewed"]["borderColor"] == styles["reviewed"]["color"]
+            assert styles["unreviewed"]["borderStyle"] == "solid"
+            assert styles["unreviewed"]["borderWidth"] == "2px"
+            assert styles["partial"]["borderStyle"] == "dashed"
+            assert styles["partial"]["borderWidth"] == "2px"
+            assert (
+                styles["unreviewed"]["borderColor"]
+                == styles["partial"]["borderColor"]
+            )
+            assert (
+                styles["unreviewed"]["borderColor"]
+                != styles["reviewed"]["borderColor"]
+            )
+            assert {style["opacity"] for style in styles.values()} == {"1"}
+            theme_colors[color_scheme] = {
+                status: style["borderColor"] for status, style in styles.items()
+            }
+
+        assert theme_colors["light"] != theme_colors["dark"]
 
 
 def test_category_lifecycle_hides_active_views_but_retains_library_state() -> None:
@@ -2546,7 +2752,7 @@ def test_category_lifecycle_hides_active_views_but_retains_library_state() -> No
         page.get_by_role("button", name="Start review", exact=True).click()
         page.get_by_role("heading", name="Review 2026-07-31", exact=True).wait_for()
         page.locator("article").first.get_by_text(
-            "Recovered under: math.AG · math.CO", exact=False
+            "Subjects: math.AG, math.CO", exact=False
         ).wait_for()
 
         page.get_by_role("button", name="Interests", exact=True).click()
@@ -2557,7 +2763,7 @@ def test_category_lifecycle_hides_active_views_but_retains_library_state() -> No
         page.get_by_role("button", name="Review", exact=True).click()
         page.get_by_role("button", name="Start review", exact=True).click()
         page.locator("article").first.get_by_text(
-            "Recovered under: math.CO", exact=False
+            "Subjects: math.AG, math.CO", exact=False
         ).wait_for()
 
         page.get_by_role("button", name="Interests", exact=True).click()
@@ -3320,15 +3526,20 @@ def test_settings_uses_fallback_only_when_the_native_picker_is_unavailable() -> 
         page.get_by_role(
             "heading", name="Historical daily-list coverage", exact=True
         ).wait_for()
-        page.get_by_role(
-            "heading", name="Canonical-event version resolution", exact=True
-        ).wait_for()
         page.get_by_text(
             "Target dates: 32 · 18 checked · 10 with papers · 8 empty · "
             "2 failed · 12 pending · 1 unavailable.",
             exact=True,
         ).wait_for()
         settings_text = page.locator("#content").inner_text()
+        for internal_label in (
+            "Canonical-event version resolution",
+            "Canonical events",
+            "Atom-confirmed",
+            "Chronology-matched",
+            "Unconfirmed",
+        ):
+            assert internal_label not in settings_text
         assert "current daily feed" not in settings_text
         assert "inferred from version history" not in settings_text
 

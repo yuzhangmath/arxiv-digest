@@ -56,8 +56,8 @@ class ReleaseFixtureApplication(FixtureApplication):
         self.review_unconfirmed_latest_version = int(
             confirmed["unconfirmed_latest_version"]
         )
-        self.review_finish_next_unreviewed_date = str(
-            confirmed["next_unreviewed_date"]
+        self.review_finish_next_later_unreviewed_date = str(
+            confirmed["next_later_unreviewed_date"]
         )
         self.sync_running = True
 
@@ -67,7 +67,9 @@ class ReleaseFixtureApplication(FixtureApplication):
         return {
             "reviewed_count": 20,
             "through_revision": 77,
-            "next_unreviewed_date": self.review_finish_next_unreviewed_date,
+            "next_later_unreviewed_date": (
+                self.review_finish_next_later_unreviewed_date
+            ),
         }
 
     def handlers(self) -> dict[str, object]:
@@ -397,32 +399,54 @@ def test_release_setup_and_two_hundred_card_review_are_explicit_and_resumable(
         unresolved = page.locator("article").nth(1)
         unresolved.get_by_text("Version not confirmed", exact=False).wait_for()
         unresolved.get_by_role(
-            "link", name="Abstract on arXiv (latest version)", exact=True
+            "link", name="Abstract on arXiv", exact=True
         ).wait_for()
         unresolved.get_by_role(
-            "link", name="PDF on arXiv (latest version)", exact=True
+            "link", name="PDF on arXiv", exact=True
         ).wait_for()
         with page.expect_response(
             lambda response: response.url.endswith("/api/v1/library/pdf")
         ):
             unresolved.get_by_role(
                 "button",
-                name="Download latest v4 — announcement version unconfirmed",
+                name="Download PDF",
                 exact=True,
             ).click()
         unresolved.get_by_role(
-            "button",
-            name=(
-                "Save unpinned + download latest v4 — "
-                "announcement version unconfirmed"
-            ),
-            exact=True,
+            "button", name="Downloaded", exact=True
         ).wait_for()
+        unresolved.get_by_text("PDF downloaded.", exact=True).wait_for()
+        assert (
+            "download_status",
+            {"job_id": "download_1234"},
+        ) in application.dashboard_calls
+        completed_status_requests = sum(
+            operation == "download_status"
+            for operation, _payload in application.dashboard_calls
+        )
+        with page.expect_response(
+            lambda response: response.url.endswith("/api/v1/library/pdf")
+        ):
+            unresolved.get_by_role(
+                "button",
+                name="Save + PDF",
+                exact=True,
+            ).click()
+        unresolved.get_by_role(
+            "button", name="Saved + downloaded", exact=True
+        ).wait_for()
+        unresolved.get_by_text(
+            "Paper saved and PDF downloaded.", exact=True
+        ).wait_for()
+        assert sum(
+            operation == "download_status"
+            for operation, _payload in application.dashboard_calls
+        ) == completed_status_requests + 1
         unresolved.get_by_role("button", name="Save", exact=True).click()
         unresolved.get_by_role("button", name="Saved", exact=True).wait_for()
         assert (
             "library_save",
-            {"arxiv_id": "2608.00002", "version": None},
+            {"arxiv_id": "2608.00002", "version": 4},
         ) in application.dashboard_calls
         assert (
             "library_pdf",
@@ -431,6 +455,15 @@ def test_release_setup_and_two_hundred_card_review_are_explicit_and_resumable(
                 "version": 4,
                 "save_first": False,
                 "save_version": None,
+            },
+        ) in application.dashboard_calls
+        assert (
+            "library_pdf",
+            {
+                "arxiv_id": "2608.00002",
+                "version": 4,
+                "save_first": True,
+                "save_version": 4,
             },
         ) in application.dashboard_calls
         page.get_by_text(
@@ -455,6 +488,8 @@ def test_release_setup_and_two_hundred_card_review_are_explicit_and_resumable(
         page.get_by_role(
             "heading", name="Review 2026-08-31", exact=True
         ).wait_for()
+        with application.lock:
+            application.saved_anchor = 181
         page.get_by_role("navigation", name="Review dates").get_by_role(
             "button", name="Back to Review overview", exact=True
         ).click()

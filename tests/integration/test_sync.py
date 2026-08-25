@@ -28,6 +28,7 @@ from arxiv_digest.profile import (
     ProfileRepository,
 )
 from arxiv_digest.setup import SetupService
+from arxiv_digest.sources.catchup import catchup_observations
 from arxiv_digest.sources.oai import OaiIdentify, OaiPage, OaiProtocolError
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import Store
@@ -263,9 +264,10 @@ def test_catchup_is_applied_before_hidden_sources_and_survives_their_failures(
         attempted=lambda _category, day: visible_after_attempt.append(
             len(store.events_for_date(day))
         ),
+        daily_list_complete=lambda: calls.append("daily_list_complete"),
     )
 
-    assert calls == ["catchup", "atom", "oai"]
+    assert calls == ["catchup", "daily_list_complete", "atom", "oai"]
     assert visible_after_attempt == [1]
     assert len(store.events_for_date(mailing_date)) == 1
 
@@ -1430,6 +1432,104 @@ def test_atom_enrichment_alone_does_not_claim_exact_mailing_coverage(
     assert progress.exact_start is None
     assert progress.exact_end is None
     assert progress.missing_exact_dates == ()
+
+
+def test_daily_list_preflight_detects_a_missing_required_date(
+    tmp_path: Path,
+) -> None:
+    _store, _oai, _atom, _catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 22))
+
+    assert service.has_pending_daily_list_work((config,)) is True
+
+
+def test_daily_list_preflight_accepts_complete_finalized_coverage(
+    tmp_path: Path,
+) -> None:
+    store, oai, atom, catchup, _service_before_finalization = _service(tmp_path)
+    service = SyncService(
+        store,
+        oai,
+        atom,
+        catchup,
+        clock=lambda: datetime(2026, 8, 23, 1, tzinfo=timezone.utc),
+        today=lambda: date(2026, 8, 22),
+    )
+    mailing_date = date(2026, 8, 22)
+    config = CategoryConfig("cs.SE", "cs:SE", mailing_date)
+    store.ensure_category_state(
+        config.category,
+        config.oai_set_spec,
+        config.coverage_start,
+    )
+    store.ensure_catchup_targets(config.category, (mailing_date,))
+    result = CatchupDay(
+        category=config.category,
+        mailing_date=mailing_date,
+        status=EnrichmentStatus.COMPLETE,
+        pages=(
+            CatchupPage(
+                category=config.category,
+                mailing_date=mailing_date,
+                page=1,
+                total_pages=1,
+                entries=(
+                    CatchupEntry(
+                        metadata=_paper("2608.04221"),
+                        section=AnnounceType.NEW,
+                        mailing_date=mailing_date,
+                        position=0,
+                    ),
+                ),
+                raw_sha256="2" * 64,
+            ),
+        ),
+        error_code=None,
+        error_message=None,
+    )
+    store.apply_catchup_day(
+        result,
+        catchup_observations(result, NOW),
+        NOW,
+    )
+
+    assert service.has_pending_daily_list_work((config,)) is False
+
+
+def test_daily_list_preflight_detects_a_failed_retryable_date(
+    tmp_path: Path,
+) -> None:
+    store, oai, atom, catchup, _service_before_finalization = _service(tmp_path)
+    service = SyncService(
+        store,
+        oai,
+        atom,
+        catchup,
+        clock=lambda: datetime(2026, 8, 23, 1, tzinfo=timezone.utc),
+        today=lambda: date(2026, 8, 22),
+    )
+    mailing_date = date(2026, 8, 22)
+    config = CategoryConfig("cs.SE", "cs:SE", mailing_date)
+    store.ensure_category_state(
+        config.category,
+        config.oai_set_spec,
+        config.coverage_start,
+    )
+    store.ensure_catchup_targets(config.category, (mailing_date,))
+    store.apply_catchup_day(
+        CatchupDay(
+            category=config.category,
+            mailing_date=mailing_date,
+            status=EnrichmentStatus.FAILED,
+            pages=(),
+            error_code="catchup_fixture_failed",
+            error_message="The catch-up fixture did not complete.",
+        ),
+        (),
+        NOW,
+    )
+
+    assert service.has_pending_daily_list_work((config,)) is True
 
 
 def test_catchup_evidence_does_not_erase_authoritative_oai_metadata(

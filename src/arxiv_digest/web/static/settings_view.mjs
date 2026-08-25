@@ -465,21 +465,6 @@ function renderSyncSettings(document, model, actions) {
   }
   wrapper.append(coverage);
 
-  const resolution = model.version_resolution ?? {};
-  const versionSection = element(document, "section", undefined, "settings-section");
-  versionSection.append(
-    element(document, "h2", "Canonical-event version resolution"),
-    element(document, "p", `Canonical events: ${number(resolution.canonical_event_count)}.`),
-    element(
-      document,
-      "p",
-      `Atom-confirmed: ${number(resolution.atom_confirmed)} · ` +
-        `Chronology-matched: ${number(resolution.chronology_matched)} · ` +
-        `Unconfirmed: ${number(resolution.unconfirmed)}.`,
-    ),
-  );
-  wrapper.append(versionSection);
-
   const durable = element(document, "section", undefined, "settings-section");
   durable.append(
     element(document, "h2", "Library and PDF presence"),
@@ -504,10 +489,6 @@ function renderDoctor(document, report) {
     ["Metadata checkpoints", report?.metadata_checkpoint_count],
     ["Daily-list targets", report?.daily_list_target_count],
     ["Daily-list gaps", report?.daily_list_gap_count],
-    ["Canonical events", report?.canonical_event_count],
-    ["Atom-confirmed", report?.atom_confirmed_count],
-    ["Chronology-matched", report?.chronology_matched_count],
-    ["Unconfirmed", report?.unconfirmed_count],
     ["Saved papers", report?.saved_paper_count],
     ["Downloaded PDFs", report?.downloaded_pdf_count],
     ["Candidate cache", report?.candidate_cache_status],

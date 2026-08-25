@@ -182,6 +182,15 @@ class SyncService:
             mailing_today=mailing_today,
         )
 
+    def has_pending_daily_list_work(
+        self, configs: tuple[CategoryConfig, ...]
+    ) -> bool:
+        """Return whether an ordinary sync pass has daily-list work."""
+
+        return any(
+            self._eligible_catchup_dates(config, None) for config in configs
+        )
+
     @staticmethod
     def _raise_cancelled(error: Exception) -> None:
         if isinstance(error, SyncCancelled):
@@ -219,6 +228,7 @@ class SyncService:
         *,
         catchup_dates: Mapping[str, Iterable[date]] | None = None,
         attempted: Callable[[str, date], None] | None = None,
+        daily_list_complete: Callable[[], None] | None = None,
     ) -> SyncReport:
         if not configs:
             return SyncReport((), False, True, None, None, ())
@@ -257,6 +267,9 @@ class SyncService:
                     network_failures += 1
                 if attempted is not None:
                     attempted(config.category, mailing_date)
+
+        if daily_list_complete is not None:
+            daily_list_complete()
 
         # Atom and OAI enrich confirmed events but never create visible ones.
         for config in configs:

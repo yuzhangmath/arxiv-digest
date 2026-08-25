@@ -192,6 +192,38 @@ function clearTrackedReviewDate() {
   history.replaceState({ view: "review" }, "", tokenFreeViewUrl("review"));
 }
 
+async function waitForDownloadJob(jobId) {
+  while (true) {
+    if (applicationClosing) throw new StaleResponseError();
+    const result = await libraryController.downloadStatus(jobId);
+    if (result?.failed || result?.status === "failed") {
+      const error = new Error("PDF download did not complete.");
+      error.code = result?.error_code ?? "download_failed";
+      throw error;
+    }
+    if (result?.complete || result?.status === "completed") return result;
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
+}
+
+async function startReviewPdfDownload(
+  arxivId,
+  version,
+  { saveFirst, saveVersion },
+) {
+  const result = await api.json(
+    `paper-pdf:${arxivId}:${saveFirst ? "save" : "download"}`,
+    "/api/v1/library/pdf",
+    jsonBody({
+      arxiv_id: arxivId,
+      version,
+      save_first: saveFirst,
+      save_version: saveVersion,
+    }),
+  );
+  return waitForDownloadJob(result?.job_id);
+}
+
 async function navigateReviewDate(
   destination,
   { synchronizationRefresh = false } = {},
@@ -206,6 +238,7 @@ async function navigateReviewDate(
     if (!rendered || state.snapshot.view !== "review") return false;
     replaceTrackedReviewDate(destination.date);
     const heading = content.querySelector(".review-view h1");
+    heading?.scrollIntoView?.({ block: "start" });
     heading?.focus();
     statusText(
       synchronizationRefresh
@@ -295,9 +328,14 @@ async function requestReview(destination = {}) {
     const summary = await api.json("review-summary", "/api/v1/review/summary");
     if (!reviewRequestIsCurrent(requestSequence)) return false;
     const synchronizing = serviceStatus?.sync?.status === "running";
+    const synchronizationPhase =
+      synchronizing && serviceStatus?.sync?.phase === "enrichment"
+        ? "enrichment"
+        : "daily_list";
     const dailyListRetry = serviceStatus?.daily_list_retry;
     renderReviewHome(document, content, summary, {
       synchronizing,
+      synchronizationPhase,
       dailyListRetry,
       dailyListProgress: serviceStatus?.daily_list_progress,
       start: (oldest) => navigateReviewDate({ date: oldest }),
@@ -374,6 +412,9 @@ async function requestReview(destination = {}) {
   if (destination.anchor_event_id != null) {
     parameters.set("anchor_event_id", String(destination.anchor_event_id));
   }
+  if (destination.from_start === true) {
+    parameters.set("from_start", "true");
+  }
   const [serviceStatus, page] = await Promise.all([
     api.json("review-status", "/api/v1/status"),
     api.json("review-page", `/api/v1/review/date?${parameters}`),
@@ -423,9 +464,12 @@ async function requestReview(destination = {}) {
         content.querySelector(".review-view") !== openedView
       ) return result;
       clearTrackedReviewDate();
-      const nextDate = result?.next_unreviewed_date;
+      const nextDate = result?.next_later_unreviewed_date;
       if (typeof nextDate === "string" && nextDate) {
-        const opened = await navigateReviewDate({ date: nextDate });
+        const opened = await navigateReviewDate({
+          date: nextDate,
+          from_start: true,
+        });
         if (opened) {
           statusText(`Finished review for ${openedDay}. Opening ${nextDate}.`);
         }
@@ -441,8 +485,20 @@ async function requestReview(destination = {}) {
         "/api/v1/library/save",
         jsonBody({ arxiv_id: arxivId, version: version || null }),
       ),
-      download: (arxivId, version) => api.json("paper-pdf", "/api/v1/library/pdf", jsonBody({ arxiv_id: arxivId, version, save_first: false, save_version: null })),
-      saveAndDownload: (arxivId, saveVersion, downloadVersion = saveVersion) => api.json("paper-pdf", "/api/v1/library/pdf", jsonBody({ arxiv_id: arxivId, version: downloadVersion, save_first: true, save_version: saveVersion })),
+      download: (arxivId, version) => startReviewPdfDownload(
+        arxivId,
+        version,
+        { saveFirst: false, saveVersion: null },
+      ),
+      saveAndDownload: (
+        arxivId,
+        saveVersion,
+        downloadVersion = saveVersion,
+      ) => startReviewPdfDownload(
+        arxivId,
+        downloadVersion,
+        { saveFirst: true, saveVersion },
+      ),
       failure: showActionFailure,
     },
   });

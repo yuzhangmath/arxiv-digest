@@ -429,6 +429,7 @@ class _DefaultRuntime:
                     "running"
                     if sync_job is not None
                     and sync_job.get("status") == "running"
+                    and sync_job.get("phase", "daily_list") == "daily_list"
                     and retry_dates
                     else "idle"
                 ),
@@ -545,6 +546,7 @@ class _DefaultRuntime:
         page = self.review.open_date(
             day,
             anchor_event_id=payload.get("anchor_event_id"),
+            from_start=payload.get("from_start", False),
         )
         versions: dict[str, int] = {}
         for card in page.cards:
@@ -567,18 +569,19 @@ class _DefaultRuntime:
         )
 
     def _review_finish(self, payload: dict[str, Any]) -> Any:
+        day = date.fromisoformat(payload["date"])
         result = self.review.finish_date(
-            date.fromisoformat(payload["date"]),
+            day,
             through_revision=payload["snapshot_revision"],
             profile_revision=payload["profile_revision"],
             projection_revision=payload["projection_revision"],
             finished_at=datetime.now(timezone.utc),
         )
-        next_date = self.review.summary().oldest_unreviewed_date
+        next_date = self.review.next_later_unreviewed_date(day)
         return {
             "reviewed_count": result.reviewed_count,
             "through_revision": result.through_revision,
-            "next_unreviewed_date": (
+            "next_later_unreviewed_date": (
                 None if next_date is None else next_date.isoformat()
             ),
         }
@@ -616,6 +619,7 @@ class _DefaultRuntime:
         *,
         job_id: str | None = None,
         request_cancel: Callable[[], None] | None = None,
+        initial_fields: Mapping[str, Any] | None = None,
     ) -> str:
         job_id = job_id or f"{prefix}_{secrets.token_urlsafe(12)}"
         with self._jobs_lock:
@@ -627,12 +631,14 @@ class _DefaultRuntime:
                 raise ValueError("too many active background jobs")
             if job_id in self._jobs:
                 raise ValueError("background job identifier already exists")
-            self._jobs[job_id] = {
+            job = {
                 "job_id": job_id,
                 "status": "running",
                 "complete": False,
                 "failed": False,
             }
+            job.update(initial_fields or {})
+            self._jobs[job_id] = job
 
         worker_registered = threading.Event()
 
@@ -1450,8 +1456,32 @@ class _DefaultRuntime:
             if progress.retryable_failed_exact_dates
         }
 
+    def _set_sync_phase(self, job_id: str, phase: str) -> None:
+        if phase not in {"daily_list", "enrichment"}:
+            raise ValueError("unknown synchronization phase")
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.get("status") != "running":
+                return
+            job["phase"] = phase
+            if phase == "enrichment":
+                job.pop("daily_list_retry", None)
+
     def _run_sync_pass(self, job_id: str, *, retry_failed_dates: bool) -> Any:
         configs = self._sync_configs()
+        pending_daily_lists = getattr(
+            self.sync,
+            "has_pending_daily_list_work",
+            None,
+        )
+        phase = (
+            "daily_list"
+            if retry_failed_dates
+            or not callable(pending_daily_lists)
+            or pending_daily_lists(configs)
+            else "enrichment"
+        )
+        self._set_sync_phase(job_id, phase)
         retry_dates = self._retryable_sync_dates(configs)
         targets_by_date: dict[date, set[str]] = {}
         for category, dates in retry_dates.items():
@@ -1496,9 +1526,22 @@ class _DefaultRuntime:
                 attempted=record_attempt,
             )
         elif targets_by_date:
-            report = self.sync.sync(configs, attempted=record_attempt)
+            report = self.sync.sync(
+                configs,
+                attempted=record_attempt,
+                daily_list_complete=lambda: self._set_sync_phase(
+                    job_id,
+                    "enrichment",
+                ),
+            )
         else:
-            report = self.sync.sync(configs)
+            report = self.sync.sync(
+                configs,
+                daily_list_complete=lambda: self._set_sync_phase(
+                    job_id,
+                    "enrichment",
+                ),
+            )
         self._last_sync_report = report
         return report
 
@@ -1538,6 +1581,18 @@ class _DefaultRuntime:
                 # startup race inside the worker thread.
                 self._sync_cancel.clear()
             try:
+                pending_daily_lists = getattr(
+                    getattr(self, "sync", None),
+                    "has_pending_daily_list_work",
+                    None,
+                )
+                initial_phase = (
+                    "daily_list"
+                    if payload.get("retry_failed_dates") is True
+                    or not callable(pending_daily_lists)
+                    or pending_daily_lists(self._sync_configs())
+                    else "enrichment"
+                )
                 self._new_job(
                     "sync",
                     "sync",
@@ -1547,6 +1602,7 @@ class _DefaultRuntime:
                     ),
                     job_id=job_id,
                     request_cancel=self._sync_cancel.set,
+                    initial_fields={"phase": initial_phase},
                 )
             except Exception:
                 with self._jobs_lock:

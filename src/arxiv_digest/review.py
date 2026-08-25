@@ -41,13 +41,6 @@ class ReviewDateSummary:
 
 
 @dataclass(frozen=True, slots=True)
-class ReviewDateLinks:
-    previous_date: date | None
-    next_date: date | None
-    next_unreviewed_date: date | None
-
-
-@dataclass(frozen=True, slots=True)
 class ReviewPosition:
     day: date
     snapshot_revision: int
@@ -68,7 +61,6 @@ class ReviewPage:
     next_anchor_event_id: int | None
     previous_date: date | None
     next_date: date | None
-    next_unreviewed_date: date | None
     page_number: int
     page_count: int
     total_cards: int
@@ -86,7 +78,6 @@ def page_from_anchor(
     projection_revision: int,
     previous_date: date | None,
     next_date: date | None,
-    next_unreviewed_date: date | None,
     last_finished_revision: int | None = None,
 ) -> ReviewPage:
     if page_size < 1:
@@ -133,7 +124,6 @@ def page_from_anchor(
         ),
         previous_date=previous_date,
         next_date=next_date,
-        next_unreviewed_date=next_unreviewed_date,
         page_number=page_number,
         page_count=page_count,
         total_cards=len(ranked),
@@ -264,6 +254,7 @@ class ReviewService:
         day: date,
         *,
         anchor_event_id: int | None = None,
+        from_start: bool = False,
     ) -> ReviewPage:
         profile = self._profile()
         active_configs = self._active_configs(profile)
@@ -298,9 +289,13 @@ class ReviewService:
             else ranked_date
         )
         anchor = (
-            anchor_event_id
-            if anchor_event_id is not None
-            else snapshot.anchor_event_id
+            None
+            if from_start
+            else (
+                anchor_event_id
+                if anchor_event_id is not None
+                else snapshot.anchor_event_id
+            )
         )
         links = self.store.review_date_links(
             day, active_configs=active_configs
@@ -315,7 +310,6 @@ class ReviewService:
             projection_revision=snapshot.projection_revision,
             previous_date=links.previous_date,
             next_date=links.next_date,
-            next_unreviewed_date=self.summary().oldest_unreviewed_date,
             last_finished_revision=snapshot.last_finished_revision,
         )
 
@@ -362,9 +356,24 @@ class ReviewService:
             day, active_configs=self._active_configs(profile)
         ).next_date
 
-    def next_unreviewed(self) -> ReviewPage | None:
-        day = self.summary().oldest_unreviewed_date
-        return None if day is None else self.open_date(day)
+    def next_later_unreviewed_date(self, day: date) -> date | None:
+        profile = self._profile()
+        active_configs = self._active_configs(profile)
+        snapshot_revision, _projection_revision = self.store.review_revisions()
+        for candidate in self.store.list_review_dates(
+            through_revision=snapshot_revision,
+            active_configs=active_configs,
+        ):
+            if candidate <= day:
+                continue
+            summary = self._date_summary(
+                candidate,
+                active_configs=active_configs,
+                through_revision=snapshot_revision,
+            )
+            if summary.unreviewed_papers > 0:
+                return candidate
+        return None
 
     def calendar(self, start: date, end: date) -> tuple[ReviewDateSummary, ...]:
         if start > end:

@@ -114,10 +114,11 @@ sample require a live connection to arXiv. Each candidate-building attempt is
 capped at five minutes; an incomplete attempt offers **Resume corpus** or
 **Restart corpus**.
 When finished, select **Quit** and wait for the terminal prompt to return.
-Closing only the browser tab may leave the process running for about 30
-minutes. The dashboard guides you through categories, initial history,
-candidate papers, optional seed papers, terms and authors, a picker-selected
-PDF folder, profile review, and the optional desktop launcher.
+Closing only the browser tab normally leaves the process running for about 3
+minutes and may take up to about 4.5 minutes when the browser cannot deliver
+its disconnect notice. The dashboard guides you through categories, initial
+history, candidate papers, optional seed papers, terms and authors, a
+picker-selected PDF folder, profile review, and the optional desktop launcher.
 The **Terms** step presents multiword **Suggested terms** and one **Custom
 term** control. A one-word custom term is saved as a keyword; a custom term of
 2–12 words is saved as a phrase. Setup and Interests present both together as

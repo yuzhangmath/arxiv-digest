@@ -56,6 +56,31 @@ def test_runtime_background_job_blocks_exclusive_maintenance_until_terminal() ->
     assert runtime._job_status({"job_id": job_id})["status"] == "completed"
 
 
+def test_background_job_exposes_initial_fields_when_first_observable() -> None:
+    runtime = _runtime()
+    operation_started = threading.Event()
+    release_operation = threading.Event()
+
+    def operation() -> str:
+        operation_started.set()
+        assert release_operation.wait(2)
+        return "finished"
+
+    job_id = runtime._new_job(
+        "sync",
+        "sync",
+        operation,
+        initial_fields={"phase": "enrichment"},
+    )
+    assert operation_started.wait(2)
+    try:
+        status = runtime._job_status({"job_id": job_id})
+        assert status["status"] == "running"
+        assert status["phase"] == "enrichment"
+    finally:
+        release_operation.set()
+
+
 def test_candidate_job_keeps_worker_completion_separate_from_corpus_readiness() -> None:
     runtime = _runtime()
     diagnostics = SimpleNamespace(
@@ -440,7 +465,34 @@ def test_restore_cancellation_stops_download_before_post_fetch_mutation() -> Non
     ]
 
 
-def test_review_finish_uses_opened_projection_and_returns_next_oldest_date() -> None:
+def test_review_date_forwards_the_from_start_override() -> None:
+    from arxiv_digest.application import _DefaultRuntime
+
+    runtime = object.__new__(_DefaultRuntime)
+    calls = []
+    page = SimpleNamespace(cards=(), last_finished_revision=None)
+
+    class Review:
+        def open_date(self, day, *, anchor_event_id, from_start):
+            calls.append((day, anchor_event_id, from_start))
+            return page
+
+    runtime.review = Review()
+    runtime.store = SimpleNamespace(article_versions=lambda _arxiv_id: ())
+
+    result = runtime._review_date(
+        {
+            "date": "2026-08-22",
+            "anchor_event_id": 19,
+            "from_start": True,
+        }
+    )
+
+    assert result.page is page
+    assert calls == [(date(2026, 8, 22), 19, True)]
+
+
+def test_review_finish_uses_opened_projection_and_returns_next_later_date() -> None:
     from arxiv_digest.application import _DefaultRuntime
 
     runtime = object.__new__(_DefaultRuntime)
@@ -451,8 +503,9 @@ def test_review_finish_uses_opened_projection_and_returns_next_oldest_date() -> 
             calls.append((day, values))
             return SimpleNamespace(reviewed_count=4, through_revision=19)
 
-        def summary(self):
-            return SimpleNamespace(oldest_unreviewed_date=date(2026, 8, 23))
+        def next_later_unreviewed_date(self, day):
+            assert day == date(2026, 8, 22)
+            return date(2026, 8, 23)
 
     runtime.review = Review()
     result = runtime._review_finish(
@@ -467,7 +520,7 @@ def test_review_finish_uses_opened_projection_and_returns_next_oldest_date() -> 
     assert result == {
         "reviewed_count": 4,
         "through_revision": 19,
-        "next_unreviewed_date": "2026-08-23",
+        "next_later_unreviewed_date": "2026-08-23",
     }
     assert calls[0][0] == date(2026, 8, 22)
     assert calls[0][1]["through_revision"] == 19
@@ -486,9 +539,10 @@ def test_restore_cancellation_reaches_active_sync_without_being_cleared() -> Non
     sync_cancelled = threading.Event()
 
     class Sync:
-        def sync(self, configs):
+        def sync(self, configs, *, daily_list_complete):
             assert configs == ("synthetic-config",)
             assert not runtime._sync_cancel.is_set()
+            daily_list_complete()
             sync_started.set()
             assert runtime._sync_cancel.wait(2)
             sync_cancelled.set()
@@ -576,6 +630,106 @@ def test_failed_date_retry_job_reports_completed_dates_while_running() -> None:
         {"status": "running", "completed": 1, "total": 2},
         {"status": "running", "completed": 2, "total": 2},
     ]
+
+
+def test_sync_job_publishes_enrichment_phase_when_daily_lists_are_complete() -> None:
+    runtime = _runtime()
+    runtime._sync_cancel = threading.Event()
+    runtime._active_sync_job = None
+    runtime._last_sync_report = None
+    runtime._sync_configs = lambda: ("synthetic-config",)
+    runtime.sync = SimpleNamespace(
+        has_pending_daily_list_work=lambda configs: False,
+    )
+    captured = {}
+
+    def capture_job(
+        _prefix,
+        _kind,
+        _operation,
+        *,
+        job_id,
+        request_cancel,
+        initial_fields,
+    ):
+        captured.update(
+            job_id=job_id,
+            request_cancel=request_cancel,
+            initial_fields=initial_fields,
+        )
+        return job_id
+
+    runtime._new_job = capture_job
+
+    result = runtime._start_sync_job({})
+
+    assert result == {"job_id": captured["job_id"]}
+    assert captured["initial_fields"] == {"phase": "enrichment"}
+
+
+def test_sync_pass_moves_from_daily_list_to_enrichment_at_the_boundary() -> None:
+    runtime = _runtime()
+    job_id = "sync_phase_fixture"
+    runtime._jobs[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "complete": False,
+        "failed": False,
+        "phase": "enrichment",
+        "daily_list_retry": {"status": "running", "completed": 1, "total": 1},
+    }
+    runtime._active_sync_job = job_id
+    runtime._last_sync_report = None
+    runtime._sync_configs = lambda: ("synthetic-config",)
+    runtime._retryable_sync_dates = lambda _configs: {}
+    observed = []
+
+    class Sync:
+        def has_pending_daily_list_work(self, configs):
+            assert configs == ("synthetic-config",)
+            return True
+
+        def sync(self, configs, *, daily_list_complete):
+            assert configs == ("synthetic-config",)
+            observed.append(runtime._jobs[job_id]["phase"])
+            daily_list_complete()
+            observed.append(runtime._jobs[job_id]["phase"])
+            assert "daily_list_retry" not in runtime._jobs[job_id]
+            return "sync-report"
+
+    runtime.sync = Sync()
+
+    result = runtime._run_sync_pass(job_id, retry_failed_dates=False)
+
+    assert result == "sync-report"
+    assert observed == ["daily_list", "enrichment"]
+
+
+def test_enrichment_phase_does_not_report_a_daily_list_retry_as_running() -> None:
+    runtime = _runtime()
+    job_id = "sync_enrichment_fixture"
+    runtime._jobs[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "complete": False,
+        "failed": False,
+        "phase": "enrichment",
+    }
+    runtime._active_sync_job = job_id
+    runtime._last_sync_report = None
+    runtime.profiles = SimpleNamespace(load=lambda: None)
+    runtime.sync = SimpleNamespace()
+    retry_day = date(2026, 8, 22)
+    runtime._retryable_sync_dates = lambda: {"cs.SE": (retry_day,)}
+
+    result = runtime.status({})
+
+    assert result["sync"]["phase"] == "enrichment"
+    assert result["daily_list_retry"] == {
+        "status": "idle",
+        "completed": 0,
+        "total": 1,
+    }
 
 
 def test_sync_start_does_not_block_restore_from_draining_a_cancelled_worker() -> None:
@@ -687,10 +841,14 @@ def test_active_sync_runs_follow_up_with_newly_published_configs() -> None:
     first_pass_started = threading.Event()
     release_first_pass = threading.Event()
     calls = []
+    phases = []
 
     class Sync:
-        def sync(self, configs):
+        def sync(self, configs, *, daily_list_complete):
             calls.append(configs)
+            phases.append(runtime._jobs[runtime._active_sync_job]["phase"])
+            daily_list_complete()
+            phases.append(runtime._jobs[runtime._active_sync_job]["phase"])
             if len(calls) == 1:
                 first_pass_started.set()
                 assert release_first_pass.wait(2)
@@ -716,6 +874,12 @@ def test_active_sync_runs_follow_up_with_newly_published_configs() -> None:
     assert second == first
     assert status["status"] == "completed"
     assert calls == [("old-config",), ("new-config",)]
+    assert phases == [
+        "daily_list",
+        "enrichment",
+        "daily_list",
+        "enrichment",
+    ]
     assert runtime._last_sync_report == "report-2"
 
 

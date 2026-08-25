@@ -662,6 +662,42 @@ def test_routes_decode_query_path_and_json_fields_for_domain_handlers() -> None:
     ]
 
 
+def test_review_date_from_start_query_is_a_strict_boolean() -> None:
+    from arxiv_digest.web.api import ApiRouter
+
+    seen = []
+    router = ApiRouter(
+        token=TOKEN,
+        host=HOST,
+        handlers={"review_date": lambda payload: seen.append(payload) or {}},
+    )
+
+    enabled = router.dispatch(
+        _request(
+            "GET",
+            "/api/v1/review/date?date=2026-08-22&from_start=true",
+        )
+    )
+    disabled = router.dispatch(
+        _request(
+            "GET",
+            "/api/v1/review/date?date=2026-08-22&from_start=false",
+        )
+    )
+    invalid = router.dispatch(
+        _request(
+            "GET",
+            "/api/v1/review/date?date=2026-08-22&from_start=1",
+        )
+    )
+
+    assert (enabled.status, disabled.status, invalid.status) == (200, 200, 400)
+    assert seen == [
+        {"date": "2026-08-22", "from_start": True},
+        {"date": "2026-08-22", "from_start": False},
+    ]
+
+
 def test_library_api_keeps_paper_and_local_pdf_availability_separate() -> None:
     from arxiv_digest.library import LibraryItem
     from arxiv_digest.models import PaperMetadata
@@ -836,7 +872,7 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
         authors=("Aster Vale",),
         abstract="Safe synthetic abstract.",
         primary_category="cs.SE",
-        categories=("cs.SE", "cs.LG"),
+        categories=("cs.SE", "cs.LG", "stat.ML"),
     )
     card = RankedPaper(
         event=event,
@@ -856,7 +892,6 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
         next_anchor_event_id=None,
         previous_date=date(2026, 8, 20),
         next_date=date(2026, 8, 25),
-        next_unreviewed_date=date(2026, 8, 25),
         page_number=1,
         page_count=1,
         total_cards=1,
@@ -871,7 +906,7 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
     )
 
     assert projected["previous_date"] == "2026-08-20"
-    assert projected["next_unreviewed_date"] == "2026-08-25"
+    assert "next_unreviewed_date" not in projected
     assert projected["profile_revision"] == 4
     assert projected["projection_revision"] == 9
     assert projected["cards"] == [
@@ -881,8 +916,9 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
             "daily_list_date": "2026-08-22",
             "event_label": "Replacement",
             "version_resolution": "chronology_matched",
-            "version_label": "Version v2 — matched by chronology",
+            "version_label": "Version v2",
             "support_categories": ["cs.LG", "cs.SE"],
+            "subjects": ["cs.SE", "cs.LG", "stat.ML"],
             "resolved_announcement_version": 2,
             "latest_known_version": 3,
             "title": "Safe synthetic title <script>",
@@ -956,7 +992,49 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
             latest_known_versions={event.arxiv_id: 3},
         )
     )["cards"][0]
-    assert atom_confirmed["version_label"] == "Announced v2 — Atom-confirmed"
+    assert atom_confirmed["version_label"] == "Version v2"
+
+    first_version_new_event = replace(
+        event,
+        announced_version=1,
+        version_resolution=VersionResolution.ATOM_CONFIRMED,
+        observations=tuple(
+            replace(observation, announce_type=AnnounceType.NEW)
+            for observation in observations
+        ),
+    )
+    first_version_new = project_review_page(
+        ReviewPagePayload(
+            page=replace(
+                page,
+                cards=(replace(card, event=first_version_new_event),),
+            ),
+            last_finished_revision=5,
+            latest_known_versions={event.arxiv_id: 1},
+        )
+    )["cards"][0]
+    assert first_version_new["version_label"] == ""
+    assert "event_label" not in first_version_new
+
+    cross_list_event = replace(
+        first_version_new_event,
+        observations=tuple(
+            replace(observation, announce_type=AnnounceType.CROSS)
+            for observation in observations
+        ),
+    )
+    cross_list = project_review_page(
+        ReviewPagePayload(
+            page=replace(
+                page,
+                cards=(replace(card, event=cross_list_event),),
+            ),
+            last_finished_revision=5,
+            latest_known_versions={event.arxiv_id: 1},
+        )
+    )["cards"][0]
+    assert cross_list["version_label"] == ""
+    assert cross_list["event_label"] == "Cross-list"
 
 
 def test_destination_display_path_is_home_relative_and_component_aware() -> None:

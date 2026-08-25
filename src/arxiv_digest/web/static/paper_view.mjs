@@ -24,7 +24,7 @@ function normalizedPaper(source) {
         )
         .filter(Boolean)
     : [];
-  const categories = source?.support_categories;
+  const subjects = source?.subjects ?? source?.support_categories;
   const rawVersion = source?.resolved_announcement_version ?? null;
   const resolvedVersion = Number.isInteger(rawVersion) && rawVersion > 0
     ? rawVersion
@@ -37,22 +37,22 @@ function normalizedPaper(source) {
     : typeof latestValue === "string" && VERSION.test(latestValue)
       ? Number(latestValue.slice(1))
       : null;
-  const linkVersion = resolvedVersion === null ? "" : `v${resolvedVersion}`;
+  const effectiveVersion = resolvedVersion ?? latestVersion;
+  const linkVersion = effectiveVersion === null ? "" : `v${effectiveVersion}`;
   const resolution = storedText(source?.version_resolution);
-  const versionLabel = storedText(source?.version_label) ||
-    (resolution === "atom_confirmed" && resolvedVersion !== null
-      ? `Announced v${resolvedVersion} — Atom-confirmed`
-      : resolution === "chronology_matched" && resolvedVersion !== null
-        ? `Version v${resolvedVersion} — matched by chronology`
-        : resolution === "unconfirmed"
-          ? "Version not confirmed"
-          : "");
+  const versionLabel = resolvedVersion === 1
+    ? ""
+    : resolvedVersion !== null
+      ? `Version v${resolvedVersion}`
+      : storedText(source?.version_label) ||
+        (resolution === "unconfirmed" ? "Version not confirmed" : "");
+  const eventLabel = storedText(source?.event_label);
   return {
     eventId: source?.event_id ?? event.event_id ?? null,
     arxivId: storedText(source?.arxiv_id ?? paper.arxiv_id),
     version: linkVersion,
-    saveVersion: resolvedVersion,
-    downloadVersion: resolvedVersion ?? latestVersion,
+    saveVersion: effectiveVersion,
+    downloadVersion: effectiveVersion,
     latestVersion,
     title: storedText(source?.title ?? paper.title, "Untitled paper"),
     authors: storedStrings(source?.authors ?? paper.authors),
@@ -62,9 +62,8 @@ function normalizedPaper(source) {
     doi: storedText(source?.doi ?? paper.doi),
     rankingText: storedText(source?.ranking_text) || reasons.join("; "),
     tier: storedText(source?.tier, "other"),
-    categories: storedStrings(categories),
-    dailyListDate: storedText(source?.daily_list_date),
-    eventLabel: storedText(source?.event_label),
+    subjects: storedStrings(subjects),
+    eventLabel: eventLabel === "New submission" ? "" : eventLabel,
     versionLabel,
     versionResolution: resolution,
     newlyDiscovered: source?.newly_discovered === true,
@@ -105,10 +104,36 @@ function safeExternalLink(document, label, href) {
   return link;
 }
 
-function actionButton(document, label, callback, ...values) {
-  const button = element(document, "button", label);
+function pdfActionButton(
+  document,
+  labels,
+  callback,
+  failure,
+  status,
+  ...values
+) {
+  const button = element(document, "button", labels.idle);
   button.setAttribute("type", "button");
-  button.addEventListener("click", () => callback?.(...values));
+  button.setAttribute("aria-busy", "false");
+  button.addEventListener("click", async () => {
+    if (typeof callback !== "function") return;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.textContent = labels.pending;
+    status.textContent = labels.pendingStatus;
+    try {
+      await callback(...values);
+      button.setAttribute("aria-busy", "false");
+      button.textContent = labels.complete;
+      status.textContent = labels.completeStatus;
+    } catch (error) {
+      button.disabled = false;
+      button.setAttribute("aria-busy", "false");
+      button.textContent = labels.idle;
+      status.textContent = labels.failureStatus;
+      failure?.(error);
+    }
+  });
   return button;
 }
 
@@ -155,13 +180,10 @@ export function renderPaperCard(document, container, source, actions = {}) {
   card.append(element(document, "p", paper.authors.join(", "), "paper-authors"));
   const labels = [
     paper.versionLabel,
-    paper.dailyListDate
-      ? `arXiv daily-list date: ${paper.dailyListDate}`
-      : "",
     paper.eventLabel,
     paper.newlyDiscovered ? "Newly discovered" : "",
-    paper.categories.length
-      ? `Recovered under: ${paper.categories.join(" · ")}`
+    paper.subjects.length
+      ? `Subjects: ${paper.subjects.join(", ")}`
       : "",
   ].filter(Boolean);
   if (labels.length) card.append(element(document, "p", labels.join(" · "), "paper-labels"));
@@ -195,15 +217,13 @@ export function renderPaperCard(document, container, source, actions = {}) {
   linksRow.append(
     safeExternalLink(
       document,
-      unconfirmed
-        ? "Abstract on arXiv (latest version)"
-        : "Abstract on arXiv",
+      "Abstract on arXiv",
       links.abstract,
     ),
     document.createTextNode(" "),
     safeExternalLink(
       document,
-      unconfirmed ? "PDF on arXiv (latest version)" : "PDF on arXiv",
+      "PDF on arXiv",
       links.pdf,
     ),
   );
@@ -222,24 +242,40 @@ export function renderPaperCard(document, container, source, actions = {}) {
       saveVersion,
       actionStatus,
     ),
-    actionButton(
+    pdfActionButton(
       document,
-      unconfirmed && downloadVersion !== null
-        ? `Download latest v${downloadVersion} — announcement version unconfirmed`
-        : "Download PDF",
+      {
+        idle: "Download PDF",
+        pending: "Downloading…",
+        complete: "Downloaded",
+        pendingStatus: "Downloading PDF…",
+        completeStatus: "PDF downloaded.",
+        failureStatus: "PDF download did not complete. Try again.",
+      },
       actions.download,
+      actions.failure,
+      actionStatus,
       arxivId,
       downloadVersion,
     ),
-    actionButton(
+    pdfActionButton(
       document,
-      unconfirmed && downloadVersion !== null
-        ? `Save unpinned + download latest v${downloadVersion} — announcement version unconfirmed`
-        : "Save + PDF",
+      {
+        idle: "Save + PDF",
+        pending: "Saving + downloading…",
+        complete: "Saved + downloaded",
+        pendingStatus: "Saving paper and downloading PDF…",
+        completeStatus: "Paper saved and PDF downloaded.",
+        failureStatus: (
+          "PDF download did not complete. Check Library for the saved paper, " +
+          "then try again."
+        ),
+      },
       actions.saveAndDownload,
-      ...(unconfirmed
-        ? [arxivId, null, downloadVersion]
-        : [arxivId, downloadVersion]),
+      actions.failure,
+      actionStatus,
+      arxivId,
+      downloadVersion,
     ),
   );
   if (unconfirmed && downloadVersion === null) {

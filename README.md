@@ -207,8 +207,9 @@ test:
 7. Select **Quit** in the top-right corner when finished.
 
 Closing the browser tab does not stop the application immediately: the
-terminal process may remain running for about 30 minutes. Select **Quit** in
-the dashboard and wait for the terminal prompt to return.
+terminal process normally remains running for about 3 minutes and may take up
+to about 4.5 minutes when the browser cannot deliver its disconnect notice.
+Select **Quit** in the dashboard and wait for the terminal prompt to return.
 
 After **Quit** stops the app and the terminal prompt returns, run
 `arxiv-digest` again and confirm that your profile, review progress, and saved

@@ -22,7 +22,7 @@ from typing import Iterator
 from arxiv_digest.atomic import atomic_write
 
 
-INACTIVITY_SECONDS = 30 * 60
+INACTIVITY_SECONDS = 3 * 60
 TAB_LEASE_SECONDS = 90
 
 

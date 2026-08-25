@@ -33,6 +33,7 @@ function paper() {
     daily_list_date: "2026-08-21",
     event_label: "New submission",
     support_categories: ["math.AG", "math.CO"],
+    subjects: ["math.AG", "math.CO"],
     title: `A safe title ${hostile}`,
     authors: [`Ada ${hostile}`, "Grace Hopper"],
     abstract: `Abstract ${hostile}`,
@@ -169,7 +170,108 @@ test("failed saves restore the action and report the error", async () => {
   assert.deepEqual(failures, [error]);
 });
 
-test("confirmed card projection shows only active daily-list support categories", () => {
+test("PDF download shows pending and completed feedback", async () => {
+  let resolveDownload;
+  const pendingDownload = new Promise((resolve) => {
+    resolveDownload = resolve;
+  });
+  const root = new FakeNode("div");
+  renderPaperCard(new FakeDocument(), root, paper(), {
+    download: () => pendingDownload,
+  });
+
+  const download = findButton(root, "Download PDF");
+  download.click();
+
+  const actionStatus = descendants(root, "p").find((node) =>
+    node.className === "paper-action-status"
+  );
+  assert.equal(download.disabled, true);
+  assert.equal(download.getAttribute("aria-busy"), "true");
+  assert.equal(download.textContent, "Downloading…");
+  assert.equal(actionStatus.textContent, "Downloading PDF…");
+
+  resolveDownload({ status: "completed", complete: true });
+  await pendingDownload;
+  await Promise.resolve();
+
+  assert.equal(download.disabled, true);
+  assert.equal(download.getAttribute("aria-busy"), "false");
+  assert.equal(download.textContent, "Downloaded");
+  assert.equal(actionStatus.textContent, "PDF downloaded.");
+});
+
+test("Save plus PDF shows pending and completed feedback", async () => {
+  let resolveDownload;
+  const pendingDownload = new Promise((resolve) => {
+    resolveDownload = resolve;
+  });
+  const root = new FakeNode("div");
+  renderPaperCard(new FakeDocument(), root, paper(), {
+    saveAndDownload: () => pendingDownload,
+  });
+
+  const saveAndDownload = findButton(root, "Save + PDF");
+  saveAndDownload.click();
+
+  const actionStatus = descendants(root, "p").find((node) =>
+    node.className === "paper-action-status"
+  );
+  assert.equal(saveAndDownload.disabled, true);
+  assert.equal(saveAndDownload.getAttribute("aria-busy"), "true");
+  assert.equal(saveAndDownload.textContent, "Saving + downloading…");
+  assert.equal(
+    actionStatus.textContent,
+    "Saving paper and downloading PDF…",
+  );
+
+  resolveDownload({ status: "completed", complete: true });
+  await pendingDownload;
+  await Promise.resolve();
+
+  assert.equal(saveAndDownload.disabled, true);
+  assert.equal(saveAndDownload.getAttribute("aria-busy"), "false");
+  assert.equal(saveAndDownload.textContent, "Saved + downloaded");
+  assert.equal(
+    actionStatus.textContent,
+    "Paper saved and PDF downloaded.",
+  );
+});
+
+test("failed Save plus PDF restores the action and reports retry guidance", async () => {
+  let rejectDownload;
+  const pendingDownload = new Promise((_resolve, reject) => {
+    rejectDownload = reject;
+  });
+  const failures = [];
+  const root = new FakeNode("div");
+  renderPaperCard(new FakeDocument(), root, paper(), {
+    saveAndDownload: () => pendingDownload,
+    failure: (error) => failures.push(error),
+  });
+
+  const saveAndDownload = findButton(root, "Save + PDF");
+  saveAndDownload.click();
+  const error = new Error("synthetic PDF failure");
+  rejectDownload(error);
+  await pendingDownload.catch(() => {});
+  await Promise.resolve();
+
+  const actionStatus = descendants(root, "p").find((node) =>
+    node.className === "paper-action-status"
+  );
+  assert.equal(saveAndDownload.disabled, false);
+  assert.equal(saveAndDownload.getAttribute("aria-busy"), "false");
+  assert.equal(saveAndDownload.textContent, "Save + PDF");
+  assert.equal(
+    actionStatus.textContent,
+    "PDF download did not complete. Check Library for the saved paper, " +
+      "then try again.",
+  );
+  assert.deepEqual(failures, [error]);
+});
+
+test("confirmed card projection shows concise metadata and full paper subjects", () => {
   const calls = [];
   const root = new FakeNode("div");
   renderPaperCard(
@@ -178,15 +280,16 @@ test("confirmed card projection shows only active daily-list support categories"
     {
       event_id: 42,
       arxiv_id: "2608.04200",
-      resolved_announcement_version: 3,
+      resolved_announcement_version: 4,
       latest_known_version: 4,
       version_resolution: "chronology_matched",
-      version_label: "Version v3 — matched by chronology",
+      version_label: "Version v4 — matched by chronology",
       daily_list_date: "2026-08-20",
       title: "Projected paper",
       authors: ["Safe Author"],
       abstract: "Safe abstract",
       support_categories: ["math.AT"],
+      subjects: ["math.AT", "math.AG"],
       event_label: "Replacement",
       newly_discovered: true,
       tier: "possible",
@@ -194,24 +297,62 @@ test("confirmed card projection shows only active daily-list support categories"
     },
     { download: (...values) => calls.push(values) },
   );
-  assert.match(root.textContent, /arXiv daily-list date: 2026-08-20/);
-  assert.match(root.textContent, /Replacement/);
-  assert.match(root.textContent, /Version v3 — matched by chronology/);
-  assert.doesNotMatch(root.textContent, /Announced v3/);
-  assert.doesNotMatch(root.textContent, /Current feed|Inferred from version history/);
-  assert.match(root.textContent, /Newly discovered/);
   const labels = descendants(root, "p").find((node) =>
     node.className === "paper-labels"
   );
-  assert.match(labels.textContent, /Recovered under: math\.AT(?: ·|$)/);
+  assert.equal(
+    labels.textContent,
+    "Version v4 · Replacement · Newly discovered · Subjects: math.AT, math.AG",
+  );
+  assert.doesNotMatch(labels.textContent, /daily-list date|matched by chronology|Announced/);
   assert.doesNotMatch(labels.textContent, /math\.AC|math\.RT/);
   findButton(root, "Download PDF").click();
-  assert.deepEqual(calls, [["2608.04200", 3]]);
+  assert.deepEqual(calls, [["2608.04200", 4]]);
   const pdf = descendants(root, "a").find((link) => /PDF/.test(link.textContent));
-  assert.equal(pdf.getAttribute("href"), "https://arxiv.org/pdf/2608.04200v3.pdf");
+  assert.equal(pdf.getAttribute("href"), "https://arxiv.org/pdf/2608.04200v4.pdf");
 });
 
-test("unconfirmed events stay unpinned while latest-version downloads are explicit", () => {
+test("first-version and new-submission labels are omitted while cross-lists remain", () => {
+  const firstVersionRoot = new FakeNode("div");
+  renderPaperCard(
+    new FakeDocument(),
+    firstVersionRoot,
+    {
+      ...paper(),
+      resolved_announcement_version: 1,
+      latest_known_version: 1,
+      version_resolution: "chronology_matched",
+      version_label: "Version v1 — matched by chronology",
+      subjects: ["math.AT", "math.AG"],
+    },
+    {},
+  );
+  const firstVersionLabels = descendants(firstVersionRoot, "p").find((node) =>
+    node.className === "paper-labels"
+  );
+  assert.equal(firstVersionLabels.textContent, "Subjects: math.AT, math.AG");
+
+  const crossListRoot = new FakeNode("div");
+  renderPaperCard(
+    new FakeDocument(),
+    crossListRoot,
+    {
+      ...paper(),
+      event_label: "Cross-list",
+      subjects: ["math.AT"],
+    },
+    {},
+  );
+  const crossListLabels = descendants(crossListRoot, "p").find((node) =>
+    node.className === "paper-labels"
+  );
+  assert.equal(
+    crossListLabels.textContent,
+    "Version v2 · Cross-list · Subjects: math.AT",
+  );
+});
+
+test("unconfirmed events use the best-known version with ordinary paper actions", () => {
   const calls = [];
   const root = new FakeNode("div");
   renderPaperCard(
@@ -221,12 +362,13 @@ test("unconfirmed events stay unpinned while latest-version downloads are explic
       event_id: 78,
       arxiv_id: "2608.07800",
       resolved_announcement_version: null,
-      latest_known_version: 4,
+      latest_known_version: 1,
       version_resolution: "unconfirmed",
       version_label: "Version not confirmed",
       daily_list_date: "2026-08-21",
       event_label: "Replacement",
       support_categories: ["math.AG"],
+      subjects: ["math.AG", "math.AT"],
       title: "Unconfirmed daily-list event",
       authors: ["Safe Author"],
       abstract: "Abstract",
@@ -240,31 +382,30 @@ test("unconfirmed events stay unpinned while latest-version downloads are explic
     },
   );
 
-  assert.match(root.textContent, /Version not confirmed/);
-  assert.match(root.textContent, /arXiv daily-list date: 2026-08-21/);
-  assert.match(root.textContent, /Recovered under: math\.AG/);
+  const labels = descendants(root, "p").find((node) =>
+    node.className === "paper-labels"
+  );
+  assert.equal(
+    labels.textContent,
+    "Version not confirmed · Replacement · Subjects: math.AG, math.AT",
+  );
+  assert.doesNotMatch(labels.textContent, /daily-list date/);
   findButton(root, "Save").click();
-  findButton(
-    root,
-    "Download latest v4 — announcement version unconfirmed",
-  ).click();
-  findButton(
-    root,
-    "Save unpinned + download latest v4 — announcement version unconfirmed",
-  ).click();
+  findButton(root, "Download PDF").click();
+  findButton(root, "Save + PDF").click();
   assert.deepEqual(calls, [
-    ["save", "2608.07800", null],
-    ["download", "2608.07800", 4],
-    ["both", "2608.07800", null, 4],
+    ["save", "2608.07800", 1],
+    ["download", "2608.07800", 1],
+    ["both", "2608.07800", 1],
   ]);
   const abstract = descendants(root, "a").find((link) =>
     /Abstract/.test(link.textContent)
   );
   const pdf = descendants(root, "a").find((link) => /PDF/.test(link.textContent));
-  assert.equal(abstract.textContent, "Abstract on arXiv (latest version)");
-  assert.equal(pdf.textContent, "PDF on arXiv (latest version)");
-  assert.equal(abstract.getAttribute("href"), "https://arxiv.org/abs/2608.07800");
-  assert.equal(pdf.getAttribute("href"), "https://arxiv.org/pdf/2608.07800.pdf");
+  assert.equal(abstract.textContent, "Abstract on arXiv");
+  assert.equal(pdf.textContent, "PDF on arXiv");
+  assert.equal(abstract.getAttribute("href"), "https://arxiv.org/abs/2608.07800v1");
+  assert.equal(pdf.getAttribute("href"), "https://arxiv.org/pdf/2608.07800v1.pdf");
 });
 
 test("missing latest-version controls support the browser HTMLCollection contract", () => {

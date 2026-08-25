@@ -188,6 +188,32 @@ def test_oldest_first_finish_and_later_discovery(
     }
 
 
+def test_next_later_unreviewed_date_skips_finished_dates_without_wrapping(
+    review: tuple[Store, Profiles, ReviewService],
+) -> None:
+    store, _profiles, service = review
+    older_day = date(2026, 7, 31)
+    current_day = date(2026, 8, 3)
+    finished_day = date(2026, 8, 5)
+    target_day = date(2026, 8, 7)
+    for number, day in enumerate(
+        (older_day, current_day, finished_day, target_day),
+        start=1,
+    ):
+        _add(store, number, day)
+    finished_page = service.open_date(finished_day)
+    service.finish_date(
+        finished_day,
+        through_revision=finished_page.snapshot_revision,
+        profile_revision=finished_page.profile_revision,
+        projection_revision=finished_page.projection_revision,
+        finished_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
+    )
+
+    assert service.next_later_unreviewed_date(current_day) == target_day
+    assert service.next_later_unreviewed_date(target_day) is None
+
+
 def test_finish_all_reviews_current_backlog_and_leaves_later_discoveries(
     review: tuple[Store, Profiles, ReviewService],
 ) -> None:
@@ -288,6 +314,49 @@ def test_pagination_resume_and_navigation_do_not_finish(
     assert service.summary().unreviewed_papers == 27
     assert service.previous_date(date(2026, 9, 1)) == date(2026, 8, 31)
     assert service.next_date(date(2026, 8, 31)) == date(2026, 9, 1)
+
+
+def test_opening_from_start_ignores_the_saved_page(
+    review: tuple[Store, Profiles, ReviewService],
+) -> None:
+    store, _profiles, service = review
+    day = date(2026, 8, 3)
+    for number in range(1, 26):
+        _add(store, number, day)
+
+    first = service.open_date(day)
+    second = service.open_date(day, anchor_event_id=first.next_anchor_event_id)
+    service.record_position(
+        day,
+        snapshot_revision=second.snapshot_revision,
+        anchor_event_id=second.anchor_event_id,
+        profile_revision=second.profile_revision,
+        projection_revision=second.projection_revision,
+    )
+
+    reopened = service.open_date(day, from_start=True)
+
+    assert reopened.page_number == 1
+    assert reopened.anchor_event_id == first.anchor_event_id
+
+
+def test_opening_from_start_takes_precedence_over_an_explicit_anchor(
+    review: tuple[Store, Profiles, ReviewService],
+) -> None:
+    store, _profiles, service = review
+    day = date(2026, 8, 3)
+    for number in range(1, 26):
+        _add(store, number, day)
+
+    first = service.open_date(day)
+    reopened = service.open_date(
+        day,
+        anchor_event_id=first.next_anchor_event_id,
+        from_start=True,
+    )
+
+    assert reopened.page_number == 1
+    assert reopened.anchor_event_id == first.anchor_event_id
 
 
 def test_calendar_jump_and_missing_anchor_use_confirmed_dates(
