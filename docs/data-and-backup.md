@@ -6,6 +6,7 @@ PDFs, and portable backups.
 ## Contents
 
 - [What is durable](#what-is-durable)
+- [Privacy and encryption](#privacy-and-encryption)
 - [Review, Calendar, and coverage](#review-calendar-and-coverage)
 - [macOS locations](#macos-locations)
 - [Linux locations](#linux-locations)
@@ -32,6 +33,26 @@ recalculates suggestions from the last updated profile. Persisted interests are
 excluded and each response is deduplicated, but a suggestion that was merely
 shown—or selected only in the unsaved draft—may appear again. Refreshing does
 not change the profile; changes take effect only after **Update interests**.
+
+## Privacy and encryption
+
+Ranking, interest matching, and Library searches run locally, and the
+application does not send telemetry. It does make HTTPS requests to arXiv
+services to build the candidate sample, recover daily lists, synchronize paper
+metadata, look up custom papers, and download PDFs. These requests disclose
+selected arXiv categories and requested date windows. A custom paper lookup or
+PDF download discloses the exact arXiv identifier; opening an arXiv link sends
+that identifier from the browser. arXiv also receives ordinary connection
+details such as the connecting network address and request time, plus a
+User-Agent containing the application version and project URL. Network
+operators can ordinarily see the arXiv host and connection metadata, while
+HTTPS protects the request contents in transit.
+
+Profiles, SQLite databases, downloaded PDFs, and portable backups are private
+local files, but arXiv Digest does not cryptographically encrypt them. A
+portable backup is a ZIP archive, not an encrypted vault. Use device or volume
+encryption where needed, restrict access to backup copies, and use a trusted
+channel when transferring them.
 
 ## Review, Calendar, and coverage
 

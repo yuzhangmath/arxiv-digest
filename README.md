@@ -3,12 +3,13 @@
 arXiv Digest is a local, explainable review queue for arXiv. It runs on macOS
 and Linux, keeps its durable state on your computer, and opens a loopback-only
 dashboard in your browser. There is no cloud account, telemetry, or API key.
+It is an independent project and is not affiliated with or endorsed by arXiv.
 
 Already have Python 3.11+, Git, and `pipx`? Open a terminal and run these
 commands one at a time:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.0
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.1
 arxiv-digest init
 ```
 
@@ -62,7 +63,7 @@ ranking** on a card to see the signals that contributed.
 
 You need:
 
-- macOS or Linux; Windows is not supported in version 0.2.0
+- macOS or Linux; Windows is not supported in version 0.2.1
 - Python 3.11 or newer
 - Git
 - a current `pipx`
@@ -139,7 +140,7 @@ pipx --version
 In that terminal, install from the public HTTPS repository:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.0
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.1
 ```
 
 When installation finishes, verify that the installed command works:
@@ -148,7 +149,7 @@ When installation finishes, verify that the installed command works:
 arxiv-digest doctor
 ```
 
-On a fresh installation, `doctor` should report version `0.2.0`, a missing
+On a fresh installation, `doctor` should report version `0.2.1`, a missing
 profile and database, and `arxiv-digest init` as the next step. If your shell
 cannot find `arxiv-digest`, open a new terminal after `pipx ensurepath` and try
 again.
@@ -266,6 +267,21 @@ loopback interface. Paper metadata, interests, review progress, and the library
 remain in the platform data directories described in
 [Data and backup](docs/data-and-backup.md).
 
+The app makes outbound HTTPS requests to arXiv services. Candidate building and
+synchronization disclose the selected arXiv categories and requested date
+windows. Looking up a custom paper, downloading a PDF, or following an arXiv
+link discloses that paper's exact arXiv identifier. Interest terms and authors,
+ranking results, review progress, and local Library searches are not sent to
+arXiv. arXiv also receives ordinary connection details such as the connecting
+network address and request time, plus a User-Agent containing the application
+version and project URL. Network operators can ordinarily see the arXiv host
+and connection metadata, while HTTPS protects the request contents in transit.
+
+arXiv Digest does not cryptographically encrypt the local profile, SQLite
+database, downloaded PDFs, or portable backup ZIP files. Protect them with
+operating-system access controls and device or volume encryption if needed, and
+transfer backups only through trusted channels.
+
 This release uses application-data generation 2, profile schema 2, and
 portable backup format 2. Earlier databases, profiles, and portable backups
 are rejected without modification; they are not converted or imported.
@@ -276,6 +292,12 @@ database, profile, backup, downloaded PDFs, or a dashboard URL containing a
 session token.
 
 ## Maintenance and troubleshooting
+
+To upgrade an existing version-0.2.0 installation, first quit the app and make
+a current private backup if its local state matters. Then follow the
+[routine generation-2 upgrade](docs/installation.md#upgrade-within-application-data-generation-2).
+The upgrade replaces the pipx-managed program without resetting the profile,
+database, or downloaded PDFs.
 
 Generation-2 backups contain interests and Library state, so keep them
 private. Export refuses to overwrite an existing file. Cache deletion is safe:
@@ -295,6 +317,8 @@ PDF, launcher, backup, and recovery guidance.
 - [Troubleshooting](docs/troubleshooting.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+- [v0.2.1 technical-beta notes](docs/releases/v0.2.1.md)
 
 Friends should install over the public HTTPS URL shown above. Maintainers may
 use the separate SSH remote `git@github.com:yuzhangmath/arxiv-digest.git`; it

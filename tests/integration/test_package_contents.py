@@ -6,11 +6,13 @@ import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
+from arxiv_digest import __version__
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DIST = PROJECT_ROOT / "dist"
-SDIST = DIST / "arxiv_digest-0.2.0.tar.gz"
-WHEEL = DIST / "arxiv_digest-0.2.0-py3-none-any.whl"
+SDIST = DIST / f"arxiv_digest-{__version__}.tar.gz"
+WHEEL = DIST / f"arxiv_digest-{__version__}-py3-none-any.whl"
 
 APPLICATION_ASSET_SHA256 = {
     "arxiv-digest.icns": (

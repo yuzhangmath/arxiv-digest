@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from arxiv_digest import __version__
 from arxiv_digest.models import (
     CategoryConfig,
     PaperMetadata,
@@ -439,6 +440,7 @@ def test_nonempty_restore_creates_and_verifies_a_private_recovery_backup(
     )
     assert result.pre_restore_path.stat().st_mode & 0o777 == 0o600
     recovery = inspect_backup(result.pre_restore_path)
+    assert recovery.manifest.application_version == __version__
     assert recovery.profile.revision == 1
     restored = ProfileRepository(
         target.profile_path, target.profile_lock_path

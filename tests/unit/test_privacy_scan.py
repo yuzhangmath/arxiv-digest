@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from arxiv_digest import __version__
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AUDITED_ICON = PROJECT_ROOT / "src/arxiv_digest/assets/arxiv-digest.icns"
@@ -1300,7 +1302,7 @@ def test_public_documentation_uses_confirmed_install_identity_and_no_email_impor
     )
     expected_commands = (
         "pipx install "
-        "git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.0\n"
+        f"git+https://github.com/yuzhangmath/arxiv-digest.git@v{__version__}\n"
         "arxiv-digest init"
     )
 
@@ -1309,7 +1311,11 @@ def test_public_documentation_uses_confirmed_install_identity_and_no_email_impor
         "pipx install git+"
     )
     install_url, install_tag = install_target.rsplit("@", 1)
-    assert install_tag == f"v{project['project']['version']}"
+    assert project["project"]["dynamic"] == ["version"]
+    assert project["tool"]["setuptools"]["dynamic"]["version"] == {
+        "attr": "arxiv_digest.__version__"
+    }
+    assert install_tag == f"v{__version__}"
     assert install_url.removesuffix(".git") == project["project"]["urls"][
         "Repository"
     ]
@@ -1395,13 +1401,24 @@ def test_long_public_documentation_contents_match_second_level_headings() -> Non
         assert actual == expected
 
 
-def test_ci_privacy_scan_uses_checkout_origin_exactly() -> None:
+@pytest.mark.parametrize(
+    "workflow_name",
+    ("tests.yml", "release.yml"),
+)
+def test_ci_privacy_scan_uses_checkout_origin_exactly(
+    workflow_name: str,
+) -> None:
     project_root = Path(__file__).resolve().parents[2]
-    workflow = (project_root / ".github/workflows/tests.yml").read_text(
+    workflow = (project_root / ".github/workflows" / workflow_name).read_text(
         encoding="utf-8"
     )
 
     assert (
-        'python scripts/privacy_scan.py tree . --expected-remote '
-        '"${{ github.server_url }}/${{ github.repository }}"'
-    ) in workflow
+        "EXPECTED_REMOTE: ${{ github.server_url }}/${{ github.repository }}"
+        in workflow
+    )
+    for mode in ("tree", "history"):
+        assert (
+            f"python scripts/privacy_scan.py {mode} . "
+            '--expected-remote "$EXPECTED_REMOTE"'
+        ) in workflow

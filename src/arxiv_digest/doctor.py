@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+from arxiv_digest import __version__
 from arxiv_digest.paths import AppPaths
 from arxiv_digest.profile import decode_profile
 from arxiv_digest.sources.oai import DURABLE_PROTOCOL_ERROR_CODES
@@ -127,7 +128,7 @@ def inspect_doctor(
     paths: AppPaths,
     *,
     platform: str | None = None,
-    application_version: str = "0.2.0",
+    application_version: str = __version__,
     today: date | None = None,
 ) -> DoctorReport:
     del platform

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arxiv-digest"
-version = "0.2.0"
+dynamic = ["version"]
 description = "A local, explainable arXiv digest and review queue"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,9 @@ arxiv-digest = "arxiv_digest.cli:main"
 [tool.setuptools]
 package-dir = {"" = "src"}
 include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "arxiv_digest.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

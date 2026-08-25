@@ -9,6 +9,7 @@ macOS or Linux.
 - [Install pipx on macOS](#install-pipx-on-macos)
 - [Install pipx on Linux](#install-pipx-on-linux)
 - [Install arXiv Digest](#install-arxiv-digest)
+- [Upgrade within application-data generation 2](#upgrade-within-application-data-generation-2)
 - [Complete first-run setup](#complete-first-run-setup)
 - [Use the app](#use-the-app)
 - [Clean reset with recovery copy](#clean-reset-with-recovery-copy)
@@ -94,11 +95,29 @@ After `pipx ensurepath`, open a new terminal. In that terminal, install arXiv
 Digest from the canonical public HTTPS address:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.0
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.1
 ```
 
 The official [pipx CLI reference](https://pipx.pypa.io/stable/reference/cli.html)
 documents VCS URLs as supported package specifications.
+
+## Upgrade within application-data generation 2
+
+Version 0.2.1 uses the same application-data generation, profile schema, and
+portable backup format as version 0.2.0. First select **Quit** in the dashboard
+and wait for the terminal prompt to return. If your local state matters, export
+a current backup and keep it private. Then run:
+
+```bash
+pipx install --force git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.1
+arxiv-digest doctor
+```
+
+The first line of `doctor` output should be `arXiv Digest 0.2.1`. This replaces
+the pipx-managed program while leaving the generation-2 profile, database,
+downloaded PDFs, and backup files in place. Do not perform a clean reset or
+import a backup for this upgrade. The clean-reset procedure below applies only
+when moving between incompatible application-data generations.
 
 ## Complete first-run setup
 

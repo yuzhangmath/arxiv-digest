@@ -30,8 +30,10 @@ node --test tests/js/*.test.mjs
 .venv/bin/python -m pytest tests/browser -q
 .venv/bin/python -m pytest tests/integration/test_package_contents.py -q
 .venv/bin/python scripts/privacy_scan.py tree . --expected-remote-from-project
-.venv/bin/python scripts/privacy_scan.py archive dist/arxiv_digest-0.2.0.tar.gz
-.venv/bin/python scripts/privacy_scan.py archive dist/arxiv_digest-0.2.0-py3-none-any.whl
+.venv/bin/python scripts/privacy_scan.py history . --expected-remote-from-project
+ARXIV_DIGEST_VERSION=$(.venv/bin/python -c 'from arxiv_digest import __version__; print(__version__)')
+.venv/bin/python scripts/privacy_scan.py archive "dist/arxiv_digest-${ARXIV_DIGEST_VERSION}.tar.gz"
+.venv/bin/python scripts/privacy_scan.py archive "dist/arxiv_digest-${ARXIV_DIGEST_VERSION}-py3-none-any.whl"
 ```
 
 The tree command above assumes that the checkout's sole `origin` is the
@@ -42,6 +44,11 @@ canonical public HTTPS clone, replace `--expected-remote-from-project` with
 when the recorded URL omits it). Reserve `--expect-no-remote` for an
 intentional release-audit copy with no Git remote; it is not the command for an
 ordinary clone.
+
+The history scan inspects every reachable Git ref. Run the release history gate
+from a clean clone containing only the branches and tags intended for public
+distribution; local editor or agent checkpoint refs are not publishable
+history and can cause a whole-repository scan to report private working data.
 
 Browser changes must pass both Chromium and WebKit. Packaging changes must
 preserve the exact migration, static-asset, license, and notice inventories.

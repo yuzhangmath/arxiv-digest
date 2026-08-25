@@ -19,6 +19,7 @@ from types import MappingProxyType
 from typing import Literal
 from urllib.parse import quote
 
+from arxiv_digest import __version__
 from arxiv_digest.atomic import atomic_write, exclusive_flock
 from arxiv_digest.folders import DestinationKind, FolderChoice, FolderService
 from arxiv_digest.maintenance import MaintenanceBarrier
@@ -1421,7 +1422,7 @@ def restore_backup(
                         _snapshot_payloads(
                             paths,
                             candidate,
-                            application_version="0.2.0",
+                            application_version=__version__,
                             created_at=now,
                         )
                     except BackupError as error:
@@ -1710,7 +1711,7 @@ def export_backup(
     *,
     maintenance: MaintenanceBarrier | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-    application_version: str = "0.2.0",
+    application_version: str = __version__,
 ) -> BackupManifest:
     """Export a verified portable snapshot without overwriting a target."""
 

@@ -1,0 +1,391 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      version: ${{ steps.identity.outputs.version }}
+      commit_sha: ${{ steps.identity.outputs.commit_sha }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+
+    steps:
+      - name: Check out the triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          check-latest: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.19.0"
+          package-manager-cache: false
+
+      - name: Verify release identity
+        id: identity
+        shell: bash
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          PYTHONPATH=src python scripts/release_check.py --tag="$RELEASE_TAG"
+          version="${RELEASE_TAG#v}"
+
+          git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"
+          if [[ "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" != "tag" ]]; then
+            echo "Releases require an annotated tag." >&2
+            exit 1
+          fi
+
+          event_commit="$(git rev-parse --verify "${EVENT_SHA}^{commit}")"
+          tag_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+          head_commit="$(git rev-parse --verify HEAD)"
+          if [[ "$event_commit" != "$tag_commit" || "$head_commit" != "$tag_commit" ]]; then
+            echo "The triggering event, checked-out commit, and release tag disagree." >&2
+            exit 1
+          fi
+
+          notes="docs/releases/${RELEASE_TAG}.md"
+          if [[ ! -f "$notes" || -L "$notes" ]]; then
+            echo "The committed release-notes file is missing or unsafe." >&2
+            exit 1
+          fi
+
+          source_date_epoch="$(git show -s --format=%ct "$head_commit")"
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+          {
+            printf 'release_tag=%s\n' "$RELEASE_TAG"
+            printf 'version=%s\n' "$version"
+            printf 'commit_sha=%s\n' "$head_commit"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install development dependencies
+        run: python -m pip install --disable-pip-version-check ".[dev]"
+
+      - name: Build wheel and source distribution once
+        run: python -m build
+
+      - name: Run Python tests
+        run: python -m pytest tests/unit tests/integration -q
+
+      - name: Run JavaScript tests
+        run: node --test tests/js/*.test.mjs
+
+      - name: Install browser-test dependencies
+        run: python -m playwright install --with-deps chromium webkit
+
+      - name: Run browser tests
+        run: python -m pytest tests/browser -q
+
+      - name: Run privacy gates
+        shell: bash
+        env:
+          EXPECTED_REMOTE: ${{ github.server_url }}/${{ github.repository }}
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          python scripts/privacy_scan.py tree . --expected-remote "$EXPECTED_REMOTE"
+          python scripts/privacy_scan.py history . --expected-remote "$EXPECTED_REMOTE"
+          python scripts/privacy_scan.py archive "dist/arxiv_digest-${VERSION}.tar.gz"
+          python scripts/privacy_scan.py archive "dist/arxiv_digest-${VERSION}-py3-none-any.whl"
+
+      - name: Smoke-test the wheel through pipx
+        shell: bash
+        env:
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          wheel="${GITHUB_WORKSPACE}/dist/arxiv_digest-${VERSION}-py3-none-any.whl"
+          mkdir -p \
+            "${RUNNER_TEMP}/pipx-home" \
+            "${RUNNER_TEMP}/pipx-bin" \
+            "${RUNNER_TEMP}/unrelated"
+          cd "${RUNNER_TEMP}/unrelated"
+
+          PIPX_HOME="${RUNNER_TEMP}/pipx-home" \
+          PIPX_BIN_DIR="${RUNNER_TEMP}/pipx-bin" \
+            python -m pipx install "$wheel"
+
+          doctor_output="$(
+            ARXIV_DIGEST_TESTING=1 \
+            ARXIV_DIGEST_TEST_ROOT="${RUNNER_TEMP}/doctor-state" \
+              "${RUNNER_TEMP}/pipx-bin/arxiv-digest" doctor
+          )"
+          if [[ "${doctor_output%%$'\n'*}" != "arXiv Digest ${VERSION}" ]]; then
+            echo "The installed wheel reported an unexpected version." >&2
+            exit 1
+          fi
+          test ! -e "${RUNNER_TEMP}/doctor-state"
+
+      - name: Confirm verification did not alter tracked source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Assemble checksummed release bundle
+        shell: bash
+        env:
+          BUNDLE: ${{ runner.temp }}/release-bundle
+          RELEASE_TAG: ${{ steps.identity.outputs.release_tag }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          COMMIT_SHA: ${{ steps.identity.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+
+          wheel="arxiv_digest-${VERSION}-py3-none-any.whl"
+          sdist="arxiv_digest-${VERSION}.tar.gz"
+          mkdir "$BUNDLE"
+          cp -- "dist/${wheel}" "$BUNDLE/"
+          cp -- "dist/${sdist}" "$BUNDLE/"
+          cp -- "docs/releases/${RELEASE_TAG}.md" "$BUNDLE/RELEASE_NOTES.md"
+          printf '%s\n' "$COMMIT_SHA" > "$BUNDLE/COMMIT_SHA"
+
+          (
+            cd "$BUNDLE"
+            sha256sum "$wheel" "$sdist" > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Upload verified release bundle
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ steps.identity.outputs.release_tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-bundle/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  publish:
+    name: Publish or verify GitHub prerelease
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: ${{ runner.temp }}/release-bundle
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Validate downloaded bundle
+        shell: bash
+        env:
+          BUNDLE: ${{ runner.temp }}/release-bundle
+          EXPECTED_COMMIT: ${{ needs.build.outputs.commit_sha }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          wheel="arxiv_digest-${VERSION}-py3-none-any.whl"
+          sdist="arxiv_digest-${VERSION}.tar.gz"
+          expected=(
+            "$wheel"
+            "$sdist"
+            "SHA256SUMS"
+            "RELEASE_NOTES.md"
+            "COMMIT_SHA"
+          )
+
+          shopt -s nullglob dotglob
+          entries=("$BUNDLE"/*)
+          if (( ${#entries[@]} != ${#expected[@]} )); then
+            echo "The release bundle has an unexpected file inventory." >&2
+            exit 1
+          fi
+
+          for name in "${expected[@]}"; do
+            if [[ ! -f "$BUNDLE/$name" || -L "$BUNDLE/$name" ]]; then
+              echo "The release bundle contains a missing or unsafe entry." >&2
+              exit 1
+            fi
+          done
+          test -s "$BUNDLE/RELEASE_NOTES.md"
+          if [[ "$(cat "$BUNDLE/COMMIT_SHA")" != "$EXPECTED_COMMIT" ]]; then
+            echo "The release bundle commit does not match the verified build." >&2
+            exit 1
+          fi
+
+          (
+            cd "$BUNDLE"
+            sha256sum "$wheel" "$sdist" > "${RUNNER_TEMP}/expected-SHA256SUMS"
+            cmp --silent SHA256SUMS "${RUNNER_TEMP}/expected-SHA256SUMS"
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Publish new prerelease or verify existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          EXPECTED_COMMIT: ${{ needs.build.outputs.commit_sha }}
+          BUNDLE: ${{ runner.temp }}/release-bundle
+          RELEASE_JSON: ${{ runner.temp }}/release.json
+        run: |
+          set -euo pipefail
+
+          wheel="arxiv_digest-${VERSION}-py3-none-any.whl"
+          sdist="arxiv_digest-${VERSION}.tar.gz"
+
+          verify_remote_tag() {
+            local remote_commit
+            remote_commit="$(
+              gh api \
+                "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" \
+                --jq .sha
+            )"
+            if [[ "$remote_commit" != "$EXPECTED_COMMIT" ]]; then
+              echo "The remote release tag no longer identifies the built commit." >&2
+              exit 1
+            fi
+          }
+
+          fetch_release() {
+            curl \
+              --silent \
+              --show-error \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --output "$RELEASE_JSON" \
+              --write-out "%{http_code}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}"
+          }
+
+          verify_release() {
+            local require_prerelease="$1"
+            REQUIRE_PRERELEASE="$require_prerelease" \
+            WHEEL_NAME="$wheel" \
+            SDIST_NAME="$sdist" \
+              python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+
+          def fail(reason: str) -> None:
+              raise SystemExit(f"release verification failed: {reason}")
+
+
+          release = json.loads(Path(os.environ["RELEASE_JSON"]).read_text())
+          tag = os.environ["RELEASE_TAG"]
+          bundle = Path(os.environ["BUNDLE"])
+          require_prerelease = os.environ["REQUIRE_PRERELEASE"] == "1"
+          expected_names = {
+              os.environ["WHEEL_NAME"],
+              os.environ["SDIST_NAME"],
+              "SHA256SUMS",
+          }
+
+          if release.get("tag_name") != tag:
+              fail("tag mismatch")
+          if release.get("draft") is not False:
+              fail("an existing draft requires manual inspection")
+          if require_prerelease and release.get("prerelease") is not True:
+              fail("new release was not marked as a prerelease")
+          if release.get("body") != (bundle / "RELEASE_NOTES.md").read_text():
+              fail("release notes mismatch")
+
+          raw_assets = release.get("assets")
+          if not isinstance(raw_assets, list):
+              fail("invalid asset inventory")
+
+          assets: dict[str, dict[str, object]] = {}
+          for item in raw_assets:
+              if not isinstance(item, dict):
+                  fail("invalid asset record")
+              name = item.get("name")
+              if not isinstance(name, str) or name in assets:
+                  fail("invalid or duplicate asset name")
+              assets[name] = item
+
+          if set(assets) != expected_names:
+              fail("asset inventory mismatch")
+
+          for name in sorted(expected_names):
+              path = bundle / name
+              digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+              record = assets[name]
+              if record.get("state") != "uploaded":
+                  fail("asset upload is incomplete")
+              if record.get("size") != path.stat().st_size:
+                  fail("asset size mismatch")
+              if record.get("digest") != digest:
+                  fail("asset digest mismatch")
+          PY
+          }
+
+          verify_remote_tag
+          status="$(fetch_release)"
+          case "$status" in
+            200)
+              # Do not modify an existing release. A manually promoted release
+              # is accepted only when its notes and assets remain identical.
+              verify_release 0
+              verify_remote_tag
+              echo "The existing release and its immutable assets match."
+              ;;
+            404)
+              gh release create "$RELEASE_TAG" \
+                "$BUNDLE/$wheel" \
+                "$BUNDLE/$sdist" \
+                "$BUNDLE/SHA256SUMS" \
+                --repo "$GITHUB_REPOSITORY" \
+                --verify-tag \
+                --title "arXiv Digest ${RELEASE_TAG}" \
+                --notes-file "$BUNDLE/RELEASE_NOTES.md" \
+                --prerelease \
+                --latest=false
+
+              status="$(fetch_release)"
+              if [[ "$status" != "200" ]]; then
+                echo "The newly created release could not be read back." >&2
+                exit 1
+              fi
+              verify_release 1
+              verify_remote_tag
+              echo "The prerelease was published and verified."
+              ;;
+            *)
+              echo "GitHub returned an unexpected release lookup status: ${status}" >&2
+              exit 1
+              ;;
+          esac

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from arxiv_digest import __version__
 from arxiv_digest.models import CategoryConfig, PaperMetadata, PaperVersion
 from arxiv_digest.paths import AppPaths, resolve_paths
 from arxiv_digest.profile import (
@@ -610,7 +611,7 @@ def test_export_is_deterministic_portable_and_excludes_machine_local_state(
     manifest = json.loads(manifest_payload)
     assert manifest == {
         "application_generation": 2,
-        "application_version": "0.2.0",
+        "application_version": __version__,
         "created_at": "2026-08-22T12:00:00Z",
         "format_name": "arxiv-digest-backup",
         "format_version": 2,
