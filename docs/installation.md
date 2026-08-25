@@ -11,7 +11,7 @@ macOS or Linux.
 - [Install arXiv Digest](#install-arxiv-digest)
 - [Complete first-run setup](#complete-first-run-setup)
 - [Use the app](#use-the-app)
-- [Upgrade](#upgrade)
+- [Clean reset with recovery copy](#clean-reset-with-recovery-copy)
 - [Uninstall](#uninstall)
 - [HTTPS and maintainer SSH](#https-and-maintainer-ssh)
 
@@ -94,7 +94,7 @@ After `pipx ensurepath`, open a new terminal. In that terminal, install arXiv
 Digest from the canonical public HTTPS address:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.1.0
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.0
 ```
 
 The official [pipx CLI reference](https://pipx.pypa.io/stable/reference/cli.html)
@@ -111,14 +111,28 @@ arxiv-digest init
 The command keeps running while the local dashboard is open. Leave the
 terminal open during setup. Listing categories and building the candidate
 sample require a live connection to arXiv. Each candidate-building attempt is
-capped at five minutes; an incomplete attempt offers **Resume** or **Retry**.
+capped at five minutes; an incomplete attempt offers **Resume corpus** or
+**Restart corpus**.
 When finished, select **Quit** and wait for the terminal prompt to return.
 Closing only the browser tab may leave the process running for about 30
 minutes. The dashboard guides you through categories, initial history,
-candidate papers, interests, a standard or picker-selected PDF folder, and the
-optional desktop launcher. Only checked suggestions and explicitly typed
-custom entries become preferences. Search, navigation, and paging do not
-select anything.
+candidate papers, optional seed papers, terms and authors, a picker-selected
+PDF folder, profile review, and the optional desktop launcher.
+The **Terms** step presents multiword **Suggested terms** and one **Custom
+term** control. A one-word custom term is saved as a keyword; a custom term of
+2–12 words is saved as a phrase. Setup and Interests present both together as
+terms while preserving that classification. Only checked suggestions and
+nonblank custom entries become preferences. Search, navigation, and paging do
+not select anything.
+
+The history choice controls recovered daily-list membership. Review and
+Calendar remain empty for a category/date until that daily list is recovered.
+Atom and OAI provide hidden support for metadata and version resolution but do
+not create visible review dates. The candidate corpus does not populate Review,
+Calendar, or Library, and selecting a seed does not save it. Failed recovery
+leaves coverage gaps; Settings shows per-category progress and retryable dates.
+Library is independent of that coverage, so removing a category does not
+remove papers you saved explicitly.
 
 ## Use the app
 
@@ -134,20 +148,32 @@ It is a manual launch shortcut, not a login item or scheduler.
 `arxiv-digest library` opens the library and `arxiv-digest config` opens
 Settings.
 
-## Upgrade
+## Clean reset with recovery copy
 
-Quit the dashboard first. Then open a terminal and export a backup. Only run
-the upgrade command after the export finishes successfully:
+This release uses application-data generation 2, profile schema 2, and
+portable backup format 2. An earlier database or profile cannot be opened, and
+an earlier portable backup cannot be imported. The app rejects each before
+changing it. Use this exact flow when moving from the earlier generation:
 
-```bash
-arxiv-digest export arxiv-digest-backup.zip
-pipx install --force git+https://github.com/yuzhangmath/arxiv-digest.git@v0.1.0
-```
+1. **Quit arXiv Digest.** Select **Quit**, wait for the terminal prompt to
+   return, and confirm no launcher-started copy remains running.
+2. **Move the old durable data and regenerable cache** into a private
+   timestamped recovery location outside the active application directories.
+   Include both the configuration and durable-data locations on Linux. The
+   locations are listed in [Data and backup](data-and-backup.md).
+3. **Remove the managed desktop launcher and installed application.** Remove
+   only the launcher created by arXiv Digest, then run `pipx uninstall
+   arxiv-digest`.
+4. **Install and start application-data generation 2.** Run the public install
+   command from [Install arXiv Digest](#install-arxiv-digest), then run
+   `arxiv-digest init` to create a new profile and database.
+5. **Leave separately downloaded PDFs** in their existing destination. They
+   are outside application data and must not be moved or deleted as part of
+   this reset.
 
-The release tag keeps the installed source fixed and reproducible. When a new
-release is documented, replace `v0.1.0` with that release's tag. Open the app
-after upgrading so any bundled database migrations can run. Portable
-application data is stored separately from the pipx environment.
+The private timestamped recovery location is rollback-only and is not imported
+by generation 2. Do not place the recovery copy back into the new active data
+directories and do not select an old portable backup during setup.
 
 ## Uninstall
 

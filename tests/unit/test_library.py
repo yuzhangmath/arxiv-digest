@@ -10,7 +10,7 @@ from arxiv_digest.storage.store import DownloadFileRecord, Store
 
 
 def seed_article(store: Store, arxiv_id: str, title: str) -> None:
-    store.apply_event_batch(
+    store.apply_article_snapshot(
         PaperMetadata(
             arxiv_id=arxiv_id,
             title=title,
@@ -29,7 +29,6 @@ def seed_article(store: Store, arxiv_id: str, title: str) -> None:
                 datetime(2026, 8, 20, tzinfo=timezone.utc),
             ),
         ),
-        (),
     )
 
 

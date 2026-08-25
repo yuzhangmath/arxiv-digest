@@ -13,7 +13,18 @@ class CorruptDatabaseError(RuntimeError):
     pass
 
 
-_VERSION_ONE_TABLES = frozenset(
+class LegacyDataGenerationError(CorruptDatabaseError):
+    pass
+
+
+_LEGACY_DATA_GENERATION_MESSAGE = (
+    "This arXiv Digest data belongs to an incompatible release. Quit the app "
+    "and follow Clean reset with recovery copy; the existing data was not "
+    "modified."
+)
+
+
+_BASE_TABLES = frozenset(
     {
         "schema_migrations",
         "state_meta",
@@ -24,13 +35,23 @@ _VERSION_ONE_TABLES = frozenset(
         "article_categories",
         "category_sync_state",
         "sync_runs",
-        "review_events",
-        "event_evidence",
-        "review_date_state",
-        "enrichment_days",
         "saved_papers",
         "papers_fts",
         "category_article_state",
+    }
+)
+_LEGACY_REVIEW_TABLES = frozenset(
+    {"review_events", "event_evidence", "review_date_state", "enrichment_days"}
+)
+_CONFIRMED_REVIEW_TABLES = frozenset(
+    {
+        "application_generation",
+        "source_observations",
+        "catchup_days",
+        "canonical_events",
+        "canonical_event_observations",
+        "review_date_state",
+        "reconciliation_diagnostics",
     }
 )
 _REQUIRED_TRIGGERS = frozenset(
@@ -50,6 +71,35 @@ def _connect(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
     return connection
+
+
+def _preflight_existing_database(path: Path) -> None:
+    uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        marker = connection.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type = 'table' AND name = 'application_generation'"""
+        ).fetchone()
+        if marker is None:
+            raise LegacyDataGenerationError(_LEGACY_DATA_GENERATION_MESSAGE)
+        generation_rows = connection.execute(
+            "SELECT singleton, generation FROM application_generation"
+        ).fetchall()
+        if generation_rows != [(1, 2)]:
+            raise LegacyDataGenerationError(_LEGACY_DATA_GENERATION_MESSAGE)
+        applied = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        current_version = len(applied)
+        if (
+            applied != [(version,) for version in range(1, current_version + 1)]
+            or current_version < 4
+            or current_version > len(_migration_scripts())
+        ):
+            raise CorruptDatabaseError("database schema version is unsupported")
+    finally:
+        connection.close()
 
 
 def _migration_scripts() -> tuple[tuple[int, str], ...]:
@@ -99,7 +149,11 @@ def _check(connection: sqlite3.Connection, expected_version: int) -> None:
             "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
         )
     }
-    required_tables = _VERSION_ONE_TABLES
+    required_tables = _BASE_TABLES
+    if expected_version < 4:
+        required_tables = required_tables | _LEGACY_REVIEW_TABLES
+    else:
+        required_tables = required_tables | _CONFIRMED_REVIEW_TABLES
     if expected_version >= 2:
         required_tables = required_tables | {"download_files"}
     if expected_version >= 3:
@@ -200,6 +254,8 @@ def open_database(path: Path) -> sqlite3.Connection:
     try:
         if not path.exists():
             _create_database(path)
+        else:
+            _preflight_existing_database(path)
         connection = _connect(path)
         scripts = _migration_scripts()
         applied = connection.execute(

@@ -2,20 +2,21 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 import sqlite3
 
-import pytest
-
 from arxiv_digest.models import (
     AnnounceType,
-    Confidence,
-    DateBasis,
-    EventCandidate,
-    EventEvidence,
-    EvidenceSource,
+    AtomBatch,
+    AtomEntry,
+    CatchupDay,
+    CatchupEntry,
+    CatchupPage,
     EnrichmentStatus,
+    EvidenceSource,
     OaiArticle,
     OaiTombstone,
     PaperMetadata,
     PaperVersion,
+    SourceObservation,
+    VersionResolution,
 )
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import Store
@@ -40,229 +41,173 @@ def _version(number: int = 1) -> PaperVersion:
     )
 
 
-def _candidate(
-    *,
-    arxiv_id: str = "2608.01001",
-    version: int | None = 1,
-    day: date = date(2026, 8, 3),
-    source_key: str = "atom:cs.SE:2026-08-03:0:2608.01001v1",
-    category: str = "cs.SE",
-    list_position: int = 0,
-) -> EventCandidate:
-    evidence = EventEvidence(
-        source_key=source_key,
-        source=EvidenceSource.ATOM,
-        confidence=Confidence.CURRENT,
-        category=category,
-        announce_type=AnnounceType.NEW,
-        mailing_date=day,
-        announced_version=version,
-        list_position=list_position,
-        oai_datestamp=None,
-        raw_sha256="0" * 64,
-        observed_at=datetime(2026, 8, 3, 13, tzinfo=timezone.utc),
-    )
-    return EventCandidate(
-        arxiv_id=arxiv_id,
-        announced_version=version,
-        effective_date=day,
-        date_basis=DateBasis.FEED_MAILING,
-        evidence=evidence,
-    )
+def test_article_snapshot_stores_metadata_and_versions_without_creating_an_event(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    store = Store(database_path)
+
+    events = store.apply_article_snapshot(_metadata(), (_version(),))
+
+    assert events == ()
+    assert store.article_metadata("2608.01001") == _metadata()
+    assert store.article_versions("2608.01001") == (_version(),)
+    assert store.canonical_event_count() == 0
+    assert store.review_queue_revision() == 0
 
 
-def _source_candidate(
-    *,
-    source: EvidenceSource,
-    version: int | None,
-    day: date,
-    source_key: str,
-    category: str = "cs.SE",
-) -> EventCandidate:
-    confidence = {
-        EvidenceSource.ATOM: Confidence.CURRENT,
-        EvidenceSource.CATCHUP: Confidence.RECOVERED,
-        EvidenceSource.OAI: Confidence.INFERRED,
-    }[source]
-    date_basis = {
-        EvidenceSource.ATOM: DateBasis.FEED_MAILING,
-        EvidenceSource.CATCHUP: DateBasis.CATCHUP_MAILING,
-        EvidenceSource.OAI: DateBasis.VERSION_HISTORY_UTC,
-    }[source]
-    evidence = EventEvidence(
-        source_key=source_key,
-        source=source,
-        confidence=confidence,
-        category=category,
-        announce_type=(
-            AnnounceType.NEW if version == 1 else AnnounceType.CROSS
-        ),
-        mailing_date=(None if source is EvidenceSource.OAI else day),
-        announced_version=version,
-        list_position=(None if source is EvidenceSource.OAI else 0),
-        oai_datestamp=(
-            date(2026, 8, 20) if source is EvidenceSource.OAI else None
-        ),
-        raw_sha256="d" * 64,
-        observed_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+def test_article_snapshot_reconciles_an_existing_catchup_backed_event(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    store = Store(database_path)
+    daily_list_date = date(2026, 8, 3)
+    observed_at = datetime(2026, 8, 4, tzinfo=timezone.utc)
+    entry = CatchupEntry(
+        metadata=_metadata(),
+        section=AnnounceType.NEW,
+        mailing_date=daily_list_date,
+        position=0,
     )
-    return EventCandidate(
+    observation = SourceObservation(
+        source_key="catchup:cs.SE:2026-08-03:0:2608.01001",
         arxiv_id="2608.01001",
-        announced_version=version,
-        effective_date=day,
-        date_basis=date_basis,
-        evidence=evidence,
+        source=EvidenceSource.CATCHUP,
+        category="cs.SE",
+        announce_type=AnnounceType.NEW,
+        daily_list_date=daily_list_date,
+        announced_version=None,
+        list_position=0,
+        oai_datestamp=None,
+        response_sha256="c" * 64,
+        observed_at=observed_at,
     )
+    original = store.apply_catchup_day(
+        CatchupDay(
+            category="cs.SE",
+            mailing_date=daily_list_date,
+            status=EnrichmentStatus.COMPLETE,
+            pages=(
+                CatchupPage(
+                    category="cs.SE",
+                    mailing_date=daily_list_date,
+                    page=1,
+                    total_pages=1,
+                    entries=(entry,),
+                    raw_sha256="c" * 64,
+                ),
+            ),
+            error_code=None,
+            error_message=None,
+        ),
+        (observation,),
+        observed_at,
+    )[0]
+
+    refined = store.apply_article_snapshot(_metadata(), (_version(),))
+
+    assert len(refined) == 1
+    assert refined[0].event_id == original.event_id
+    assert refined[0].queue_revision == original.queue_revision
+    assert refined[0].announced_version == 1
+    assert refined[0].version_resolution is VersionResolution.CHRONOLOGY_MATCHED
 
 
-def test_apply_event_batch_creates_a_review_event_atomically(
+def test_candidate_mailing_evidence_uses_durable_atom_and_catchup_observations(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "state.sqlite3"
     open_database(database_path).close()
     store = Store(database_path)
-
-    result = store.apply_event_batch(
-        _metadata(), (_version(),), (_candidate(),)
+    observed_at = datetime(2026, 8, 4, tzinfo=timezone.utc)
+    atom_day = date(2026, 8, 2)
+    atom_metadata = _metadata("2608.01002")
+    atom_observation = SourceObservation(
+        source_key="atom:cs.SE:2026-08-02:0:2608.01002v1",
+        arxiv_id=atom_metadata.arxiv_id,
+        source=EvidenceSource.ATOM,
+        category="cs.SE",
+        announce_type=AnnounceType.NEW,
+        daily_list_date=atom_day,
+        announced_version=1,
+        list_position=0,
+        oai_datestamp=None,
+        response_sha256="a" * 64,
+        observed_at=observed_at,
     )
-
-    assert len(result) == 1
-    event = result[0]
-    assert event.arxiv_id == "2608.01001"
-    assert event.announced_version == 1
-    assert event.queue_revision == 1
-    assert event.evidence[0].source_key.startswith("atom:")
-    assert store.events_for_date(date(2026, 8, 3)) == result
-
-
-def test_candidate_mailing_evidence_is_category_and_window_bounded(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    store.apply_event_batch(
-        _metadata(),
-        (_version(),),
-        (
-            _candidate(day=date(2026, 8, 3)),
-            _candidate(
-                category="math.LO",
-                day=date(2026, 8, 4),
-                source_key="atom:math.LO:2026-08-04:0:2608.01001v1",
+    store.apply_atom_batch(
+        AtomBatch(
+            category="cs.SE",
+            mailing_date=atom_day,
+            entries=(
+                AtomEntry(
+                    metadata=atom_metadata,
+                    announced_version=1,
+                    published_at=observed_at,
+                    announce_type=AnnounceType.NEW,
+                    mailing_date=atom_day,
+                    position=0,
+                ),
             ),
+            raw_sha256="a" * 64,
+            fetched_at=observed_at,
         ),
+        (atom_observation,),
     )
-    store.apply_event_batch(
-        _metadata("2608.01002"),
-        (_version(),),
-        (
-            _candidate(
-                arxiv_id="2608.01002",
-                day=date(2026, 5, 1),
-                source_key="atom:cs.SE:2026-05-01:0:2608.01002v1",
+    catchup_day = date(2026, 8, 3)
+    catchup_metadata = _metadata("2608.01003")
+    catchup_entry = CatchupEntry(
+        metadata=catchup_metadata,
+        section=AnnounceType.NEW,
+        mailing_date=catchup_day,
+        position=0,
+    )
+    catchup_observation = SourceObservation(
+        source_key="catchup:cs.SE:2026-08-03:0:2608.01003",
+        arxiv_id=catchup_metadata.arxiv_id,
+        source=EvidenceSource.CATCHUP,
+        category="cs.SE",
+        announce_type=AnnounceType.NEW,
+        daily_list_date=catchup_day,
+        announced_version=None,
+        list_position=0,
+        oai_datestamp=None,
+        response_sha256="b" * 64,
+        observed_at=observed_at,
+    )
+    store.apply_catchup_day(
+        CatchupDay(
+            category="cs.SE",
+            mailing_date=catchup_day,
+            status=EnrichmentStatus.COMPLETE,
+            pages=(
+                CatchupPage(
+                    category="cs.SE",
+                    mailing_date=catchup_day,
+                    page=1,
+                    total_pages=1,
+                    entries=(catchup_entry,),
+                    raw_sha256="b" * 64,
+                ),
             ),
+            error_code=None,
+            error_message=None,
         ),
+        (catchup_observation,),
+        observed_at,
     )
 
     assert store.candidate_mailing_evidence(
-        "cs.SE", date(2026, 8, 1), date(2026, 8, 31)
-    ) == (("2608.01001", date(2026, 8, 3)),)
-
-
-def test_source_key_replay_is_idempotent_and_does_not_consume_revision(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    first_candidate = _candidate()
-
-    original = store.apply_event_batch(
-        _metadata(), (_version(),), (first_candidate,)
+        "cs.SE", atom_day, catchup_day
+    ) == (
+        ("2608.01002", atom_day),
+        ("2608.01003", catchup_day),
     )
-    replay = store.apply_event_batch(
-        _metadata(), (_version(),), (first_candidate,)
-    )
-    next_event = store.apply_event_batch(
-        _metadata("2608.01002"),
-        (_version(),),
-        (
-            _candidate(
-                arxiv_id="2608.01002",
-                source_key="atom:cs.SE:2026-08-03:1:2608.01002v1",
-            ),
-        ),
-    )
-
-    assert replay == original
-    assert len(store.events_for_date(date(2026, 8, 3))) == 2
-    assert next_event[0].queue_revision == 2
-
-
-def test_overlapping_categories_merge_into_one_versioned_daily_event(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    metadata = PaperMetadata(
-        arxiv_id="2608.01001",
-        title="Synthetic Queue Systems",
-        authors=("A. Example",),
-        abstract="A fictional abstract about deterministic queues.",
-        primary_category="cs.SE",
-        categories=("cs.SE", "math.LO"),
-    )
-
-    result = store.apply_event_batch(
-        metadata,
-        (_version(),),
-        (
-            _candidate(),
-            _candidate(
-                category="math.LO",
-                list_position=4,
-                source_key="atom:math.LO:2026-08-03:4:2608.01001v1",
-            ),
-        ),
-    )
-
-    assert len(result) == 1
-    assert result[0].queue_revision == 1
-    assert {item.category for item in result[0].evidence} == {
-        "cs.SE",
-        "math.LO",
-    }
-
-
-def test_finish_date_does_not_review_later_discovery(tmp_path: Path) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    first = store.apply_event_batch(
-        _metadata(), (_version(),), (_candidate(),)
-    )[0]
-    second = store.apply_event_batch(
-        _metadata("2608.01002"),
-        (_version(),),
-        (
-            _candidate(
-                arxiv_id="2608.01002",
-                source_key="atom:cs.SE:2026-08-03:1:2608.01002v1",
-            ),
-        ),
-    )[0]
-
-    result = store.finish_date(
-        date(2026, 8, 3),
-        through_revision=first.queue_revision,
-        finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
-    )
-
-    assert result.reviewed_count == 1
-    assert store.review_event(first.event_id).reviewed_at is not None
-    assert store.review_event(second.event_id).reviewed_at is None
+    assert store.candidate_mailing_evidence(
+        "math.LO", atom_day, catchup_day
+    ) == ()
 
 
 def test_beginning_incremental_sync_updates_only_incremental_status(
@@ -553,57 +498,6 @@ def test_oai_page_builds_stable_complete_article_snapshots(tmp_path: Path) -> No
     ) == (snapshots[1],)
 
 
-def test_distinct_non_null_versions_never_merge(tmp_path: Path) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    second = _candidate(
-        version=2,
-        source_key="atom:cs.SE:2026-08-03:1:2608.01001v2",
-        list_position=1,
-    )
-
-    events = store.apply_event_batch(
-        _metadata(), (_version(1), _version(2)), (_candidate(), second)
-    )
-
-    assert [event.announced_version for event in events] == [1, 2]
-    assert [event.queue_revision for event in events] == [1, 2]
-
-
-def test_invalid_event_rolls_back_article_versions_fts_and_revision(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    invalid = _candidate(
-        arxiv_id="2608.09999",
-        source_key="atom:cs.SE:2026-08-03:1:2608.09999v1",
-    )
-
-    with pytest.raises(ValueError, match="metadata"):
-        store.apply_event_batch(
-            _metadata(), (_version(),), (_candidate(), invalid)
-        )
-
-    connection = sqlite3.connect(database_path)
-    for table in (
-        "articles",
-        "article_versions",
-        "review_events",
-        "event_evidence",
-        "papers_fts",
-    ):
-        assert connection.execute(f"SELECT count(*) FROM {table}").fetchone() == (
-            0,
-        )
-    assert connection.execute(
-        "SELECT queue_revision FROM state_meta WHERE singleton = 1"
-    ).fetchone() == (0,)
-    connection.close()
-
-
 def test_library_search_covers_id_title_author_abstract_and_safe_punctuation(
     tmp_path: Path,
 ) -> None:
@@ -626,21 +520,8 @@ def test_library_search_covers_id_title_author_abstract_and_safe_punctuation(
         primary_category="cs.SE",
         categories=("cs.SE",),
     )
-    for position, metadata in enumerate((title_match, abstract_match)):
-        store.apply_event_batch(
-            metadata,
-            (_version(),),
-            (
-                _candidate(
-                    arxiv_id=metadata.arxiv_id,
-                    source_key=(
-                        f"atom:cs.SE:2026-08-03:{position}:"
-                        f"{metadata.arxiv_id}v1"
-                    ),
-                    list_position=position,
-                ),
-            ),
-        )
+    for metadata in (title_match, abstract_match):
+        store.apply_article_snapshot(metadata, (_version(),))
         store.save_paper(metadata.arxiv_id, 1)
 
     widget = store.search_library("widget", limit=10, offset=0)
@@ -668,7 +549,7 @@ def test_saved_tombstone_stays_searchable_but_unavailable(tmp_path: Path) -> Non
     connection.commit()
     connection.close()
     store = Store(database_path)
-    store.apply_event_batch(_metadata(), (_version(),), (_candidate(),))
+    store.apply_article_snapshot(_metadata(), (_version(),))
     store.save_paper("2608.01001", 1)
     run_id = store.begin_sync_run(
         "cs.SE",
@@ -700,7 +581,7 @@ def test_saved_tombstone_stays_searchable_but_unavailable(tmp_path: Path) -> Non
     assert result[0].local_pdf_versions == ()
 
 
-def test_tombstone_excludes_snapshots_and_future_event_batches(
+def test_tombstone_excludes_oai_snapshots_and_article_snapshots_do_not_revive_it(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "state.sqlite3"
@@ -753,16 +634,8 @@ def test_tombstone_excludes_snapshots_and_future_event_batches(
     )
 
     assert store.article_snapshots("cs.SE") == ()
-    result = store.apply_event_batch(
-        _metadata(),
-        (_version(1), _version(2)),
-        (
-            _candidate(
-                version=2,
-                day=date(2026, 8, 5),
-                source_key="atom:cs.SE:2026-08-05:0:2608.01001v2",
-            ),
-        ),
+    result = store.apply_article_snapshot(
+        _metadata(), (_version(1), _version(2))
     )
 
     assert result == ()
@@ -771,53 +644,11 @@ def test_tombstone_excludes_snapshots_and_future_event_batches(
     assert connection.execute(
         "SELECT is_deleted FROM articles WHERE arxiv_id = '2608.01001'"
     ).fetchone() == (1,)
-    assert connection.execute("SELECT count(*) FROM review_events").fetchone() == (
-        0,
-    )
+    assert store.canonical_event_count() == 0
     assert connection.execute(
         "SELECT queue_revision FROM state_meta WHERE singleton = 1"
     ).fetchone() == (0,)
     connection.close()
-
-
-def test_review_snapshot_dates_links_and_position_are_durable(tmp_path: Path) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    first = store.apply_event_batch(
-        _metadata(), (_version(),), (_candidate(),)
-    )[0]
-    store.apply_event_batch(
-        _metadata("2608.01002"),
-        (_version(),),
-        (
-            _candidate(
-                arxiv_id="2608.01002",
-                day=date(2026, 8, 5),
-                source_key="atom:cs.SE:2026-08-05:0:2608.01002v1",
-            ),
-        ),
-    )
-
-    snapshot = store.review_snapshot(date(2026, 8, 3))
-    assert snapshot.snapshot_revision == 2
-    assert snapshot.events == (first,)
-    assert snapshot.anchor_event_id is None
-    assert store.list_review_dates() == (
-        date(2026, 8, 3),
-        date(2026, 8, 5),
-    )
-    assert store.review_date_links(date(2026, 8, 3)).next_date == date(
-        2026, 8, 5
-    )
-
-    position = store.record_position(
-        date(2026, 8, 3), snapshot.snapshot_revision, first.event_id, 7
-    )
-    assert position.anchor_event_id == first.event_id
-    resumed = store.review_snapshot(date(2026, 8, 3))
-    assert resumed.anchor_event_id == first.event_id
-    assert resumed.profile_revision == 7
 
 
 def test_enrichment_day_records_exact_empty_and_failed_states(
@@ -837,177 +668,24 @@ def test_enrichment_day_records_exact_empty_and_failed_states(
             raw_sha256="c" * 64,
         )
     )
-
-    connection = sqlite3.connect(database_path)
-    assert connection.execute(
-        """SELECT status, fetched_at, raw_sha256, error_code
-           FROM enrichment_days
-           WHERE category = 'cs.SE' AND mailing_date = '2026-08-03'
-             AND source = 'catchup'"""
-    ).fetchone() == (
-        "empty",
-        "2026-08-04T00:00:00Z",
-        "c" * 64,
-        None,
-    )
-    connection.close()
-
-
-def test_stronger_evidence_relocates_unreviewed_event_without_changing_id(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    inferred = _source_candidate(
-        source=EvidenceSource.OAI,
-        version=1,
-        day=date(2026, 8, 1),
-        source_key="oai:cs:SE:2608.01001:v1",
-    )
-    original = store.apply_event_batch(
-        _metadata(), (_version(),), (inferred,)
-    )[0]
-    store.record_position(
-        date(2026, 8, 1), original.queue_revision, original.event_id, 4
-    )
-    current = _source_candidate(
-        source=EvidenceSource.ATOM,
-        version=1,
-        day=date(2026, 8, 3),
-        source_key="atom:cs.SE:2026-08-03:2608.01001:v1:new",
+    store.record_enrichment_day(
+        EnrichmentDayRecord(
+            category="cs.SE",
+            mailing_date=date(2026, 8, 4),
+            source="catchup",
+            status=EnrichmentStatus.FAILED,
+            fetched_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+            error_code="catchup_layout_changed",
+            error_message="Safe synthetic parser diagnostic.",
+        )
     )
 
-    upgraded = store.apply_event_batch(
-        _metadata(), (_version(),), (current,)
-    )[0]
-
-    assert upgraded.event_id == original.event_id
-    assert upgraded.effective_date == date(2026, 8, 3)
-    assert upgraded.date_basis is DateBasis.FEED_MAILING
-    assert upgraded.confidence is Confidence.CURRENT
-    assert upgraded.queue_revision > original.queue_revision
-    assert len(upgraded.evidence) == 2
-    assert store.review_snapshot(date(2026, 8, 1)).anchor_event_id == original.event_id
-
-
-def test_strength_only_upgrade_never_reopens_reviewed_event(tmp_path: Path) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    inferred = _source_candidate(
-        source=EvidenceSource.OAI,
-        version=1,
-        day=date(2026, 8, 1),
-        source_key="oai:cs:SE:2608.01001:v1",
-    )
-    original = store.apply_event_batch(
-        _metadata(), (_version(),), (inferred,)
-    )[0]
-    store.finish_date(
-        date(2026, 8, 1),
-        through_revision=original.queue_revision,
-        finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
-    )
-    current = _source_candidate(
-        source=EvidenceSource.ATOM,
-        version=1,
-        day=date(2026, 8, 3),
-        source_key="atom:cs.SE:2026-08-03:2608.01001:v1:new",
-    )
-
-    upgraded = store.apply_event_batch(
-        _metadata(), (_version(),), (current,)
-    )[0]
-
-    assert upgraded.event_id == original.event_id
-    assert upgraded.reviewed_at == datetime(2026, 8, 4, tzinfo=timezone.utc)
-    assert upgraded.queue_revision == original.queue_revision
-
-
-@pytest.mark.parametrize("atom_first", [True, False])
-def test_same_day_atom_and_versionless_catchup_merge_order_independently(
-    tmp_path: Path,
-    atom_first: bool,
-) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    atom = _source_candidate(
-        source=EvidenceSource.ATOM,
-        version=1,
-        day=date(2026, 8, 3),
-        source_key="atom:cs.SE:2026-08-03:2608.01001:v1:new",
-    )
-    catchup = _source_candidate(
-        source=EvidenceSource.CATCHUP,
-        version=None,
-        day=date(2026, 8, 3),
-        source_key="catchup:cs.SE:2026-08-03:2608.01001:new",
-    )
-    first, second = (atom, catchup) if atom_first else (catchup, atom)
-
-    initial = store.apply_event_batch(_metadata(), (_version(),), (first,))[0]
-    merged = store.apply_event_batch(_metadata(), (_version(),), (second,))[0]
-
-    assert merged.event_id == initial.event_id
-    assert merged.announced_version == 1
-    assert merged.effective_date == date(2026, 8, 3)
-    assert {item.source for item in merged.evidence} == {
-        EvidenceSource.ATOM,
-        EvidenceSource.CATCHUP,
-    }
-    assert store.events_for_date(date(2026, 8, 3)) == (merged,)
-
-
-def test_relocation_collision_uses_lower_id_and_repoints_every_anchor(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    store = Store(database_path)
-    catchup = _source_candidate(
-        source=EvidenceSource.CATCHUP,
-        version=None,
-        day=date(2026, 8, 3),
-        source_key="catchup:cs.SE:2026-08-03:2608.01001:new",
-    )
-    inferred = _source_candidate(
-        source=EvidenceSource.OAI,
-        version=1,
-        day=date(2026, 8, 1),
-        source_key="oai:cs:SE:2608.01001:v1",
-    )
-    first = store.apply_event_batch(_metadata(), (_version(),), (catchup,))[0]
-    second = store.apply_event_batch(_metadata(), (_version(),), (inferred,))[0]
-    store.record_position(date(2026, 8, 3), second.queue_revision, first.event_id, 1)
-    store.record_position(date(2026, 8, 1), second.queue_revision, second.event_id, 2)
-    store.finish_date(
-        date(2026, 8, 1),
-        through_revision=second.queue_revision,
-        finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
-    )
-    current = _source_candidate(
-        source=EvidenceSource.ATOM,
-        version=1,
-        day=date(2026, 8, 3),
-        source_key="atom:cs.SE:2026-08-03:2608.01001:v1:new",
-    )
-
-    survivor = store.apply_event_batch(
-        _metadata(), (_version(),), (current,)
-    )[0]
-
-    assert survivor.event_id == min(first.event_id, second.event_id)
-    assert survivor.announced_version == 1
-    assert survivor.effective_date == date(2026, 8, 3)
-    assert survivor.reviewed_at is not None
-    assert {item.source for item in survivor.evidence} == {
-        EvidenceSource.ATOM,
-        EvidenceSource.CATCHUP,
-        EvidenceSource.OAI,
-    }
-    assert store.review_snapshot(date(2026, 8, 3)).anchor_event_id == survivor.event_id
-    assert store.review_snapshot(date(2026, 8, 1)).anchor_event_id == survivor.event_id
-    with pytest.raises(KeyError):
-        store.review_event(max(first.event_id, second.event_id))
+    records = store.enrichment_records("cs.SE")
+    assert [(record.mailing_date, record.status) for record in records] == [
+        (date(2026, 8, 3), EnrichmentStatus.EMPTY),
+        (date(2026, 8, 4), EnrichmentStatus.FAILED),
+    ]
+    assert records[0].raw_sha256 == "c" * 64
+    assert records[0].error_code is None
+    assert records[1].raw_sha256 is None
+    assert records[1].error_code == "catchup_layout_changed"

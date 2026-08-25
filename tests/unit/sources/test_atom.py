@@ -7,9 +7,14 @@ from threading import Event
 
 import pytest
 
-from arxiv_digest.models import AnnounceType
+from arxiv_digest.models import AnnounceType, EvidenceSource
 from arxiv_digest.rate_limit import HttpResponse, Interface
-from arxiv_digest.sources.atom import AtomParseError, AtomSource, parse_atom_batch
+from arxiv_digest.sources.atom import (
+    AtomParseError,
+    AtomSource,
+    atom_observations,
+    parse_atom_batch,
+)
 
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "atom"
@@ -53,8 +58,8 @@ def test_parse_atom_batch_normalizes_a_new_announcement() -> None:
         "Journal of Fictional Systems 1 (2026)"
     )
     assert entry.metadata.doi == "10.0000/example.10001"
-    assert entry.version.number == 1
-    assert entry.version.submitted_at == datetime(
+    assert entry.announced_version == 1
+    assert entry.published_at == datetime(
         2026,
         8,
         22,
@@ -62,6 +67,157 @@ def test_parse_atom_batch_normalizes_a_new_announcement() -> None:
         0,
         tzinfo=timezone.utc,
     )
+
+
+def test_atom_batch_normalizes_globally_keyed_hidden_observations() -> None:
+    batch = parse_atom_batch(fixture("current-mixed.xml"), "cs.CL")
+
+    observations = atom_observations(batch)
+
+    first = observations[0]
+    assert first.source_key == "atom:cs.CL:2608.10001:v1"
+    assert first.arxiv_id == "2608.10001"
+    assert first.source is EvidenceSource.ATOM
+    assert first.category == "cs.CL"
+    assert first.announce_type is AnnounceType.NEW
+    assert first.daily_list_date == batch.mailing_date
+    assert first.announced_version == 1
+    assert first.list_position == 0
+    assert first.oai_datestamp is None
+    assert first.response_sha256 == batch.raw_sha256
+    assert first.observed_at == batch.fetched_at
+    assert atom_observations(batch) == observations
+
+
+def test_production_atom_contract_is_normalized() -> None:
+    payload = fixture("current-production.xml")
+
+    batch = parse_atom_batch(payload, "math.AC")
+
+    assert batch.mailing_date == date(2026, 8, 24)
+    assert batch.fetched_at == datetime(
+        2026,
+        8,
+        24,
+        4,
+        32,
+        tzinfo=timezone.utc,
+    )
+    assert len(batch.entries) == 1
+    entry = batch.entries[0]
+    assert entry.metadata.arxiv_id == "2608.18078"
+    assert entry.announced_version == 2
+    assert entry.published_at == datetime(
+        2026,
+        8,
+        24,
+        4,
+        tzinfo=timezone.utc,
+    )
+    assert entry.metadata.title == "Production-Shaped Synthetic Example"
+    assert entry.metadata.authors == ("Ada Fixture", "Ben Example")
+    assert entry.metadata.abstract == (
+        "A synthetic production-shaped abstract."
+    )
+    assert entry.metadata.primary_category == "math.AC"
+    assert entry.metadata.categories == ("math.AC", "math.AT", "math.RT")
+    assert entry.metadata.journal_ref == "Synthetic Journal 1 (2026)"
+    assert entry.metadata.doi == "10.0000/production.fixture"
+    assert entry.announce_type is AnnounceType.NEW
+
+
+def test_dc_creator_keeps_commas_inside_affiliations() -> None:
+    payload = fixture("current-production.xml").replace(
+        b"Ada Fixture, Ben Example",
+        b"Ada Fixture (Fixture Lab, Example University), Ben Example",
+    )
+
+    batch = parse_atom_batch(payload, "math.AC")
+
+    assert batch.entries[0].metadata.authors == (
+        "Ada Fixture (Fixture Lab, Example University)",
+        "Ben Example",
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        (b"arXiv:2608.18078v2", b"arXiv:2608.18079v2"),
+        (b"Announce Type: new", b"Announce Type: cross"),
+    ),
+)
+def test_production_summary_header_must_match_structured_fields(
+    old: bytes,
+    new: bytes,
+) -> None:
+    payload = fixture("current-production.xml").replace(old, new, 1)
+
+    with pytest.raises(AtomParseError, match="summary header"):
+        parse_atom_batch(payload, "math.AC")
+
+
+def test_production_feed_rejects_mixed_published_dates() -> None:
+    payload = fixture("current-production.xml")
+    second = (
+        b"<entry>"
+        b"<id>oai:arXiv.org:2608.18079v1</id>"
+        b"<published>2026-08-25T04:00:00Z</published>"
+        b"<title>Second synthetic entry</title>"
+        b"<summary>arXiv:2608.18079v1 Announce Type: new "
+        b"Abstract: Another synthetic abstract.</summary>"
+        b"<dc:creator xmlns:dc=\"http://purl.org/dc/elements/1.1/\">"
+        b"Cora Fixture</dc:creator>"
+        b"<category term=\"math.AC\" />"
+        b"<arxiv:announce_type "
+        b"xmlns:arxiv=\"http://arxiv.org/schemas/atom\">"
+        b"new</arxiv:announce_type>"
+        b"</entry>"
+    )
+    payload = payload.replace(b"</feed>", second + b"</feed>")
+
+    with pytest.raises(AtomParseError, match="mixed Atom published dates"):
+        parse_atom_batch(payload, "math.AC")
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    (
+        (b"    <dc:creator>Ada Fixture, Ben Example</dc:creator>\n", "authors"),
+        (b"    <category term=\"math.AC\" />\n", "categories"),
+    ),
+)
+def test_production_feed_requires_authors_and_categories(
+    line: bytes,
+    message: str,
+) -> None:
+    payload = fixture("current-production.xml").replace(line, b"", 1)
+    if message == "categories":
+        payload = payload.replace(
+            b"    <category term=\"math.AT\" />\n",
+            b"",
+        ).replace(
+            b"    <category term=\"math.RT\" />\n",
+            b"",
+        )
+
+    with pytest.raises(AtomParseError, match=message):
+        parse_atom_batch(payload, "math.AC")
+
+
+def test_production_feed_rejects_unknown_action() -> None:
+    payload = fixture("current-production.xml").replace(b"new", b"surprise")
+
+    with pytest.raises(AtomParseError, match="unknown announcement type"):
+        parse_atom_batch(payload, "math.AC")
+
+
+def test_production_absonly_action_maps_to_replacement() -> None:
+    payload = fixture("current-production.xml").replace(b"new", b"absonly")
+
+    batch = parse_atom_batch(payload, "math.AC")
+
+    assert batch.entries[0].announce_type is AnnounceType.REPLACE
 
 
 def test_cross_announcement_follows_new_in_source_order() -> None:
@@ -81,13 +237,13 @@ def test_replacement_announcement_is_preserved() -> None:
     assert entry.position == 2
     assert entry.announce_type is AnnounceType.REPLACE
     assert entry.metadata.arxiv_id == "2608.10003"
-    assert entry.version.number == 2
+    assert entry.announced_version == 2
 
 
-def test_later_version_uses_entry_updated_timestamp() -> None:
+def test_legacy_later_version_uses_entry_updated_timestamp() -> None:
     batch = parse_atom_batch(fixture("current-mixed.xml"), "cs.CL")
 
-    assert batch.entries[2].version.submitted_at == datetime(
+    assert batch.entries[2].published_at == datetime(
         2026,
         8,
         22,
@@ -104,7 +260,7 @@ def test_source_provided_replace_cross_is_preserved() -> None:
     assert entry.position == 3
     assert entry.announce_type is AnnounceType.REPLACE_CROSS
     assert entry.metadata.arxiv_id == "2608.10004"
-    assert entry.version.number == 3
+    assert entry.announced_version == 3
 
 
 def test_empty_current_feed_is_a_normal_batch() -> None:
@@ -215,6 +371,9 @@ def test_atom_source_requests_xml_through_shared_client() -> None:
     batch = source.fetch("cs.CL")
 
     assert batch.entries == ()
+    assert batch.fetched_at == datetime(
+        2026, 8, 23, 4, tzinfo=timezone.utc
+    )
     assert client.calls == [
         (
             "https://rss.arxiv.org/atom/cs.CL",
@@ -249,6 +408,21 @@ def test_atom_source_forwards_cooperative_cancellation() -> None:
     assert client.cancelled is cancelled
 
 
+def test_atom_source_rejects_a_redirect_to_a_different_category() -> None:
+    class RedirectingClient:
+        def get(self, url: str, **_options: object) -> HttpResponse:
+            return HttpResponse(
+                status=200,
+                final_url="https://rss.arxiv.org/atom/math.AG",
+                headers={"content-type": "application/atom+xml"},
+                body=fixture("current-production.xml"),
+                observed_at=datetime(2026, 8, 24, 5, tzinfo=timezone.utc),
+            )
+
+    with pytest.raises(AtomParseError, match="requested category"):
+        AtomSource(RedirectingClient()).fetch("math.AC")
+
+
 def test_versioned_legacy_entry_id_is_preserved() -> None:
     payload = fixture("current-mixed.xml").replace(
         b"2608.10001v1",
@@ -259,7 +433,7 @@ def test_versioned_legacy_entry_id_is_preserved() -> None:
     batch = parse_atom_batch(payload, "cs.CL")
 
     assert batch.entries[0].metadata.arxiv_id == "hep-th/9901001"
-    assert batch.entries[0].version.number == 1
+    assert batch.entries[0].announced_version == 1
 
 
 def test_invalid_feed_timestamp_is_rejected_with_typed_error() -> None:

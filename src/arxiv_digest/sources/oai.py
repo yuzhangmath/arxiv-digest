@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -9,14 +10,16 @@ from urllib.parse import urlencode
 from xml.etree.ElementTree import Element, ParseError, fromstring
 
 from arxiv_digest.models import (
+    EvidenceSource,
     OaiArticle,
     OaiTombstone,
     PaperMetadata,
     PaperVersion,
+    SourceObservation,
 )
 from arxiv_digest.rate_limit import ArxivHttpClient, Interface
 
-from .xml import element_text, parse_arxiv_id, parse_utc_datetime
+from .xml import element_text, normalize_space, parse_arxiv_id, parse_utc_datetime
 
 
 class OaiError(Exception):
@@ -77,6 +80,29 @@ class OaiPage:
     raw_sha256: str
 
 
+def oai_observations(page: OaiPage) -> tuple[SourceObservation, ...]:
+    """Normalize version provenance without creating reviewable dates."""
+
+    return tuple(
+        SourceObservation(
+            source_key=f"oai:{record.metadata.arxiv_id}:v{version.number}",
+            arxiv_id=record.metadata.arxiv_id,
+            source=EvidenceSource.OAI,
+            category=None,
+            announce_type=None,
+            daily_list_date=None,
+            announced_version=version.number,
+            list_position=None,
+            oai_datestamp=record.oai_datestamp,
+            response_sha256=page.raw_sha256,
+            observed_at=page.response_date,
+        )
+        for record in page.records
+        if isinstance(record, OaiArticle)
+        for version in record.versions
+    )
+
+
 def _parse_xml(payload: bytes) -> Element:
     try:
         return fromstring(payload)
@@ -133,6 +159,81 @@ def _parse_author(element: Element) -> str:
     return " ".join(part for part in parts if part)
 
 
+_AUTHOR_CONJUNCTION_RE = re.compile(
+    r"(?:\s*,\s*|\s+)(?:and|&)\s+",
+    flags=re.IGNORECASE,
+)
+_AUTHOR_LEADING_CONJUNCTION_RE = re.compile(
+    r"^(?:and|&)\s+",
+    flags=re.IGNORECASE,
+)
+_AUTHOR_SUFFIX_RE = re.compile(
+    r"(?:Jr\.?|Sr\.?|I|II|III|IV|V)",
+    flags=re.IGNORECASE,
+)
+_ET_AL_RE = re.compile(r"et\.?\s+al\.?", flags=re.IGNORECASE)
+
+
+def _raw_author_name_blocks(value: str) -> tuple[str, ...]:
+    """Return non-parenthetical blocks from an arXiv raw author line."""
+
+    # Match the boundary semantics of arXiv's MIT-licensed split_authors().
+    # Pinned upstream revision: 656c8e841a2c610019f19fff8cc8d13d0983e377.
+    blocks: list[str] = []
+    buffer: list[str] = []
+    depth = 0
+    for character in value:
+        if character == "(":
+            if depth == 0:
+                block = normalize_space("".join(buffer))
+                if block:
+                    blocks.append(block)
+                buffer = []
+            depth += 1
+        elif character == ")" and depth:
+            depth -= 1
+            if depth == 0:
+                buffer = []
+        elif depth == 0:
+            buffer.append(character)
+    if depth == 0:
+        block = normalize_space("".join(buffer))
+        if block:
+            blocks.append(block)
+    return tuple(blocks)
+
+
+def _parse_raw_authors(value: str) -> tuple[str, ...]:
+    """Split the legacy arXivRaw author string into display names."""
+
+    authors: list[str] = []
+    for block in _raw_author_name_blocks(value):
+        normalized = _AUTHOR_LEADING_CONJUNCTION_RE.sub("", block)
+        normalized = _AUTHOR_CONJUNCTION_RE.sub(",", normalized)
+        for candidate in re.split(r"[,:]\s*", normalized):
+            name = normalize_space(candidate)
+            if not name or _ET_AL_RE.fullmatch(name):
+                continue
+            name = re.sub(r"(?<!\\)\.(\S)", r". \1", name)
+            if authors and _AUTHOR_SUFFIX_RE.fullmatch(name):
+                authors[-1] = f"{authors[-1]}, {name}"
+            else:
+                authors.append(name)
+    return tuple(authors)
+
+
+def _parse_authors(element: Element | None) -> tuple[str, ...]:
+    if element is None:
+        raise OaiParseError("missing required OAI field: authors")
+    author_elements = element.findall("{*}author")
+    if author_elements:
+        return tuple(_parse_author(author) for author in author_elements)
+    authors = _parse_raw_authors(element_text(element))
+    if not authors:
+        raise OaiParseError("missing required OAI field: authors")
+    return authors
+
+
 def _parse_article(record: Element) -> OaiArticle:
     header = record.find("{*}header")
     raw = record.find("{*}metadata/{*}arXivRaw")
@@ -145,13 +246,7 @@ def _parse_article(record: Element) -> OaiArticle:
     categories = tuple(
         _required_text(raw, "{*}categories", "categories").split()
     )
-    authors_parent = raw.find("{*}authors")
-    author_elements = (
-        () if authors_parent is None else authors_parent.findall("{*}author")
-    )
-    if not author_elements:
-        raise OaiParseError("missing required OAI field: authors")
-    authors = tuple(_parse_author(author) for author in author_elements)
+    authors = _parse_authors(raw.find("{*}authors"))
     metadata = PaperMetadata(
         arxiv_id=base_id,
         title=_required_text(raw, "{*}title", "title"),

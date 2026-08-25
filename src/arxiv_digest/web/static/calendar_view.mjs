@@ -1,5 +1,5 @@
 function readableCount(count) {
-  return `${count} ${count === 1 ? "paper" : "papers"}`;
+  return `${count} ${count === 1 ? "paper announcement" : "paper announcements"}`;
 }
 
 export function renderCalendar(document, container, entries, selectDate) {
@@ -22,7 +22,7 @@ export function renderCalendar(document, container, entries, selectDate) {
     control.setAttribute("type", "button");
     control.setAttribute("role", "listitem");
     control.setAttribute("aria-label", `${date}: ${readableCount(count)}, ${status}`);
-    control.textContent = `${date}\n${count}`;
+    control.textContent = `${date}\n${readableCount(count)}`;
     control.dataset.date = date;
     control.dataset.status = status;
     control.addEventListener("click", () => selectDate?.(date));

@@ -96,7 +96,7 @@ def test_get_returns_normalized_response_and_identifies_the_application() -> Non
         allowed_content_types=("application/xml",),
     )
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=lambda: 0.0,
@@ -123,7 +123,7 @@ def test_get_returns_normalized_response_and_identifies_the_application() -> Non
         response.headers["x-test"] = "changed"
     request = opener.requests[0]
     assert request.get_header("User-agent") == (
-        "arxiv-digest/0.1 (+https://example.invalid/contact)"
+        "arxiv-digest/0.2 (+https://example.invalid/contact)"
     )
     assert request.get_header("Accept") == "application/xml"
 
@@ -131,7 +131,7 @@ def test_get_returns_normalized_response_and_identifies_the_application() -> Non
 def test_current_oai_endpoint_is_allowed() -> None:
     opener = FakeOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         policies={
@@ -172,7 +172,7 @@ def test_transport_open_uses_the_validated_request_timeout() -> None:
 
     opener = TimeoutOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         request_timeout=7.5,
@@ -200,7 +200,7 @@ def test_transport_open_uses_the_validated_request_timeout() -> None:
 def test_request_timeout_must_be_finite_positive_and_bounded(timeout: float) -> None:
     with pytest.raises(ValueError, match="request timeout"):
         ArxivHttpClient(
-            user_agent="arxiv-digest/0.1",
+            user_agent="arxiv-digest/0.2",
             contact_url="https://example.invalid/contact",
             opener=FakeOpener(),
             request_timeout=timeout,
@@ -231,7 +231,7 @@ def test_response_read_stops_at_a_cancellation_boundary() -> None:
             return response
 
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=CancellingOpener(),
         policies={
@@ -283,7 +283,7 @@ def test_http_response_read1_checks_cancellation_between_available_chunks() -> N
             return response
 
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=SlowDripOpener(),
         policies={
@@ -313,7 +313,7 @@ def test_cancellation_before_first_request_never_opens_the_transport() -> None:
     cancellation.set()
     opener = FakeOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         policies={
@@ -369,7 +369,7 @@ def test_requests_are_serialized_across_worker_threads() -> None:
     opener = BlockingOpener()
     policy = RequestPolicy(0, 1, 0, 1_024, ("application/xml",))
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=lambda: 0.0,
@@ -425,7 +425,7 @@ def test_queued_request_observes_cancellation_before_the_gate_opens() -> None:
 
     opener = BlockingOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         policies={
@@ -498,7 +498,7 @@ def test_every_interface_uses_one_shared_request_start_schedule() -> None:
     xml_policy = RequestPolicy(3, 1, 0, 1_024, ("application/xml",))
     catchup_policy = RequestPolicy(15, 1, 0, 1_024, ("text/html",))
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=clock.monotonic,
@@ -557,7 +557,7 @@ def test_larger_retry_after_delta_overrides_the_normal_delay() -> None:
 
     opener = RetryOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=clock.monotonic,
@@ -614,7 +614,7 @@ def test_retry_after_http_date_uses_the_injected_wall_clock() -> None:
 
     opener = RetryOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=clock.monotonic,
@@ -667,7 +667,7 @@ def test_retryable_statuses_use_exponential_backoff(status: int) -> None:
 
     opener = RetryOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=clock.monotonic,
@@ -709,7 +709,7 @@ def test_non_retryable_http_error_fails_immediately() -> None:
 
     opener = FailingOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=clock.monotonic,
@@ -768,7 +768,7 @@ def test_retries_stop_at_the_attempt_and_total_time_limits(
 
     opener = FailingOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=clock.monotonic,
@@ -808,7 +808,7 @@ def test_retries_stop_at_the_attempt_and_total_time_limits(
 def test_disallowed_source_urls_are_rejected_before_opening(url: str) -> None:
     opener = FakeOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=lambda: 0.0,
@@ -856,7 +856,7 @@ def test_external_redirect_target_is_rejected_before_transport_open() -> None:
 
     opener = build_opener(ArxivRedirectHandler(), RedirectingHttpsHandler())
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=lambda: 0.0,
@@ -900,7 +900,7 @@ def test_disallowed_final_url_is_rejected_as_defense_in_depth() -> None:
 
     opener = ExternalFinalOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=lambda: 0.0,
@@ -948,7 +948,7 @@ def test_unexpected_content_type_is_rejected_before_body_read() -> None:
 
     opener = HtmlOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=lambda: 0.0,
@@ -998,7 +998,7 @@ def test_response_larger_than_the_effective_interface_limit_is_rejected() -> Non
 
     opener = LargeOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=lambda: 0.0,
@@ -1043,7 +1043,7 @@ def test_cancellation_before_retry_preserves_the_original_error() -> None:
 
     opener = CancellingOpener()
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=clock.monotonic,
@@ -1101,7 +1101,7 @@ def test_default_opener_installs_the_validating_redirect_handler(
 
     monkeypatch.setattr(rate_limit, "build_opener", fake_build_opener)
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         monotonic=lambda: 0.0,
         wall_clock=lambda: datetime(2026, 8, 22, tzinfo=timezone.utc),

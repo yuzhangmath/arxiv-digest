@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import stat
+from datetime import date
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -18,6 +19,7 @@ from arxiv_digest.folders import (
 from arxiv_digest.profile import (
     PdfDestination,
     Profile,
+    ProfileCategory,
     ProfileRepository,
 )
 
@@ -249,9 +251,11 @@ def test_picker_cancellation_leaves_the_prior_profile_untouched(
         tmp_path / "profile.lock",
     )
     original = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=1,
-        categories=("cs.SE",),
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 8, 1)),
+        ),
         keywords=(),
         phrases=(),
         authors=(),
@@ -437,9 +441,11 @@ def test_macos_open_uses_only_the_active_validated_destination(
     destination = tmp_path / "Active; $(Folder)"
     destination.mkdir()
     profile = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=1,
-        categories=("cs.SE",),
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 8, 1)),
+        ),
         keywords=(),
         phrases=(),
         authors=(),
@@ -484,9 +490,11 @@ def test_linux_open_uses_xdg_open_with_one_path_argument(tmp_path: Path) -> None
     destination = tmp_path / "Active Linux Folder"
     destination.mkdir()
     profile = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=1,
-        categories=("cs.SE",),
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 8, 1)),
+        ),
         keywords=(),
         phrases=(),
         authors=(),
@@ -520,9 +528,11 @@ def test_open_reports_an_unavailable_native_opener_without_running(
     destination = tmp_path / "Active Folder"
     destination.mkdir()
     profile = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=1,
-        categories=("cs.SE",),
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 8, 1)),
+        ),
         keywords=(),
         phrases=(),
         authors=(),
@@ -550,9 +560,11 @@ def test_open_reports_a_redacted_native_opener_failure(tmp_path: Path) -> None:
     destination = tmp_path / "Active Folder"
     destination.mkdir()
     profile = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=1,
-        categories=("cs.SE",),
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 8, 1)),
+        ),
         keywords=(),
         phrases=(),
         authors=(),
@@ -583,9 +595,11 @@ def test_open_refuses_an_active_destination_that_is_not_a_directory(
 ) -> None:
     missing = tmp_path / "Missing Folder"
     profile = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=1,
-        categories=("cs.SE",),
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 8, 1)),
+        ),
         keywords=(),
         phrases=(),
         authors=(),

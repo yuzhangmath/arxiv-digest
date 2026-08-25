@@ -8,7 +8,6 @@ from enum import StrEnum
 from math import ceil, sqrt
 
 from arxiv_digest.models import (
-    Confidence,
     EvidenceSource,
     PaperMetadata,
     ReviewEvent,
@@ -40,19 +39,6 @@ _TIER_ORDER = {
     RankingTier.POSSIBLE: 1,
     RankingTier.OTHER: 2,
 }
-
-_CONFIDENCE_STRENGTH = {
-    Confidence.CURRENT: 3,
-    Confidence.RECOVERED: 2,
-    Confidence.INFERRED: 1,
-}
-
-_SOURCE_STRENGTH = {
-    EvidenceSource.ATOM: 3,
-    EvidenceSource.CATCHUP: 2,
-    EvidenceSource.OAI: 1,
-}
-
 
 @dataclass(frozen=True, slots=True)
 class RankingReason:
@@ -106,29 +92,13 @@ def _best_similarity(
 
 def _mailing_position(event: ReviewEvent) -> int | None:
     positioned = tuple(
-        evidence
-        for evidence in event.evidence
-        if evidence.list_position is not None
+        observation.list_position
+        for observation in event.observations
+        if observation.source is EvidenceSource.CATCHUP
+        and observation.daily_list_date == event.daily_list_date
+        and observation.list_position is not None
     )
-    if not positioned:
-        return None
-    strongest = max(
-        (
-            _CONFIDENCE_STRENGTH[evidence.confidence],
-            _SOURCE_STRENGTH[evidence.source],
-        )
-        for evidence in positioned
-    )
-    return min(
-        evidence.list_position
-        for evidence in positioned
-        if (
-            _CONFIDENCE_STRENGTH[evidence.confidence],
-            _SOURCE_STRENGTH[evidence.source],
-        )
-        == strongest
-        and evidence.list_position is not None
-    )
+    return None if not positioned else min(positioned)
 
 
 def _event_sort_key(event: ReviewEvent) -> tuple[str, bool, int, int]:
@@ -167,7 +137,7 @@ def rank_date(
     paper_values = papers.values() if isinstance(papers, Mapping) else papers
     paper_by_id = {paper.arxiv_id: paper for paper in paper_values}
     selected_categories = {
-        category.casefold(): category for category in profile.categories
+        item.category.casefold(): item for item in profile.category_coverage
     }
     ranked: list[RankedPaper] = []
     for event in events:
@@ -178,9 +148,16 @@ def rank_date(
         matched_categories = tuple(
             sorted(
                 {
-                    selected_categories[category.casefold()]
-                    for category in paper.categories
-                    if category.casefold() in selected_categories
+                    selected_categories[observation.category.casefold()].category
+                    for observation in event.observations
+                    if observation.source is EvidenceSource.CATCHUP
+                    and observation.category is not None
+                    and observation.daily_list_date == event.daily_list_date
+                    and observation.category.casefold() in selected_categories
+                    and event.daily_list_date
+                    >= selected_categories[
+                        observation.category.casefold()
+                    ].coverage_start
                 },
                 key=str.casefold,
             )

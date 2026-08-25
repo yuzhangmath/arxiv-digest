@@ -34,6 +34,8 @@ from arxiv_digest.text import (
 
 _CACHE_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_LATEX_CONTROL_WORD_RE = re.compile(r"\\([A-Za-z]+)")
+_GENERIC_SUGGESTION_KEYWORDS = frozenset({"also", "over", "prove"})
 _STRATA_COUNT = 18
 
 
@@ -1432,7 +1434,9 @@ def suggest_distinctive_terms(
         for seed_id in accepted_seed_ids
         if seed_id in documents_by_id
         for term in extract_ngrams(
-            documents_by_id[seed_id].paper.title,
+            _LATEX_CONTROL_WORD_RE.sub(
+                " ", documents_by_id[seed_id].paper.title
+            ),
             ngram_range=(1, 3),
         )
     }
@@ -1441,16 +1445,47 @@ def suggest_distinctive_terms(
     total_weight: Counter[str] = Counter()
     categories_by_term: dict[str, set[str]] = defaultdict(set)
     for document in corpus.documents:
+        # Remove each TeX command only at its source occurrence. A command such
+        # as ``\mathbb`` must not surface, while a word used elsewhere as prose
+        # remains eligible.
+        suggestion_terms = set(
+            extract_ngrams(
+                _LATEX_CONTROL_WORD_RE.sub(" ", document.paper.title),
+                ngram_range=(1, 3),
+            )
+            + extract_ngrams(
+                _LATEX_CONTROL_WORD_RE.sub(" ", document.paper.abstract),
+                ngram_range=(1, 3),
+            )
+        )
         vector = vectors.get(document.paper.arxiv_id, {})
         for term, weight in vector.items():
+            if term not in suggestion_terms:
+                continue
             document_frequency[term] += 1
             total_weight[term] += weight
             categories_by_term[term].update(document.eligible_categories)
 
     by_kind: dict[str, list[TermSuggestion]] = {"keyword": [], "phrase": []}
     for term in sorted(document_frequency):
-        word_count = len(term.split())
+        tokens = term.split()
+        word_count = len(tokens)
         if not 1 <= word_count <= 3:
+            continue
+        alphabetic_counts = [
+            sum(character.isalpha() for character in token) for token in tokens
+        ]
+        # Reject bare variables/numerals while retaining notation-led topics
+        # such as "k theory", which still contain descriptive language.
+        if word_count == 1 and (
+            alphabetic_counts[0] < 2
+            or tokens[0] in _GENERIC_SUGGESTION_KEYWORDS
+        ):
+            continue
+        if word_count > 1 and (
+            sum(count > 0 for count in alphabetic_counts) < 2
+            or max(alphabetic_counts) < 2
+        ):
             continue
         if term in excluded or term in seed_title_terms:
             continue

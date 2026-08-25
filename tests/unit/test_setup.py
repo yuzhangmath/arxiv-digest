@@ -15,8 +15,13 @@ from arxiv_digest.candidates import (
     CandidateDocument,
     candidate_corpus_hash,
 )
-from arxiv_digest.models import PaperMetadata, PaperVersion
-from arxiv_digest.profile import PdfDestination, ProfileRepository
+from arxiv_digest.models import CategoryConfig, PaperMetadata, PaperVersion
+from arxiv_digest.profile import (
+    PdfDestination,
+    Profile,
+    ProfileCategory,
+    ProfileRepository,
+)
 from arxiv_digest.setup import (
     CREATE_DESKTOP_LAUNCHER_LABEL,
     CategorySelection,
@@ -160,7 +165,7 @@ def test_draft_survives_restart_and_rejects_stale_edits(tmp_path: Path) -> None:
     assert (error.value.expected, error.value.actual) == (0, 1)
 
 
-def test_initial_coverage_honors_oai_boundary_and_warns_after_90_days(
+def test_initial_coverage_rejects_dates_outside_supported_catchup_window(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "state.sqlite3"
@@ -181,21 +186,88 @@ def test_initial_coverage_honors_oai_boundary_and_warns_after_90_days(
     with pytest.raises(SetupStateError) as error:
         service.set_initial_coverage(
             draft.revision,
-            date(2006, 1, 1),
+            date(2026, 5, 24),
             earliest_datestamp=date(2007, 1, 1),
         )
-    assert error.value.code == "coverage_before_earliest"
+    assert error.value.code == "coverage_outside_recovery_window"
     assert service.load_draft() == draft
 
     revised = service.set_initial_coverage(
         draft.revision,
-        date(2026, 5, 1),
+        date(2026, 5, 25),
         earliest_datestamp=date(2007, 1, 1),
     )
     assert revised.current_step is SetupStep.CANDIDATE_CORPUS
-    assert revised.coverage_start == date(2026, 5, 1)
-    assert "inferred metadata/version events" in revised.coverage_warning
-    assert "bulk-update" in revised.coverage_warning
+    assert revised.coverage_start == date(2026, 5, 25)
+    assert revised.coverage_warning is None
+
+
+def test_initial_coverage_rejects_current_eastern_date_until_finalization(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    repository = ProfileRepository(
+        tmp_path / "profile.json", tmp_path / "profile.lock"
+    )
+    observed_at = {
+        "value": datetime(2026, 8, 22, 23, 59, tzinfo=timezone.utc)
+    }
+    service = SetupService(
+        database_path,
+        repository,
+        clock=lambda: observed_at["value"],
+    )
+    draft = service.start()
+    draft = service.select_categories(
+        draft.revision, (CategorySelection("math.AG", "math.AG"),)
+    )
+
+    with pytest.raises(SetupStateError) as error:
+        service.set_initial_coverage(
+            draft.revision,
+            date(2026, 8, 22),
+            earliest_datestamp=date(2007, 1, 1),
+        )
+    assert error.value.code == "coverage_outside_recovery_window"
+
+    observed_at["value"] = datetime(
+        2026, 8, 23, 0, 0, tzinfo=timezone.utc
+    )
+    revised = service.set_initial_coverage(
+        draft.revision,
+        date(2026, 8, 22),
+        earliest_datestamp=date(2007, 1, 1),
+    )
+    assert revised.coverage_start == date(2026, 8, 22)
+
+
+def test_initial_coverage_validation_uses_server_issued_bounds(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    service = SetupService(
+        database_path,
+        ProfileRepository(
+            tmp_path / "profile.json", tmp_path / "profile.lock"
+        ),
+        clock=lambda: datetime(2026, 8, 23, 0, tzinfo=timezone.utc),
+    )
+    draft = service.select_categories(
+        service.start().revision,
+        (CategorySelection("math.AG", "math.AG"),),
+    )
+
+    with pytest.raises(SetupStateError) as error:
+        service.set_initial_coverage(
+            draft.revision,
+            date(2026, 8, 22),
+            earliest_datestamp=date(2007, 1, 1),
+            coverage_bounds=(date(2026, 5, 24), date(2026, 8, 21)),
+        )
+
+    assert error.value.code == "coverage_outside_recovery_window"
 
 
 def _corpus_build(
@@ -348,3 +420,138 @@ def test_explicit_custom_selections_survive_through_review(tmp_path: Path) -> No
     reviewed = service.confirm_review(draft.revision)
     assert reviewed.current_step is SetupStep.DESKTOP_LAUNCHER
     assert reviewed.review_confirmed is True
+
+
+def test_empty_optional_interests_advance_and_publish(tmp_path: Path) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    repository = ProfileRepository(
+        tmp_path / "profile.json", tmp_path / "profile.lock"
+    )
+    service = SetupService(
+        database_path,
+        repository,
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
+    )
+    draft = _draft_through_corpus(service)
+
+    draft = service.select_seed_papers(draft.revision, ())
+    draft = service.select_terms(draft.revision, keywords=(), phrases=())
+    draft = service.select_authors(draft.revision, ())
+    destination = PdfDestination("custom", (tmp_path / "pdfs").resolve())
+    draft = service.set_pdf_destination(
+        draft.revision, destination, tested=True
+    )
+    reviewed = service.confirm_review(draft.revision)
+    profile = service.complete(reviewed.revision, launcher_choice="not_now")
+
+    assert profile.schema_version == 2
+    assert profile.category_coverage == (
+        ProfileCategory("math.AG", date(2026, 8, 1)),
+    )
+    assert profile.seed_papers == ()
+    assert profile.keywords == ()
+    assert profile.phrases == ()
+    assert profile.authors == ()
+    assert repository.load() == profile
+    connection = sqlite3.connect(database_path)
+    try:
+        projection_revision = connection.execute(
+            "SELECT projection_revision FROM state_meta WHERE singleton = 1"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert projection_revision == 1
+
+
+def test_profile_publication_requires_exact_category_coverage_pairs(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    repository = ProfileRepository(
+        tmp_path / "profile.json", tmp_path / "profile.lock"
+    )
+    service = SetupService(
+        database_path,
+        repository,
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
+    )
+    draft = _draft_through_corpus(service)
+    draft = service.select_seed_papers(draft.revision, ())
+    draft = service.select_terms(draft.revision, keywords=(), phrases=())
+    draft = service.select_authors(draft.revision, ())
+    draft = service.set_pdf_destination(
+        draft.revision,
+        PdfDestination("custom", (tmp_path / "pdfs").resolve()),
+        tested=True,
+    )
+    reviewed = service.confirm_review(draft.revision)
+    original = service.complete(reviewed.revision, launcher_choice="not_now")
+    revised = Profile(
+        schema_version=2,
+        revision=2,
+        category_coverage=(
+            ProfileCategory("math.AG", date(2026, 7, 15)),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=original.pdf_destination,
+    )
+
+    with pytest.raises(ValueError, match="category coverage"):
+        service.publish_profile(
+            revised,
+            (CategoryConfig("math.AG", "math.AG", date(2026, 8, 1)),),
+            expected_revision=1,
+        )
+
+    assert repository.load() == original
+
+
+def test_preference_only_profile_publication_preserves_projection_revision(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    repository = ProfileRepository(
+        tmp_path / "profile.json", tmp_path / "profile.lock"
+    )
+    service = SetupService(database_path, repository)
+    config = CategoryConfig("math.AG", "math.AG", date(2026, 8, 1))
+    initial = Profile(
+        schema_version=2,
+        revision=1,
+        category_coverage=(
+            ProfileCategory(config.category, config.coverage_start),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=PdfDestination("custom", (tmp_path / "pdfs").resolve()),
+    )
+    service.publish_profile(initial, (config,), expected_revision=None)
+    revised = Profile(
+        schema_version=2,
+        revision=2,
+        category_coverage=initial.category_coverage,
+        keywords=("derived categories",),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=initial.pdf_destination,
+    )
+
+    service.publish_profile(revised, (config,), expected_revision=1)
+
+    connection = sqlite3.connect(database_path)
+    try:
+        projection_revision = connection.execute(
+            "SELECT projection_revision FROM state_meta WHERE singleton = 1"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert projection_revision == 1

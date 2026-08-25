@@ -6,6 +6,7 @@ PDFs, and portable backups.
 ## Contents
 
 - [What is durable](#what-is-durable)
+- [Review, Calendar, and coverage](#review-calendar-and-coverage)
 - [macOS locations](#macos-locations)
 - [Linux locations](#linux-locations)
 - [Cache safety](#cache-safety)
@@ -16,10 +17,34 @@ PDFs, and portable backups.
 
 ## What is durable
 
-The profile stores categories, keywords, phrases, authors, seed papers, and
-the chosen PDF destination kind. The SQLite database stores article metadata,
-synchronization checkpoints, evidence, review progress, and the saved library.
-These are durable even when the dashboard is offline.
+The profile stores categories, keywords, phrases, authors, seed papers, the
+chosen PDF folder reference, and the daily-list coverage start for each
+category. The SQLite database stores article metadata, source observations,
+daily-list coverage status, canonical announcement events, review progress,
+and the saved Library. These are durable even when the dashboard is offline.
+
+Guided setup groups keywords and phrases under **Terms**, but the durable
+profile keeps them as separate fields. Interests presents both together as
+**Terms** while preserving that classification when the profile is updated.
+
+**Refresh suggestions** resumes or reuses the bounded 90-day paper sample and
+recalculates suggestions from the last updated profile. Persisted interests are
+excluded and each response is deduplicated, but a suggestion that was merely
+shown—or selected only in the unsaved draft—may appear again. Refreshing does
+not change the profile; changes take effect only after **Update interests**.
+
+## Review, Calendar, and coverage
+
+Review and Calendar require recovered daily-list membership. Atom and OAI are
+hidden support for metadata and version resolution; neither source can place a
+paper on a visible date without recovered daily-list membership. Failed,
+pending, or unavailable recovery leaves coverage gaps. Settings preserves and
+reports those gaps instead of filling them with another date source.
+
+The setup candidate corpus does not populate Review, Calendar, or Library, and
+selecting a seed does not save it. Library is independent of category coverage:
+saving a paper does not add a review event, and removing a category does not
+remove its saved papers or separately downloaded PDFs.
 
 ## macOS locations
 
@@ -27,8 +52,9 @@ These are durable even when the dashboard is offline.
 - Regenerable cache: `~/Library/Caches/arxiv-digest`
 - Backups: the `backups` folder inside the durable data directory
 
-The active PDF destination is whichever standard folder or native-picker
-choice you confirmed in setup or Settings.
+The active PDF destination is the folder you confirmed in setup or Settings.
+The native picker is the normal path; app-managed Downloads and Documents
+fallbacks appear only on systems where no native folder picker is available.
 
 ## Linux locations
 
@@ -48,11 +74,15 @@ mean durable history was lost.
 
 ## PDF destinations
 
-The dashboard offers friendly standard destinations before the native folder
-picker. It does not accept a typed path or trust a path sent by a browser
-request. Folder testing and **Open folder** use only the active,
-server-validated destination. Backups do not contain PDF bytes or an absolute
-machine-local destination.
+First-run setup and Settings normally use the native folder picker. If the
+picker is unavailable, the dashboard offers app-managed Downloads and
+Documents fallbacks so setup and restore remain possible. The setup review
+shows the chosen destination as a
+read-only path and shortens the current home directory to `~`; destinations
+outside the home directory remain absolute. The dashboard does not accept a
+typed path or trust a path sent by a browser request. Folder testing and **Open
+folder** use only the active, server-validated destination. Backups do not
+contain PDF bytes or an absolute machine-local destination.
 
 ## Export a backup
 
@@ -64,9 +94,13 @@ and choose a new filename:
 arxiv-digest export arxiv-digest-backup.zip
 ```
 
-Export refuses to overwrite an existing file. A backup contains a manifest,
-portable profile, and durable portable records with checksums. Keep it as
-private as the interests and library it contains.
+Export refuses to overwrite an existing file. Portable backup format 2 records
+application-data generation 2, profile schema 2, and record schema 2 in its
+manifest. It contains exact per-category coverage, portable article metadata
+and version history, source observations, daily-list status, canonical events
+and observation links, review-date state, saved Library papers, and portable
+download-file metadata. Keep it as private as the interests and Library it
+contains.
 
 ## Inspect and import
 
@@ -79,9 +113,19 @@ select **Quit** in the dashboard, open a terminal, and run:
 arxiv-digest import arxiv-digest-backup.zip
 ```
 
-The command inspects the backup, asks you to choose the restored PDF
-destination, and then revalidates the archive immediately before restore. It
-keeps the current state if inspection or restore validation fails.
+The command validates the backup format and generation before changing local
+state, asks you to choose the restored PDF destination, and then revalidates
+the archive immediately before restore. Format-1 or generation-1 backups are
+reported as unsupported and are not imported. A valid restore builds a fresh
+schema-version-4, generation-2 database. Before replacing nonempty
+generation-2 state, the app creates and verifies a private pre-restore recovery
+archive; failed inspection or validation leaves the current state unchanged.
+
+Download-file records never carry PDF bytes. Restore registers only the exact
+named file when it already exists in the newly selected destination and its PDF
+signature, size, and checksum all match the record. Missing or nonmatching
+files are skipped; restore does not scan unrelated files or invent downloaded
+state.
 
 ## What a portable backup excludes
 

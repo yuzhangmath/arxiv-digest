@@ -4,26 +4,31 @@ import hashlib
 import json
 import re
 import sqlite3
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import ContextManager
 
 from arxiv_digest.models import (
     AnnounceType,
-    Confidence,
-    DateBasis,
+    AtomBatch,
+    CatchupDay,
+    CatchupDayStatus,
+    CategoryConfig,
     EnrichmentStatus,
-    EventCandidate,
-    EventEvidence,
     EvidenceSource,
     OaiArticle,
     OaiTombstone,
     PaperMetadata,
     PaperVersion,
     ReviewEvent,
+    ReconciliationResult,
+    SourceObservation,
+    VersionResolution,
 )
 from arxiv_digest.maintenance import MaintenanceBarrier
+from arxiv_digest.reconciliation import reconcile_paper
 
 
 class _LeasedConnection(sqlite3.Connection):
@@ -102,6 +107,12 @@ class FinishResult:
     through_revision: int
 
 
+class ReviewSnapshotConflict(RuntimeError):
+    """A Review mutation was created under a stale active projection."""
+
+    code = "review_snapshot_stale"
+
+
 @dataclass(frozen=True, slots=True)
 class StoredArticleSnapshot:
     category: str
@@ -129,6 +140,7 @@ class StoreReviewSnapshot:
     events: tuple[ReviewEvent, ...]
     anchor_event_id: int | None
     profile_revision: int
+    projection_revision: int
     last_finished_revision: int | None
     papers: tuple[PaperMetadata, ...]
     seed_papers: tuple[PaperMetadata, ...]
@@ -147,6 +159,7 @@ class ReviewPosition:
     snapshot_revision: int
     anchor_event_id: int
     profile_revision: int
+    projection_revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +185,16 @@ class EnrichmentDayRecord:
                 raise ValueError("failed enrichment requires safe error fields")
         elif self.error_code is not None or self.error_message is not None:
             raise ValueError("successful enrichment cannot carry an error")
+
+
+@dataclass(frozen=True, slots=True)
+class CatchupDayRecord:
+    category: str
+    daily_list_date: date
+    status: CatchupDayStatus
+    attempted_at: datetime | None
+    response_sha256: str | None
+    error_code: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,23 +410,88 @@ class Store:
     def enrichment_records(
         self, category: str
     ) -> tuple[EnrichmentDayRecord, ...]:
+        return tuple(
+            EnrichmentDayRecord(
+                category=row.category,
+                mailing_date=row.daily_list_date,
+                source="catchup",
+                status=EnrichmentStatus(row.status.value),
+                fetched_at=row.attempted_at,
+                raw_sha256=row.response_sha256,
+                error_code=row.error_code,
+                error_message=(
+                    "The historical daily list could not be recovered."
+                    if row.status is CatchupDayStatus.FAILED
+                    else None
+                ),
+            )
+            for row in self.catchup_day_records(category)
+            if row.status is not CatchupDayStatus.PENDING
+            and row.attempted_at is not None
+        )
+
+    def ensure_catchup_targets(
+        self,
+        category: str,
+        dates: tuple[date, ...],
+    ) -> None:
+        if not isinstance(dates, tuple) or any(
+            not isinstance(value, date) or isinstance(value, datetime)
+            for value in dates
+        ):
+            raise TypeError("catch-up targets must be a tuple of dates")
+        if not category.strip():
+            raise ValueError("catch-up category must not be blank")
+        normalized = tuple(sorted(set(dates)))
         connection = self._connect()
         try:
-            rows = connection.execute(
-                """SELECT * FROM enrichment_days WHERE category = ?
-                   ORDER BY mailing_date, source""",
-                (category,),
-            ).fetchall()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.executemany(
+                """INSERT INTO catchup_days(
+                       category, daily_list_date, status
+                   ) VALUES (?, ?, 'pending')
+                   ON CONFLICT(category, daily_list_date) DO NOTHING""",
+                (
+                    (category, _date_text(daily_list_date))
+                    for daily_list_date in normalized
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def catchup_day_records(
+        self,
+        category: str | None = None,
+    ) -> tuple[CatchupDayRecord, ...]:
+        connection = self._connect()
+        try:
+            if category is None:
+                rows = connection.execute(
+                    """SELECT * FROM catchup_days
+                       ORDER BY daily_list_date, category"""
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT * FROM catchup_days WHERE category = ?
+                       ORDER BY daily_list_date""",
+                    (category,),
+                ).fetchall()
             return tuple(
-                EnrichmentDayRecord(
+                CatchupDayRecord(
                     category=row["category"],
-                    mailing_date=_parse_date(row["mailing_date"]),
-                    source=row["source"],
-                    status=EnrichmentStatus(row["status"]),
-                    fetched_at=_parse_utc(row["fetched_at"]),
-                    raw_sha256=row["raw_sha256"],
+                    daily_list_date=_parse_date(row["daily_list_date"]),
+                    status=CatchupDayStatus(row["status"]),
+                    attempted_at=(
+                        None
+                        if row["attempted_at"] is None
+                        else _parse_utc(row["attempted_at"])
+                    ),
+                    response_sha256=row["response_sha256"],
                     error_code=row["error_code"],
-                    error_message=row["error_message"],
                 )
                 for row in rows
             )
@@ -416,7 +504,7 @@ class Store:
         window_start: date,
         window_end: date,
     ) -> tuple[tuple[str, date], ...]:
-        """Return corroborating Atom/catch-up mailing dates for candidates."""
+        """Return Atom feed or catch-up dates that support candidates."""
 
         if not isinstance(category, str) or not category.strip():
             raise ValueError("category must not be blank")
@@ -427,17 +515,16 @@ class Store:
         connection = self._connect()
         try:
             rows = connection.execute(
-                """SELECT DISTINCT r.arxiv_id, e.mailing_date
-                   FROM review_events AS r
-                   JOIN event_evidence AS e ON e.event_id = r.event_id
-                   WHERE e.category = ?
-                     AND e.source IN ('atom', 'catchup')
-                     AND e.mailing_date BETWEEN ? AND ?
-                   ORDER BY r.arxiv_id, e.mailing_date""",
+                """SELECT DISTINCT arxiv_id, daily_list_date
+                   FROM source_observations
+                   WHERE category = ?
+                     AND source IN ('atom', 'catchup')
+                     AND daily_list_date BETWEEN ? AND ?
+                   ORDER BY arxiv_id, daily_list_date""",
                 (category, start_text, end_text),
             ).fetchall()
             return tuple(
-                (row["arxiv_id"], _parse_date(row["mailing_date"]))
+                (row["arxiv_id"], _parse_date(row["daily_list_date"]))
                 for row in rows
             )
         finally:
@@ -663,11 +750,17 @@ class Store:
         run_id: int,
         category: str,
         records: tuple[OaiArticle | OaiTombstone, ...],
-        candidates: tuple[EventCandidate, ...],
+        observations: tuple[SourceObservation, ...],
         raw_sha256: str,
         observed_at: datetime,
     ) -> tuple[ReviewEvent, ...]:
         _require_sha256(raw_sha256)
+        if any(
+            observation.source is not EvidenceSource.OAI
+            or observation.category is not None
+            for observation in observations
+        ):
+            raise ValueError("OAI pages require global OAI observations")
         observed_text = _utc_text(observed_at)
         connection = self._connect()
         try:
@@ -772,8 +865,15 @@ class Store:
                         observed_text,
                     ),
                 )
-            event_ids = self._apply_candidates(
-                connection, metadata_by_id, candidates
+            if any(
+                observation.arxiv_id not in metadata_by_id
+                for observation in observations
+            ):
+                raise ValueError("OAI observation does not belong to the page")
+            self._upsert_observations(connection, observations)
+            event_ids = self._reconcile_affected_papers(
+                connection,
+                set(metadata_by_id),
             )
             connection.execute(
                 """UPDATE sync_runs
@@ -795,29 +895,30 @@ class Store:
             connection.close()
 
     def record_enrichment_day(self, result: EnrichmentDayRecord) -> None:
+        if result.source == "atom":
+            # Atom observations are durable provenance; an Atom day is not a
+            # daily-list coverage outcome in the confirmed model.
+            return
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                """INSERT INTO enrichment_days(
-                       category, mailing_date, source, status, fetched_at,
-                       raw_sha256, error_code, error_message
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(category, mailing_date, source) DO UPDATE SET
+                """INSERT INTO catchup_days(
+                       category, daily_list_date, status, attempted_at,
+                       response_sha256, error_code
+                   ) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(category, daily_list_date) DO UPDATE SET
                        status = excluded.status,
-                       fetched_at = excluded.fetched_at,
-                       raw_sha256 = excluded.raw_sha256,
-                       error_code = excluded.error_code,
-                       error_message = excluded.error_message""",
+                       attempted_at = excluded.attempted_at,
+                       response_sha256 = excluded.response_sha256,
+                       error_code = excluded.error_code""",
                 (
                     result.category,
                     _date_text(result.mailing_date),
-                    result.source,
                     result.status.value,
                     _utc_text(result.fetched_at),
                     result.raw_sha256,
                     result.error_code,
-                    result.error_message,
                 ),
             )
             connection.commit()
@@ -911,19 +1012,621 @@ class Store:
         )
 
     @staticmethod
-    def _validate_candidate(
-        metadata: PaperMetadata, candidate: EventCandidate
+    def _upsert_observations(
+        connection: sqlite3.Connection,
+        observations: tuple[SourceObservation, ...],
     ) -> None:
-        evidence = candidate.evidence
-        if candidate.arxiv_id != metadata.arxiv_id:
-            raise ValueError("event candidate belongs to a different article")
-        if (
-            evidence.announced_version is not None
-            and evidence.announced_version != candidate.announced_version
+        for observation in observations:
+            existing = connection.execute(
+                """SELECT arxiv_id, source FROM source_observations
+                   WHERE source_key = ?""",
+                (observation.source_key,),
+            ).fetchone()
+            identity = (observation.arxiv_id, observation.source.value)
+            if existing is not None and tuple(existing) != identity:
+                raise ValueError("source observation key changed identity")
+            connection.execute(
+                """INSERT INTO source_observations(
+                       source_key, arxiv_id, source, category, announce_type,
+                       daily_list_date, announced_version, list_position,
+                       oai_datestamp, response_sha256, observed_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source_key) DO UPDATE SET
+                       category = excluded.category,
+                       announce_type = excluded.announce_type,
+                       daily_list_date = excluded.daily_list_date,
+                       announced_version = excluded.announced_version,
+                       list_position = excluded.list_position,
+                       oai_datestamp = excluded.oai_datestamp,
+                       response_sha256 = excluded.response_sha256,
+                       observed_at = excluded.observed_at""",
+                (
+                    observation.source_key,
+                    observation.arxiv_id,
+                    observation.source.value,
+                    observation.category,
+                    (
+                        None
+                        if observation.announce_type is None
+                        else observation.announce_type.value
+                    ),
+                    (
+                        None
+                        if observation.daily_list_date is None
+                        else _date_text(observation.daily_list_date)
+                    ),
+                    observation.announced_version,
+                    observation.list_position,
+                    (
+                        None
+                        if observation.oai_datestamp is None
+                        else _date_text(observation.oai_datestamp)
+                    ),
+                    observation.response_sha256,
+                    _utc_text(observation.observed_at),
+                ),
+            )
+
+    @staticmethod
+    def _observation_from_row(row: sqlite3.Row) -> SourceObservation:
+        return SourceObservation(
+            source_key=row["source_key"],
+            arxiv_id=row["arxiv_id"],
+            source=EvidenceSource(row["source"]),
+            category=row["category"],
+            announce_type=(
+                None
+                if row["announce_type"] is None
+                else AnnounceType(row["announce_type"])
+            ),
+            daily_list_date=(
+                None
+                if row["daily_list_date"] is None
+                else _parse_date(row["daily_list_date"])
+            ),
+            announced_version=row["announced_version"],
+            list_position=row["list_position"],
+            oai_datestamp=(
+                None
+                if row["oai_datestamp"] is None
+                else _parse_date(row["oai_datestamp"])
+            ),
+            response_sha256=row["response_sha256"],
+            observed_at=_parse_utc(row["observed_at"]),
+        )
+
+    @staticmethod
+    def _versions_from_connection(
+        connection: sqlite3.Connection, arxiv_id: str
+    ) -> tuple[PaperVersion, ...]:
+        return tuple(
+            PaperVersion(
+                number=int(row["version"]),
+                submitted_at=_parse_utc(row["submitted_at"]),
+                size=row["size"],
+                source_type=row["source_type"],
+            )
+            for row in connection.execute(
+                """SELECT version, submitted_at, size, source_type
+                   FROM article_versions WHERE arxiv_id = ?
+                   ORDER BY version""",
+                (arxiv_id,),
+            )
+        )
+
+    @classmethod
+    def _observations_from_connection(
+        cls, connection: sqlite3.Connection, arxiv_id: str
+    ) -> tuple[SourceObservation, ...]:
+        return tuple(
+            cls._observation_from_row(row)
+            for row in connection.execute(
+                """SELECT * FROM source_observations
+                   WHERE arxiv_id = ? ORDER BY source_key""",
+                (arxiv_id,),
+            )
+        )
+
+    @staticmethod
+    def _recompute_reconciliation_diagnostics(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute("DELETE FROM reconciliation_diagnostics")
+        connection.execute(
+            """INSERT INTO reconciliation_diagnostics(
+                   diagnostic_code, occurrence_count, last_observed_at
+               )
+               SELECT c.conflict_code, COUNT(*), MAX(o.observed_at)
+               FROM canonical_events AS c
+               JOIN canonical_event_observations AS link
+                 ON link.event_id = c.event_id
+               JOIN source_observations AS o
+                 ON o.observation_id = link.observation_id
+               WHERE c.conflict_code = 'version_evidence_conflict'
+               GROUP BY c.conflict_code"""
+        )
+
+    @classmethod
+    def _assert_canonical_catchup_support(
+        cls, connection: sqlite3.Connection
+    ) -> None:
+        missing = connection.execute(
+            """SELECT c.event_id
+               FROM canonical_events AS c
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM canonical_event_observations AS link
+                   JOIN source_observations AS o
+                     ON o.observation_id = link.observation_id
+                   WHERE link.event_id = c.event_id
+                     AND o.source = 'catchup'
+                     AND o.daily_list_date = c.daily_list_date
+               )
+               LIMIT 1"""
+        ).fetchone()
+        if missing is not None:
+            raise RuntimeError(
+                "canonical event is missing exact-date catch-up support"
+            )
+
+    @classmethod
+    def _apply_reconciliation_result(
+        cls,
+        connection: sqlite3.Connection,
+        result: ReconciliationResult,
+    ) -> tuple[int, ...]:
+        existing = {
+            _parse_date(row["daily_list_date"]): row
+            for row in connection.execute(
+                """SELECT * FROM canonical_events
+                   WHERE arxiv_id = ? ORDER BY daily_list_date""",
+                (result.arxiv_id,),
+            )
+        }
+        desired_by_date = {
+            event.daily_list_date: event for event in result.events
+        }
+
+        # A source correction can move a uniquely identified concrete
+        # announcement. Preserve its event identity and reviewed state.
+        stale_concrete: dict[int, list[sqlite3.Row]] = {}
+        for old_date, row in existing.items():
+            version = row["announced_version"]
+            if old_date not in desired_by_date and version is not None:
+                stale_concrete.setdefault(int(version), []).append(row)
+        for daily_list_date, desired in desired_by_date.items():
+            if daily_list_date in existing or desired.announced_version is None:
+                continue
+            candidates = stale_concrete.get(desired.announced_version, [])
+            if len(candidates) != 1:
+                continue
+            row = candidates[0]
+            old_date = _parse_date(row["daily_list_date"])
+            connection.execute(
+                """UPDATE canonical_events SET daily_list_date = ?
+                   WHERE event_id = ?""",
+                (_date_text(daily_list_date), row["event_id"]),
+            )
+            old_state = connection.execute(
+                """SELECT * FROM review_date_state
+                   WHERE daily_list_date = ?""",
+                (_date_text(old_date),),
+            ).fetchone()
+            new_state = connection.execute(
+                """SELECT * FROM review_date_state
+                   WHERE daily_list_date = ?""",
+                (_date_text(daily_list_date),),
+            ).fetchone()
+            if old_state is not None and new_state is None:
+                connection.execute(
+                    """UPDATE review_date_state SET daily_list_date = ?
+                       WHERE daily_list_date = ?""",
+                    (_date_text(daily_list_date), _date_text(old_date)),
+                )
+            elif old_state is not None and new_state is not None:
+                anchor_event_id = (
+                    new_state["anchor_event_id"]
+                    if new_state["anchor_event_id"] is not None
+                    else old_state["anchor_event_id"]
+                )
+                finished_values = tuple(
+                    value
+                    for value in (
+                        old_state["last_finished_at"],
+                        new_state["last_finished_at"],
+                    )
+                    if value is not None
+                )
+                revision_values = tuple(
+                    int(value)
+                    for value in (
+                        old_state["last_finished_revision"],
+                        new_state["last_finished_revision"],
+                    )
+                    if value is not None
+                )
+                connection.execute(
+                    "DELETE FROM review_date_state WHERE daily_list_date = ?",
+                    (_date_text(old_date),),
+                )
+                connection.execute(
+                    """UPDATE review_date_state
+                       SET anchor_event_id = ?, profile_revision = ?,
+                           last_finished_at = ?, last_finished_revision = ?
+                       WHERE daily_list_date = ?""",
+                    (
+                        anchor_event_id,
+                        max(
+                            int(old_state["profile_revision"]),
+                            int(new_state["profile_revision"]),
+                        ),
+                        max(finished_values) if finished_values else None,
+                        max(revision_values) if revision_values else None,
+                        _date_text(daily_list_date),
+                    ),
+                )
+            existing[daily_list_date] = connection.execute(
+                "SELECT * FROM canonical_events WHERE event_id = ?",
+                (row["event_id"],),
+            ).fetchone()
+            del existing[old_date]
+            stale_concrete[desired.announced_version] = []
+
+        event_ids: list[int] = []
+        for daily_list_date in sorted(desired_by_date):
+            desired = desired_by_date[daily_list_date]
+            row = existing.get(daily_list_date)
+            if row is None:
+                queue_revision = cls._next_queue_revision(connection)
+                finished = connection.execute(
+                    """SELECT 1 FROM review_date_state
+                       WHERE daily_list_date = ? AND last_finished_at IS NOT NULL""",
+                    (_date_text(daily_list_date),),
+                ).fetchone()
+                cursor = connection.execute(
+                    """INSERT INTO canonical_events(
+                           arxiv_id, daily_list_date, announced_version,
+                           version_resolution, queue_revision,
+                           recovered_after_finish, conflict_code
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        desired.arxiv_id,
+                        _date_text(daily_list_date),
+                        desired.announced_version,
+                        desired.version_resolution.value,
+                        queue_revision,
+                        int(finished is not None),
+                        desired.conflict_code,
+                    ),
+                )
+                event_id = int(cursor.lastrowid)
+            else:
+                event_id = int(row["event_id"])
+                old_version = row["announced_version"]
+                concrete_replacement = (
+                    old_version is not None
+                    and desired.announced_version is not None
+                    and int(old_version) != desired.announced_version
+                )
+                if concrete_replacement:
+                    queue_revision = cls._next_queue_revision(connection)
+                    reviewed_at = None
+                else:
+                    queue_revision = int(row["queue_revision"])
+                    reviewed_at = row["reviewed_at"]
+                connection.execute(
+                    """UPDATE canonical_events
+                       SET announced_version = ?, version_resolution = ?,
+                           queue_revision = ?, reviewed_at = ?, conflict_code = ?
+                       WHERE event_id = ?""",
+                    (
+                        desired.announced_version,
+                        desired.version_resolution.value,
+                        queue_revision,
+                        reviewed_at,
+                        desired.conflict_code,
+                        event_id,
+                    ),
+                )
+
+            connection.execute(
+                "DELETE FROM canonical_event_observations WHERE event_id = ?",
+                (event_id,),
+            )
+            observation_rows = connection.execute(
+                """SELECT observation_id, source, daily_list_date
+                   FROM source_observations
+                   WHERE source_key IN ({})""".format(
+                    ",".join("?" for _ in desired.observation_keys)
+                ),
+                desired.observation_keys,
+            ).fetchall()
+            if len(observation_rows) != len(desired.observation_keys):
+                raise RuntimeError("reconciler returned an unknown observation")
+            if not any(
+                value["source"] == EvidenceSource.CATCHUP.value
+                and value["daily_list_date"] == _date_text(daily_list_date)
+                for value in observation_rows
+            ):
+                raise RuntimeError(
+                    "reconciler returned an event without exact catch-up support"
+                )
+            connection.executemany(
+                """INSERT INTO canonical_event_observations(
+                       event_id, observation_id
+                   ) VALUES (?, ?)""",
+                (
+                    (event_id, int(value["observation_id"]))
+                    for value in observation_rows
+                ),
+            )
+            event_ids.append(event_id)
+
+        desired_dates = set(desired_by_date)
+        for daily_list_date, row in existing.items():
+            if daily_list_date in desired_dates:
+                continue
+            cls._next_queue_revision(connection)
+            connection.execute(
+                "DELETE FROM canonical_events WHERE event_id = ?",
+                (row["event_id"],),
+            )
+        return tuple(event_ids)
+
+    @classmethod
+    def _reconcile_affected_papers(
+        cls,
+        connection: sqlite3.Connection,
+        arxiv_ids: set[str],
+    ) -> tuple[int, ...]:
+        event_ids: list[int] = []
+        for arxiv_id in sorted(arxiv_ids):
+            result = reconcile_paper(
+                arxiv_id,
+                cls._observations_from_connection(connection, arxiv_id),
+                cls._versions_from_connection(connection, arxiv_id),
+            )
+            event_ids.extend(
+                cls._apply_reconciliation_result(connection, result)
+            )
+        cls._recompute_reconciliation_diagnostics(connection)
+        cls._assert_canonical_catchup_support(connection)
+        return tuple(event_ids)
+
+    def apply_atom_batch(
+        self,
+        batch: AtomBatch,
+        observations: tuple[SourceObservation, ...],
+    ) -> tuple[ReviewEvent, ...]:
+        if any(
+            observation.source is not EvidenceSource.ATOM
+            for observation in observations
         ):
-            raise ValueError("event evidence version does not match candidate")
-        if not evidence.source_key.strip():
-            raise ValueError("event source key must not be blank")
+            raise ValueError("Atom batches require Atom observations")
+        metadata_by_id = {
+            entry.metadata.arxiv_id: entry.metadata for entry in batch.entries
+        }
+        if any(
+            observation.arxiv_id not in metadata_by_id
+            or observation.category != batch.category
+            for observation in observations
+        ):
+            raise ValueError("Atom observation does not belong to the batch")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for arxiv_id in sorted(metadata_by_id):
+                self._upsert_article(connection, metadata_by_id[arxiv_id])
+            # Atom's published timestamp is a feed timestamp, not an arXiv
+            # submission timestamp. OAI remains authoritative for versions.
+            self._upsert_observations(connection, observations)
+            event_ids = self._reconcile_affected_papers(
+                connection, set(metadata_by_id)
+            )
+            events = tuple(
+                self._event_from_connection(connection, event_id)
+                for event_id in event_ids
+            )
+            connection.commit()
+            return events
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def apply_catchup_day(
+        self,
+        result: CatchupDay,
+        observations: tuple[SourceObservation, ...],
+        attempted_at: datetime,
+    ) -> tuple[ReviewEvent, ...]:
+        attempted_text = _utc_text(attempted_at)
+        day_text = _date_text(result.mailing_date)
+        if any(
+            page.category != result.category
+            or page.mailing_date != result.mailing_date
+            for page in result.pages
+        ):
+            raise ValueError("catch-up page does not belong to its day")
+        if result.status is EnrichmentStatus.FAILED:
+            if observations:
+                raise ValueError("failed catch-up day cannot contain observations")
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """INSERT INTO catchup_days(
+                           category, daily_list_date, status, attempted_at,
+                           response_sha256, error_code
+                       ) VALUES (?, ?, 'failed', ?, NULL, ?)
+                       ON CONFLICT(category, daily_list_date) DO UPDATE SET
+                           status = excluded.status,
+                           attempted_at = excluded.attempted_at,
+                           response_sha256 = NULL,
+                           error_code = excluded.error_code""",
+                    (
+                        result.category,
+                        day_text,
+                        attempted_text,
+                        result.error_code or "catchup_failed",
+                    ),
+                )
+                connection.commit()
+                return ()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        entries = tuple(
+            entry for page in result.pages for entry in page.entries
+        )
+        expected = Counter(
+            (
+                entry.metadata.arxiv_id,
+                entry.section,
+                entry.mailing_date,
+                entry.position,
+            )
+            for entry in entries
+        )
+        actual = Counter(
+            (
+                observation.arxiv_id,
+                observation.announce_type,
+                observation.daily_list_date,
+                observation.list_position,
+            )
+            for observation in observations
+        )
+        if expected != actual or any(
+            observation.source is not EvidenceSource.CATCHUP
+            or observation.category != result.category
+            for observation in observations
+        ):
+            raise ValueError(
+                "catch-up observations do not match the complete parsed day"
+            )
+        metadata_by_id: dict[str, PaperMetadata] = {}
+        for entry in entries:
+            existing = metadata_by_id.get(entry.metadata.arxiv_id)
+            if existing is not None and existing != entry.metadata:
+                raise ValueError("catch-up day contains conflicting metadata")
+            metadata_by_id[entry.metadata.arxiv_id] = entry.metadata
+        response_sha256: str | None
+        page_hashes = tuple(page.raw_sha256 for page in result.pages)
+        if len(page_hashes) == 1:
+            response_sha256 = page_hashes[0]
+        elif page_hashes:
+            response_sha256 = hashlib.sha256(
+                "\n".join(page_hashes).encode("ascii")
+            ).hexdigest()
+        else:
+            response_sha256 = None
+        stored_status = (
+            "empty"
+            if result.status is EnrichmentStatus.EMPTY or not observations
+            else "complete"
+        )
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            prior_rows = connection.execute(
+                """SELECT observation_id, source_key, arxiv_id
+                   FROM source_observations
+                   WHERE source = 'catchup' AND category = ?
+                     AND daily_list_date = ?""",
+                (result.category, day_text),
+            ).fetchall()
+            incoming_keys = {item.source_key for item in observations}
+            stale_rows = [
+                row for row in prior_rows if row["source_key"] not in incoming_keys
+            ]
+            affected_ids = {
+                row["arxiv_id"] for row in prior_rows
+            } | {item.arxiv_id for item in observations}
+            if stale_rows:
+                stale_ids = tuple(int(row["observation_id"]) for row in stale_rows)
+                placeholders = ",".join("?" for _ in stale_ids)
+                connection.execute(
+                    "DELETE FROM canonical_event_observations "
+                    f"WHERE observation_id IN ({placeholders})",
+                    stale_ids,
+                )
+                connection.execute(
+                    "DELETE FROM source_observations "
+                    f"WHERE observation_id IN ({placeholders})",
+                    stale_ids,
+                )
+            for arxiv_id in sorted(metadata_by_id):
+                self._upsert_article(connection, metadata_by_id[arxiv_id])
+            self._upsert_observations(connection, observations)
+            connection.execute(
+                """INSERT INTO catchup_days(
+                       category, daily_list_date, status, attempted_at,
+                       response_sha256, error_code
+                   ) VALUES (?, ?, ?, ?, ?, NULL)
+                   ON CONFLICT(category, daily_list_date) DO UPDATE SET
+                       status = excluded.status,
+                       attempted_at = excluded.attempted_at,
+                       response_sha256 = excluded.response_sha256,
+                       error_code = NULL""",
+                (
+                    result.category,
+                    day_text,
+                    stored_status,
+                    attempted_text,
+                    response_sha256,
+                ),
+            )
+            event_ids = self._reconcile_affected_papers(
+                connection, affected_ids
+            )
+            events = tuple(
+                self._event_from_connection(connection, event_id)
+                for event_id in event_ids
+            )
+            connection.commit()
+            return events
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def canonical_event_count(self) -> int:
+        connection = self._connect()
+        try:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM canonical_events"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+
+    def source_observations(
+        self, arxiv_id: str | None = None
+    ) -> tuple[SourceObservation, ...]:
+        connection = self._connect()
+        try:
+            if arxiv_id is None:
+                rows = connection.execute(
+                    """SELECT * FROM source_observations
+                       ORDER BY source_key"""
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT * FROM source_observations
+                       WHERE arxiv_id = ? ORDER BY source_key""",
+                    (arxiv_id,),
+                ).fetchall()
+            return tuple(self._observation_from_row(row) for row in rows)
+        finally:
+            connection.close()
 
     @staticmethod
     def _next_queue_revision(connection: sqlite3.Connection) -> int:
@@ -936,351 +1639,69 @@ class Store:
         return int(row[0])
 
     @staticmethod
-    def _associated_event_ids(
-        connection: sqlite3.Connection, candidate: EventCandidate
-    ) -> set[int]:
-        """Return only event identities supported by the explicit join rules."""
-
-        matched = {
-            int(row[0])
-            for row in connection.execute(
-                """SELECT event_id FROM review_events
-                   WHERE arxiv_id = ?
-                     AND COALESCE(announced_version, 0) = COALESCE(?, 0)
-                     AND effective_date = ?""",
-                (
-                    candidate.arxiv_id,
-                    candidate.announced_version,
-                    _date_text(candidate.effective_date),
-                ),
-            )
-        }
-        source = candidate.evidence.source
-        version = candidate.announced_version
-
-        if version is not None and source in {
-            EvidenceSource.ATOM,
-            EvidenceSource.CATCHUP,
-        }:
-            provisional = {
-                int(row[0])
-                for row in connection.execute(
-                    """SELECT DISTINCT r.event_id
-                       FROM review_events AS r
-                       JOIN event_evidence AS e ON e.event_id = r.event_id
-                       WHERE r.arxiv_id = ? AND r.announced_version = ?
-                         AND e.source = 'oai'""",
-                    (candidate.arxiv_id, version),
-                )
-            }
-            if len(provisional) == 1:
-                matched.update(provisional)
-
-        if version is not None and source is EvidenceSource.OAI:
-            corroborated = {
-                int(row[0])
-                for row in connection.execute(
-                    """SELECT DISTINCT r.event_id
-                       FROM review_events AS r
-                       JOIN event_evidence AS e ON e.event_id = r.event_id
-                       WHERE r.arxiv_id = ? AND r.announced_version = ?
-                         AND e.source IN ('atom', 'catchup')""",
-                    (candidate.arxiv_id, version),
-                )
-            }
-            if len(corroborated) == 1:
-                matched.update(corroborated)
-
-        if source is EvidenceSource.ATOM:
-            matched.update(
-                int(row[0])
-                for row in connection.execute(
-                    """SELECT DISTINCT r.event_id
-                       FROM review_events AS r
-                       JOIN event_evidence AS e ON e.event_id = r.event_id
-                       WHERE r.arxiv_id = ? AND r.announced_version IS NULL
-                         AND r.effective_date = ? AND e.source = 'catchup'
-                         AND e.category = ?""",
-                    (
-                        candidate.arxiv_id,
-                        _date_text(candidate.effective_date),
-                        candidate.evidence.category,
-                    ),
-                )
-            )
-
-        if source is EvidenceSource.CATCHUP and version is None:
-            compatible = {
-                int(row[0])
-                for row in connection.execute(
-                    """SELECT DISTINCT r.event_id
-                       FROM review_events AS r
-                       JOIN event_evidence AS e ON e.event_id = r.event_id
-                       WHERE r.arxiv_id = ? AND r.announced_version IS NOT NULL
-                         AND r.effective_date = ?
-                         AND e.source IN ('atom', 'oai')
-                         AND e.category = ?""",
-                    (
-                        candidate.arxiv_id,
-                        _date_text(candidate.effective_date),
-                        candidate.evidence.category,
-                    ),
-                )
-            }
-            if len(compatible) == 1:
-                matched.update(compatible)
-
-        return matched
-
-    @classmethod
-    def _merge_associated_events(
-        cls,
-        connection: sqlite3.Connection,
-        event_ids: set[int],
-        candidate: EventCandidate,
-    ) -> int:
-        placeholders = ",".join("?" for _ in event_ids)
-        rows = connection.execute(
-            f"""SELECT event_id, announced_version, effective_date,
-                       date_basis, confidence, queue_revision, reviewed_at
-                FROM review_events WHERE event_id IN ({placeholders})""",
-            tuple(sorted(event_ids)),
-        ).fetchall()
-        if len(rows) != len(event_ids):
-            raise ValueError("associated review event disappeared")
-
-        rank = {
-            Confidence.CURRENT.value: 0,
-            Confidence.RECOVERED.value: 1,
-            Confidence.INFERRED.value: 2,
-        }
-        strongest_existing = min(
-            rows, key=lambda row: (rank[row["confidence"]], row["event_id"])
-        )
-        incoming_rank = rank[candidate.evidence.confidence.value]
-        if incoming_rank < rank[strongest_existing["confidence"]]:
-            canonical_version = candidate.announced_version
-            if (
-                canonical_version is None
-                and candidate.evidence.source is EvidenceSource.CATCHUP
-            ):
-                supported_versions = {
-                    int(row["announced_version"])
-                    for row in rows
-                    if row["announced_version"] is not None
-                }
-                if len(supported_versions) == 1:
-                    canonical_version = supported_versions.pop()
-            canonical_date = _date_text(candidate.effective_date)
-            canonical_basis = candidate.date_basis.value
-            canonical_confidence = candidate.evidence.confidence.value
-        else:
-            canonical_version = strongest_existing["announced_version"]
-            canonical_date = strongest_existing["effective_date"]
-            canonical_basis = strongest_existing["date_basis"]
-            canonical_confidence = strongest_existing["confidence"]
-
-        survivor = min(event_ids)
-        survivor_row = next(row for row in rows if row["event_id"] == survivor)
-        losers = sorted(event_ids - {survivor})
-        reviewed_values = sorted(
-            row["reviewed_at"] for row in rows if row["reviewed_at"] is not None
-        )
-        reviewed_at = reviewed_values[0] if reviewed_values else None
-        relocating = any(
-            row["announced_version"] != canonical_version
-            or row["effective_date"] != canonical_date
-            for row in rows
-        )
-        queue_revision = int(survivor_row["queue_revision"])
-        if relocating and reviewed_at is None:
-            queue_revision = cls._next_queue_revision(connection)
-
-        for loser in losers:
-            connection.execute(
-                """UPDATE review_date_state SET anchor_event_id = ?
-                   WHERE anchor_event_id = ?""",
-                (survivor, loser),
-            )
-            connection.execute(
-                "UPDATE event_evidence SET event_id = ? WHERE event_id = ?",
-                (survivor, loser),
-            )
-            connection.execute(
-                "DELETE FROM review_events WHERE event_id = ?", (loser,)
-            )
-
-        connection.execute(
-            """UPDATE review_events
-               SET announced_version = ?, effective_date = ?, date_basis = ?,
-                   confidence = ?, queue_revision = ?, reviewed_at = ?
-               WHERE event_id = ?""",
-            (
-                canonical_version,
-                canonical_date,
-                canonical_basis,
-                canonical_confidence,
-                queue_revision,
-                reviewed_at,
-                survivor,
-            ),
-        )
-        return survivor
-
-    @classmethod
-    def _apply_candidates(
-        cls,
-        connection: sqlite3.Connection,
-        metadata_by_id: dict[str, PaperMetadata],
-        candidates: tuple[EventCandidate, ...],
-    ) -> list[int]:
-        event_ids: list[int] = []
-        for candidate in candidates:
-            try:
-                metadata = metadata_by_id[candidate.arxiv_id]
-            except KeyError as error:
-                raise ValueError(
-                    "event candidate has no metadata in the batch"
-                ) from error
-            cls._validate_candidate(metadata, candidate)
-            article_state = connection.execute(
-                "SELECT is_deleted FROM articles WHERE arxiv_id = ?",
-                (candidate.arxiv_id,),
-            ).fetchone()
-            if article_state is not None and bool(article_state[0]):
-                continue
-            existing_evidence = connection.execute(
-                "SELECT event_id FROM event_evidence WHERE source_key = ?",
-                (candidate.evidence.source_key,),
-            ).fetchone()
-            if existing_evidence is not None:
-                event_id = int(existing_evidence[0])
-            else:
-                matched_ids = cls._associated_event_ids(connection, candidate)
-                if not matched_ids:
-                    revision = cls._next_queue_revision(connection)
-                    cursor = connection.execute(
-                        """INSERT INTO review_events(
-                               arxiv_id, announced_version, effective_date,
-                               date_basis, confidence, queue_revision
-                           ) VALUES (?, ?, ?, ?, ?, ?)""",
-                        (
-                            candidate.arxiv_id,
-                            candidate.announced_version,
-                            candidate.effective_date.isoformat(),
-                            candidate.date_basis.value,
-                            candidate.evidence.confidence.value,
-                            revision,
-                        ),
-                    )
-                    event_id = int(cursor.lastrowid)
-                else:
-                    event_id = cls._merge_associated_events(
-                        connection, matched_ids, candidate
-                    )
-                evidence = candidate.evidence
-                connection.execute(
-                    """INSERT INTO event_evidence(
-                           event_id, source_key, source, confidence, category,
-                           announce_type, mailing_date, announced_version,
-                           list_position, oai_datestamp, raw_sha256, observed_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        event_id,
-                        evidence.source_key,
-                        evidence.source.value,
-                        evidence.confidence.value,
-                        evidence.category,
-                        (
-                            None
-                            if evidence.announce_type is None
-                            else evidence.announce_type.value
-                        ),
-                        (
-                            None
-                            if evidence.mailing_date is None
-                            else evidence.mailing_date.isoformat()
-                        ),
-                        evidence.announced_version,
-                        evidence.list_position,
-                        (
-                            None
-                            if evidence.oai_datestamp is None
-                            else evidence.oai_datestamp.isoformat()
-                        ),
-                        evidence.raw_sha256,
-                        _utc_text(evidence.observed_at),
-                    ),
-                )
-            event_ids = [
-                value
-                for value in event_ids
-                if connection.execute(
-                    "SELECT 1 FROM review_events WHERE event_id = ?", (value,)
-                ).fetchone()
-                is not None
-            ]
-            if event_id not in event_ids:
-                event_ids.append(event_id)
-        return event_ids
-
-    @staticmethod
     def _event_from_connection(
         connection: sqlite3.Connection, event_id: int
     ) -> ReviewEvent:
         row = connection.execute(
-            "SELECT * FROM review_events WHERE event_id = ?", (event_id,)
+            "SELECT * FROM canonical_events WHERE event_id = ?", (event_id,)
         ).fetchone()
         if row is None:
             raise KeyError(event_id)
-        evidence_rows = connection.execute(
-            """SELECT * FROM event_evidence
-               WHERE event_id = ? ORDER BY evidence_id""",
+        observation_rows = connection.execute(
+            """SELECT o.*
+               FROM source_observations AS o
+               JOIN canonical_event_observations AS link
+                 ON link.observation_id = o.observation_id
+               WHERE link.event_id = ?
+               ORDER BY o.source_key""",
             (event_id,),
         ).fetchall()
-        evidence = tuple(
-            EventEvidence(
-                source_key=value["source_key"],
-                source=EvidenceSource(value["source"]),
-                confidence=Confidence(value["confidence"]),
-                category=value["category"],
-                announce_type=(
-                    None
-                    if value["announce_type"] is None
-                    else AnnounceType(value["announce_type"])
-                ),
-                mailing_date=(
-                    None
-                    if value["mailing_date"] is None
-                    else _parse_date(value["mailing_date"])
-                ),
-                announced_version=value["announced_version"],
-                list_position=value["list_position"],
-                oai_datestamp=(
-                    None
-                    if value["oai_datestamp"] is None
-                    else _parse_date(value["oai_datestamp"])
-                ),
-                raw_sha256=value["raw_sha256"],
-                observed_at=_parse_utc(value["observed_at"]),
-            )
-            for value in evidence_rows
-        )
         return ReviewEvent(
-            event_id=row["event_id"],
+            event_id=int(row["event_id"]),
             arxiv_id=row["arxiv_id"],
+            daily_list_date=_parse_date(row["daily_list_date"]),
             announced_version=row["announced_version"],
-            effective_date=_parse_date(row["effective_date"]),
-            date_basis=DateBasis(row["date_basis"]),
-            confidence=Confidence(row["confidence"]),
-            evidence=evidence,
-            queue_revision=row["queue_revision"],
+            version_resolution=VersionResolution(row["version_resolution"]),
+            observations=tuple(
+                Store._observation_from_row(value)
+                for value in observation_rows
+            ),
+            queue_revision=int(row["queue_revision"]),
             reviewed_at=(
                 None
                 if row["reviewed_at"] is None
                 else _parse_utc(row["reviewed_at"])
             ),
+            recovered_after_finish=bool(row["recovered_after_finish"]),
+            conflict_code=row["conflict_code"],
         )
+
+    @staticmethod
+    def _project_event(
+        event: ReviewEvent,
+        active_configs: tuple[CategoryConfig, ...] | None,
+    ) -> ReviewEvent | None:
+        if active_configs is None:
+            return event
+        if any(
+            not isinstance(config, CategoryConfig)
+            for config in active_configs
+        ):
+            raise TypeError("active configs must be CategoryConfig values")
+        coverage = {config.category: config.coverage_start for config in active_configs}
+        if len(coverage) != len(active_configs):
+            raise ValueError("active category configurations must be unique")
+        active_observations = tuple(
+            observation
+            for observation in event.observations
+            if observation.source is EvidenceSource.CATCHUP
+            and observation.category in coverage
+            and observation.daily_list_date == event.daily_list_date
+            and event.daily_list_date >= coverage[observation.category]
+        )
+        if not active_observations:
+            return None
+        return replace(event, observations=active_observations)
 
     @staticmethod
     def _metadata_from_connection(
@@ -1319,19 +1740,20 @@ class Store:
             doi=row["doi"],
         )
 
-    def apply_event_batch(
+    def apply_article_snapshot(
         self,
         metadata: PaperMetadata,
         versions: tuple[PaperVersion, ...],
-        candidates: tuple[EventCandidate, ...],
     ) -> tuple[ReviewEvent, ...]:
+        """Store current article data and reconcile existing observations."""
+
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             self._upsert_article(connection, metadata)
             self._upsert_versions(connection, metadata.arxiv_id, versions)
-            event_ids = self._apply_candidates(
-                connection, {metadata.arxiv_id: metadata}, candidates
+            event_ids = self._reconcile_affected_papers(
+                connection, {metadata.arxiv_id}
             )
             result = tuple(
                 self._event_from_connection(connection, event_id)
@@ -1610,11 +2032,59 @@ class Store:
         finally:
             connection.close()
 
+    def review_queue_revision(self) -> int:
+        connection = self._connect()
+        try:
+            return int(
+                connection.execute(
+                    "SELECT queue_revision FROM state_meta WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+
+    def review_revisions(self) -> tuple[int, int]:
+        """Return the queue and active-projection revisions together."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT queue_revision, projection_revision
+                   FROM state_meta WHERE singleton = 1"""
+            ).fetchone()
+            return int(row["queue_revision"]), int(row["projection_revision"])
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _current_profile_projection_revisions(
+        connection: sqlite3.Connection,
+    ) -> tuple[int, int]:
+        profile_row = connection.execute(
+            """SELECT pending_revision FROM profile_publication
+               WHERE singleton = 1 AND status = 'published'"""
+        ).fetchone()
+        profile_revision = (
+            0
+            if profile_row is None or profile_row[0] is None
+            else int(profile_row[0])
+        )
+        projection_revision = int(
+            connection.execute(
+                """SELECT projection_revision FROM state_meta
+                   WHERE singleton = 1"""
+            ).fetchone()[0]
+        )
+        return profile_revision, projection_revision
+
     def review_snapshot(
         self,
         day: date,
         *,
         seed_ids: tuple[str, ...] = (),
+        through_revision: int | None = None,
+        active_configs: tuple[CategoryConfig, ...] | None = None,
+        profile_revision: int | None = None,
     ) -> StoreReviewSnapshot:
         day_text = _date_text(day)
         if not isinstance(seed_ids, tuple) or any(
@@ -1624,20 +2094,35 @@ class Store:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            snapshot_revision = int(
+            current_revision = int(
                 connection.execute(
                     "SELECT queue_revision FROM state_meta WHERE singleton = 1"
                 ).fetchone()[0]
             )
+            if through_revision is None:
+                snapshot_revision = current_revision
+            elif type(through_revision) is not int or through_revision < 0:
+                raise ValueError("snapshot revision must be nonnegative")
+            elif through_revision > current_revision:
+                raise ValueError("snapshot revision is from the future")
+            else:
+                snapshot_revision = through_revision
             event_rows = connection.execute(
-                """SELECT event_id FROM review_events
-                   WHERE effective_date = ? AND queue_revision <= ?
+                """SELECT event_id FROM canonical_events
+                   WHERE daily_list_date = ? AND queue_revision <= ?
                    ORDER BY queue_revision, event_id""",
                 (day_text, snapshot_revision),
             ).fetchall()
             events = tuple(
-                self._event_from_connection(connection, int(row[0]))
+                projected
                 for row in event_rows
+                if (
+                    projected := self._project_event(
+                        self._event_from_connection(connection, int(row[0])),
+                        active_configs,
+                    )
+                )
+                is not None
             )
             papers = tuple(
                 self._metadata_from_connection(connection, arxiv_id)
@@ -1658,16 +2143,40 @@ class Store:
             state = connection.execute(
                 """SELECT anchor_event_id, profile_revision,
                           last_finished_revision
-                   FROM review_date_state WHERE effective_date = ?""",
+                   FROM review_date_state WHERE daily_list_date = ?""",
                 (day_text,),
             ).fetchone()
+            stored_profile_revision, projection_revision = (
+                self._current_profile_projection_revisions(connection)
+            )
+            if (
+                profile_revision is not None
+                and stored_profile_revision not in {0, profile_revision}
+            ):
+                raise ReviewSnapshotConflict(
+                    "active profile changed; reopen this Review date"
+                )
+            effective_profile_revision = (
+                stored_profile_revision
+                if profile_revision is None
+                else profile_revision
+            )
+            active_event_ids = {event.event_id for event in events}
+            anchor_event_id = None
+            if (
+                state is not None
+                and state[0] in active_event_ids
+                and int(state[1]) == effective_profile_revision
+            ):
+                anchor_event_id = int(state[0])
             connection.commit()
             return StoreReviewSnapshot(
                 day=day,
                 snapshot_revision=snapshot_revision,
                 events=events,
-                anchor_event_id=None if state is None else state[0],
-                profile_revision=0 if state is None else state[1],
+                anchor_event_id=anchor_event_id,
+                profile_revision=effective_profile_revision,
+                projection_revision=projection_revision,
                 last_finished_revision=None if state is None else state[2],
                 papers=papers,
                 seed_papers=seed_papers,
@@ -1679,37 +2188,56 @@ class Store:
         finally:
             connection.close()
 
-    def list_review_dates(self) -> tuple[date, ...]:
+    def list_review_dates(
+        self,
+        *,
+        through_revision: int | None = None,
+        active_configs: tuple[CategoryConfig, ...] | None = None,
+    ) -> tuple[date, ...]:
+        if through_revision is not None and (
+            type(through_revision) is not int or through_revision < 0
+        ):
+            raise ValueError("snapshot revision must be nonnegative")
         connection = self._connect()
         try:
-            return tuple(
-                _parse_date(row[0])
-                for row in connection.execute(
-                    """SELECT DISTINCT effective_date FROM review_events
-                       ORDER BY effective_date"""
+            if through_revision is None:
+                rows = connection.execute(
+                    """SELECT event_id, daily_list_date
+                       FROM canonical_events
+                       ORDER BY daily_list_date, queue_revision, event_id"""
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT event_id, daily_list_date
+                       FROM canonical_events
+                       WHERE queue_revision <= ?
+                       ORDER BY daily_list_date, queue_revision, event_id""",
+                    (through_revision,),
+                ).fetchall()
+            dates: dict[date, None] = {}
+            for row in rows:
+                event = self._event_from_connection(
+                    connection, int(row["event_id"])
                 )
-            )
+                if self._project_event(event, active_configs) is not None:
+                    dates.setdefault(_parse_date(row["daily_list_date"]), None)
+            return tuple(dates)
         finally:
             connection.close()
 
-    def review_date_links(self, day: date) -> ReviewDateLinks:
-        day_text = _date_text(day)
-        connection = self._connect()
-        try:
-            row = connection.execute(
-                """SELECT
-                       (SELECT MAX(effective_date) FROM review_events
-                        WHERE effective_date < ?),
-                       (SELECT MIN(effective_date) FROM review_events
-                        WHERE effective_date > ?)""",
-                (day_text, day_text),
-            ).fetchone()
-            return ReviewDateLinks(
-                previous_date=None if row[0] is None else _parse_date(row[0]),
-                next_date=None if row[1] is None else _parse_date(row[1]),
-            )
-        finally:
-            connection.close()
+    def review_date_links(
+        self,
+        day: date,
+        *,
+        active_configs: tuple[CategoryConfig, ...] | None = None,
+    ) -> ReviewDateLinks:
+        dates = self.list_review_dates(active_configs=active_configs)
+        previous = tuple(value for value in dates if value < day)
+        following = tuple(value for value in dates if value > day)
+        return ReviewDateLinks(
+            previous_date=previous[-1] if previous else None,
+            next_date=following[0] if following else None,
+        )
 
     def record_position(
         self,
@@ -1717,8 +2245,15 @@ class Store:
         snapshot_revision: int,
         anchor_event_id: int,
         profile_revision: int,
+        projection_revision: int | None = None,
+        *,
+        active_configs: tuple[CategoryConfig, ...] | None = None,
     ) -> ReviewPosition:
-        if snapshot_revision < 0 or profile_revision < 0:
+        if (
+            snapshot_revision < 0
+            or profile_revision < 0
+            or (projection_revision is not None and projection_revision < 0)
+        ):
             raise ValueError("revisions must be nonnegative")
         day_text = _date_text(day)
         connection = self._connect()
@@ -1731,26 +2266,54 @@ class Store:
             )
             if snapshot_revision > current_revision:
                 raise ValueError("snapshot revision is from the future")
-            anchor = connection.execute(
-                """SELECT 1 FROM review_events
-                   WHERE event_id = ? AND effective_date = ?
+            current_profile, current_projection = (
+                self._current_profile_projection_revisions(connection)
+            )
+            if (
+                projection_revision is not None
+                and (
+                    (
+                        current_profile != 0
+                        and profile_revision != current_profile
+                    )
+                    or projection_revision != current_projection
+                )
+            ):
+                raise ReviewSnapshotConflict(
+                    "active profile changed; reopen this Review date"
+                )
+            anchor_row = connection.execute(
+                """SELECT event_id FROM canonical_events
+                   WHERE event_id = ? AND daily_list_date = ?
                      AND queue_revision <= ?""",
                 (anchor_event_id, day_text, snapshot_revision),
             ).fetchone()
+            anchor = (
+                None
+                if anchor_row is None
+                else self._project_event(
+                    self._event_from_connection(connection, anchor_event_id),
+                    active_configs,
+                )
+            )
             if anchor is None:
                 raise ValueError("anchor event is not in the review snapshot")
             connection.execute(
                 """INSERT INTO review_date_state(
-                       effective_date, anchor_event_id, profile_revision
+                       daily_list_date, anchor_event_id, profile_revision
                    ) VALUES (?, ?, ?)
-                   ON CONFLICT(effective_date) DO UPDATE SET
+                   ON CONFLICT(daily_list_date) DO UPDATE SET
                        anchor_event_id = excluded.anchor_event_id,
                        profile_revision = excluded.profile_revision""",
                 (day_text, anchor_event_id, profile_revision),
             )
             connection.commit()
             return ReviewPosition(
-                day, snapshot_revision, anchor_event_id, profile_revision
+                day,
+                snapshot_revision,
+                anchor_event_id,
+                profile_revision,
+                current_projection,
             )
         except Exception:
             connection.rollback()
@@ -1758,18 +2321,30 @@ class Store:
         finally:
             connection.close()
 
-    def events_for_date(self, day: date) -> tuple[ReviewEvent, ...]:
+    def events_for_date(
+        self,
+        day: date,
+        *,
+        active_configs: tuple[CategoryConfig, ...] | None = None,
+    ) -> tuple[ReviewEvent, ...]:
         connection = self._connect()
         try:
             rows = connection.execute(
-                """SELECT event_id FROM review_events
-                   WHERE effective_date = ?
+                """SELECT event_id FROM canonical_events
+                   WHERE daily_list_date = ?
                    ORDER BY queue_revision, event_id""",
                 (day.isoformat(),),
             ).fetchall()
             return tuple(
-                self._event_from_connection(connection, int(row[0]))
+                projected
                 for row in rows
+                if (
+                    projected := self._project_event(
+                        self._event_from_connection(connection, int(row[0])),
+                        active_configs,
+                    )
+                )
+                is not None
             )
         finally:
             connection.close()
@@ -1894,6 +2469,9 @@ class Store:
         *,
         through_revision: int,
         finished_at: datetime,
+        profile_revision: int | None = None,
+        projection_revision: int | None = None,
+        active_configs: tuple[CategoryConfig, ...] | None = None,
     ) -> FinishResult:
         if through_revision < 0:
             raise ValueError("through_revision must be nonnegative")
@@ -1901,30 +2479,189 @@ class Store:
             raise ValueError("finished_at must be aware UTC")
         if finished_at.utcoffset().total_seconds() != 0:
             raise ValueError("finished_at must be aware UTC")
+        if (profile_revision is None) != (projection_revision is None):
+            raise ValueError(
+                "profile and projection revisions must be supplied together"
+            )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                """UPDATE review_events
-                   SET reviewed_at = ?
-                   WHERE effective_date = ?
-                     AND queue_revision <= ?
-                     AND reviewed_at IS NULL""",
-                (_utc_text(finished_at), day.isoformat(), through_revision),
+            current_revision = int(
+                connection.execute(
+                    """SELECT queue_revision FROM state_meta
+                       WHERE singleton = 1"""
+                ).fetchone()[0]
             )
-            reviewed_count = cursor.rowcount
+            if through_revision > current_revision:
+                raise ValueError("snapshot revision is from the future")
+            current_profile, current_projection = (
+                self._current_profile_projection_revisions(connection)
+            )
+            if profile_revision is not None and (
+                (
+                    current_profile != 0
+                    and profile_revision != current_profile
+                )
+                or projection_revision != current_projection
+            ):
+                raise ReviewSnapshotConflict(
+                    "active profile changed; reopen this Review date"
+                )
+            rows = connection.execute(
+                """SELECT event_id FROM canonical_events
+                   WHERE daily_list_date = ? AND queue_revision <= ?
+                   ORDER BY event_id""",
+                (_date_text(day), through_revision),
+            ).fetchall()
+            event_ids = tuple(
+                int(row["event_id"])
+                for row in rows
+                if self._project_event(
+                    self._event_from_connection(
+                        connection, int(row["event_id"])
+                    ),
+                    active_configs,
+                )
+                is not None
+            )
+            reviewed_count = 0
+            if event_ids:
+                placeholders = ",".join("?" for _ in event_ids)
+                cursor = connection.execute(
+                    "UPDATE canonical_events SET reviewed_at = ? "
+                    f"WHERE event_id IN ({placeholders}) "
+                    "AND reviewed_at IS NULL",
+                    (_utc_text(finished_at), *event_ids),
+                )
+                reviewed_count = cursor.rowcount
             connection.execute(
                 """INSERT INTO review_date_state(
-                       effective_date, last_finished_at, last_finished_revision
-                   ) VALUES (?, ?, ?)
-                   ON CONFLICT(effective_date) DO UPDATE SET
+                       daily_list_date, profile_revision, last_finished_at,
+                       last_finished_revision
+                   ) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(daily_list_date) DO UPDATE SET
+                       profile_revision = excluded.profile_revision,
                        last_finished_at = excluded.last_finished_at,
                        last_finished_revision = MAX(
                            COALESCE(review_date_state.last_finished_revision, 0),
                            excluded.last_finished_revision
                        )""",
-                (day.isoformat(), _utc_text(finished_at), through_revision),
+                (
+                    day.isoformat(),
+                    current_profile if profile_revision is None else profile_revision,
+                    _utc_text(finished_at),
+                    through_revision,
+                ),
             )
+            connection.commit()
+            return FinishResult(reviewed_count, through_revision)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finish_all(
+        self,
+        *,
+        through_revision: int,
+        finished_at: datetime,
+        profile_revision: int | None = None,
+        projection_revision: int | None = None,
+        active_configs: tuple[CategoryConfig, ...] | None = None,
+    ) -> FinishResult:
+        if type(through_revision) is not int or through_revision < 0:
+            raise ValueError("through_revision must be nonnegative")
+        if finished_at.tzinfo is None or finished_at.utcoffset() is None:
+            raise ValueError("finished_at must be aware UTC")
+        if finished_at.utcoffset().total_seconds() != 0:
+            raise ValueError("finished_at must be aware UTC")
+        if (profile_revision is None) != (projection_revision is None):
+            raise ValueError(
+                "profile and projection revisions must be supplied together"
+            )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current_revision = int(
+                connection.execute(
+                    "SELECT queue_revision FROM state_meta WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            if through_revision > current_revision:
+                raise ValueError("snapshot revision is from the future")
+            current_profile, current_projection = (
+                self._current_profile_projection_revisions(connection)
+            )
+            if profile_revision is not None and (
+                (
+                    current_profile != 0
+                    and profile_revision != current_profile
+                )
+                or projection_revision != current_projection
+            ):
+                raise ReviewSnapshotConflict(
+                    "active profile changed; reopen Review"
+                )
+            rows = connection.execute(
+                """SELECT event_id, daily_list_date FROM canonical_events
+                   WHERE queue_revision <= ?
+                   ORDER BY daily_list_date, event_id""",
+                (through_revision,),
+            ).fetchall()
+            selected = tuple(
+                (int(row["event_id"]), row["daily_list_date"])
+                for row in rows
+                if self._project_event(
+                    self._event_from_connection(
+                        connection, int(row["event_id"])
+                    ),
+                    active_configs,
+                )
+                is not None
+            )
+            reviewed_count = 0
+            if selected:
+                event_ids = tuple(event_id for event_id, _day in selected)
+                placeholders = ",".join("?" for _ in event_ids)
+                cursor = connection.execute(
+                    "UPDATE canonical_events SET reviewed_at = ? "
+                    f"WHERE event_id IN ({placeholders}) "
+                    "AND reviewed_at IS NULL",
+                    (_utc_text(finished_at), *event_ids),
+                )
+                reviewed_count = cursor.rowcount
+                finished_profile = (
+                    current_profile
+                    if profile_revision is None
+                    else profile_revision
+                )
+                connection.executemany(
+                    """INSERT INTO review_date_state(
+                           daily_list_date, profile_revision,
+                           last_finished_at, last_finished_revision
+                       ) VALUES (?, ?, ?, ?)
+                       ON CONFLICT(daily_list_date) DO UPDATE SET
+                           profile_revision = excluded.profile_revision,
+                           last_finished_at = excluded.last_finished_at,
+                           last_finished_revision = MAX(
+                               COALESCE(
+                                   review_date_state.last_finished_revision, 0
+                               ),
+                               excluded.last_finished_revision
+                           )""",
+                    (
+                        (
+                            daily_list_date,
+                            finished_profile,
+                            _utc_text(finished_at),
+                            through_revision,
+                        )
+                        for daily_list_date in dict.fromkeys(
+                            day for _event_id, day in selected
+                        )
+                    ),
+                )
             connection.commit()
             return FinishResult(reviewed_count, through_revision)
         except Exception:

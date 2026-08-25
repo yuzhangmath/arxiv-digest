@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -13,19 +14,31 @@ import {
 } from "./dom_test_helper.mjs";
 
 const hostile = '<img src=x onerror="steal()"><script>bad()</script>';
+const stylesheet = readFileSync(
+  new URL("../../src/arxiv_digest/web/static/styles.css", import.meta.url),
+  "utf8",
+);
+const paperViewSource = readFileSync(
+  new URL("../../src/arxiv_digest/web/static/paper_view.mjs", import.meta.url),
+  "utf8",
+);
 
 function paper() {
   return {
     arxiv_id: "2608.01234",
-    version: "v2",
+    resolved_announcement_version: 2,
+    latest_known_version: 2,
+    version_resolution: "atom_confirmed",
+    version_label: "Announced v2 — Atom-confirmed",
+    daily_list_date: "2026-08-21",
+    event_label: "New submission",
+    support_categories: ["math.AG", "math.CO"],
     title: `A safe title ${hostile}`,
     authors: [`Ada ${hostile}`, "Grace Hopper"],
     abstract: `Abstract ${hostile}`,
     comments: `Comments ${hostile}`,
     ranking_text: `Why: ${hostile}`,
     tier: "top",
-    observations: ["math.AG", "math.CO"],
-    date_label: "Recovered",
   };
 }
 
@@ -36,8 +49,27 @@ test("paper metadata and ranking prose are inserted only as literal text", () =>
   assert.match(root.textContent, /<script>bad\(\)<\/script>/);
   assert.equal(descendants(root, "img").length, 0);
   assert.equal(descendants(root, "script").length, 0);
-  assert.equal(descendants(root, "details").length, 1);
-  assert.match(descendants(root, "summary")[0].textContent, /abstract/i);
+  assert.ok(
+    descendants(root, "summary").some((summary) => /abstract/i.test(summary.textContent)),
+  );
+});
+
+test("paper ranking rationale is initially hidden in a disclosure", () => {
+  const root = new FakeNode("div");
+  renderPaperCard(new FakeDocument(), root, paper(), {});
+
+  const explanation = descendants(root, "details").find((node) =>
+    node.className === "ranking-explanation"
+  );
+  assert.ok(explanation, "ranking disclosure was not rendered");
+  assert.equal(explanation.getAttribute("open"), null);
+  assert.equal(descendants(explanation, "summary")[0].textContent, "Why this ranking");
+  assert.match(explanation.textContent, /Why: <img src=x/);
+});
+
+test("review paper titles do not impose a fixed reading-width cap", () => {
+  const titleRule = stylesheet.match(/\.paper-card h3\s*\{([^}]*)\}/)?.[1] ?? "";
+  assert.doesNotMatch(titleRule, /max-width\s*:/);
 });
 
 test("links are derived from stored IDs and restricted to HTTPS arXiv hosts", () => {
@@ -67,18 +99,77 @@ test("card actions close over immutable stored IDs and versions", () => {
     saveAndDownload: (...args) => calls.push(["both", ...args]),
   });
   source.arxiv_id = "9999.99999";
-  source.version = "v99";
+  source.resolved_announcement_version = 99;
   findButton(root, "Save").click();
   findButton(root, "Download PDF").click();
   findButton(root, "Save + PDF").click();
   assert.deepEqual(calls, [
-    ["save", "2608.01234", "v2"],
-    ["download", "2608.01234", "v2"],
-    ["both", "2608.01234", "v2"],
+    ["save", "2608.01234", 2],
+    ["download", "2608.01234", 2],
+    ["both", "2608.01234", 2],
   ]);
 });
 
-test("explicit API card projection shows confidence, observations, and discovery labels", () => {
+test("save shows pending and successful Library feedback", async () => {
+  let resolveSave;
+  const pendingSave = new Promise((resolve) => {
+    resolveSave = resolve;
+  });
+  const root = new FakeNode("div");
+  renderPaperCard(new FakeDocument(), root, paper(), {
+    save: () => pendingSave,
+  });
+
+  const save = findButton(root, "Save");
+  save.click();
+
+  assert.equal(save.disabled, true);
+  assert.equal(save.textContent, "Saving…");
+  const actionStatus = descendants(root, "p").find((node) =>
+    node.className === "paper-action-status"
+  );
+  assert.equal(actionStatus.getAttribute("role"), "status");
+  assert.equal(actionStatus.getAttribute("aria-live"), "polite");
+  assert.equal(actionStatus.textContent, "Saving paper…");
+
+  resolveSave({ saved: true });
+  await pendingSave;
+  await Promise.resolve();
+
+  assert.equal(save.disabled, true);
+  assert.equal(save.textContent, "Saved");
+  assert.equal(actionStatus.textContent, "Paper saved to Library.");
+});
+
+test("failed saves restore the action and report the error", async () => {
+  let rejectSave;
+  const pendingSave = new Promise((_resolve, reject) => {
+    rejectSave = reject;
+  });
+  const failures = [];
+  const root = new FakeNode("div");
+  renderPaperCard(new FakeDocument(), root, paper(), {
+    save: () => pendingSave,
+    failure: (error) => failures.push(error),
+  });
+
+  const save = findButton(root, "Save");
+  save.click();
+  const error = new Error("synthetic save failure");
+  rejectSave(error);
+  await pendingSave.catch(() => {});
+  await Promise.resolve();
+
+  assert.equal(save.disabled, false);
+  assert.equal(save.textContent, "Save");
+  const actionStatus = descendants(root, "p").find((node) =>
+    node.className === "paper-action-status"
+  );
+  assert.equal(actionStatus.textContent, "Paper was not saved. Try again.");
+  assert.deepEqual(failures, [error]);
+});
+
+test("confirmed card projection shows only active daily-list support categories", () => {
   const calls = [];
   const root = new FakeNode("div");
   renderPaperCard(
@@ -87,62 +178,156 @@ test("explicit API card projection shows confidence, observations, and discovery
     {
       event_id: 42,
       arxiv_id: "2608.04200",
-      announced_version: 3,
+      resolved_announcement_version: 3,
+      latest_known_version: 4,
+      version_resolution: "chronology_matched",
+      version_label: "Version v3 — matched by chronology",
+      daily_list_date: "2026-08-20",
       title: "Projected paper",
       authors: ["Safe Author"],
       abstract: "Safe abstract",
-      category_observations: ["math.AG", "math.CO"],
-      date_label: "arXiv mailing date",
-      confidence_label: "Recovered announcement",
+      support_categories: ["math.AT"],
+      event_label: "Replacement",
       newly_discovered: true,
       tier: "possible",
       reasons: [{ kind: "keyword", label: "Matched selected keyword", location: "title" }],
     },
     { download: (...values) => calls.push(values) },
   );
-  assert.match(root.textContent, /Recovered announcement/);
-  assert.match(root.textContent, /arXiv mailing date/);
+  assert.match(root.textContent, /arXiv daily-list date: 2026-08-20/);
+  assert.match(root.textContent, /Replacement/);
+  assert.match(root.textContent, /Version v3 — matched by chronology/);
+  assert.doesNotMatch(root.textContent, /Announced v3/);
+  assert.doesNotMatch(root.textContent, /Current feed|Inferred from version history/);
   assert.match(root.textContent, /Newly discovered/);
-  assert.match(root.textContent, /math\.AG · math\.CO/);
+  const labels = descendants(root, "p").find((node) =>
+    node.className === "paper-labels"
+  );
+  assert.match(labels.textContent, /Recovered under: math\.AT(?: ·|$)/);
+  assert.doesNotMatch(labels.textContent, /math\.AC|math\.RT/);
   findButton(root, "Download PDF").click();
   assert.deepEqual(calls, [["2608.04200", 3]]);
   const pdf = descendants(root, "a").find((link) => /PDF/.test(link.textContent));
   assert.equal(pdf.getAttribute("href"), "https://arxiv.org/pdf/2608.04200v3.pdf");
 });
 
-test("versionless events use only the server-resolved download version and render full metadata", () => {
+test("unconfirmed events stay unpinned while latest-version downloads are explicit", () => {
   const calls = [];
   const root = new FakeNode("div");
   renderPaperCard(
     new FakeDocument(),
     root,
     {
-      event_id: 77,
-      arxiv_id: "2608.07700",
-      announced_version: null,
-      download_version: 4,
-      title: "Versionless recovered event",
+      event_id: 78,
+      arxiv_id: "2608.07800",
+      resolved_announcement_version: null,
+      latest_known_version: 4,
+      version_resolution: "unconfirmed",
+      version_label: "Version not confirmed",
+      daily_list_date: "2026-08-21",
+      event_label: "Replacement",
+      support_categories: ["math.AG"],
+      title: "Unconfirmed daily-list event",
       authors: ["Safe Author"],
       abstract: "Abstract",
-      comments: `18 pages ${hostile}`,
-      journal_ref: "Synthetic Journal 1 (2026)",
-      doi: "10.0000/synthetic-doi",
-      category_observations: ["math.AG"],
-      confidence_label: "Inferred update",
       tier: "other",
       reasons: [],
     },
-    { download: (...values) => calls.push(values) },
+    {
+      save: (...values) => calls.push(["save", ...values]),
+      download: (...values) => calls.push(["download", ...values]),
+      saveAndDownload: (...values) => calls.push(["both", ...values]),
+    },
   );
-  assert.match(root.textContent, /Announcement version unavailable/);
-  assert.match(root.textContent, /18 pages <img/);
-  assert.match(root.textContent, /Synthetic Journal/);
-  assert.match(root.textContent, /10\.0000\/synthetic-doi/);
-  assert.equal(descendants(root, "img").length, 0);
-  findButton(root, "Download PDF").click();
-  assert.deepEqual(calls, [["2608.07700", 4]]);
+
+  assert.match(root.textContent, /Version not confirmed/);
+  assert.match(root.textContent, /arXiv daily-list date: 2026-08-21/);
+  assert.match(root.textContent, /Recovered under: math\.AG/);
+  findButton(root, "Save").click();
+  findButton(
+    root,
+    "Download latest v4 — announcement version unconfirmed",
+  ).click();
+  findButton(
+    root,
+    "Save unpinned + download latest v4 — announcement version unconfirmed",
+  ).click();
+  assert.deepEqual(calls, [
+    ["save", "2608.07800", null],
+    ["download", "2608.07800", 4],
+    ["both", "2608.07800", null, 4],
+  ]);
+  const abstract = descendants(root, "a").find((link) =>
+    /Abstract/.test(link.textContent)
+  );
   const pdf = descendants(root, "a").find((link) => /PDF/.test(link.textContent));
-  assert.equal(pdf.getAttribute("href"), "https://arxiv.org/pdf/2608.07700v4.pdf");
+  assert.equal(abstract.textContent, "Abstract on arXiv (latest version)");
+  assert.equal(pdf.textContent, "PDF on arXiv (latest version)");
+  assert.equal(abstract.getAttribute("href"), "https://arxiv.org/abs/2608.07800");
+  assert.equal(pdf.getAttribute("href"), "https://arxiv.org/pdf/2608.07800.pdf");
+});
+
+test("missing latest-version controls support the browser HTMLCollection contract", () => {
+  assert.doesNotMatch(paperViewSource, /controls\.children\.slice\(/);
+
+  const root = new FakeNode("div");
+  renderPaperCard(
+    new FakeDocument(),
+    root,
+    {
+      event_id: 48,
+      arxiv_id: "2608.04800",
+      resolved_announcement_version: null,
+      latest_known_version: null,
+      version_resolution: "unconfirmed",
+      version_label: "Version not confirmed",
+      daily_list_date: "2026-08-24",
+      support_categories: ["math.AT"],
+      title: "No known PDF version",
+      authors: ["Safe Author"],
+      abstract: "Safe abstract",
+    },
+    {},
+  );
+
+  assert.equal(
+    findButton(root, "PDF unavailable — announcement version unconfirmed").disabled,
+    true,
+  );
+  assert.equal(
+    findButton(root, "Save unpinned (PDF unavailable)").disabled,
+    true,
+  );
+});
+
+test("paper titles render delimited math inline through the audited KaTeX runtime", () => {
+  const calls = [];
+  const previous = globalThis.katex;
+  globalThis.katex = {
+    render(source, output, options) {
+      calls.push({ source, options });
+      output.textContent = `rendered:${source}`;
+    },
+  };
+  try {
+    const root = new FakeNode("div");
+    renderPaperCard(
+      new FakeDocument(),
+      root,
+      { ...paper(), title: String.raw`Towards $\mathbb{A}^1$-homotopy` },
+      {},
+    );
+
+    const title = descendants(root, "h3")[0];
+    assert.equal(title.textContent, String.raw`Towards rendered:\mathbb{A}^1-homotopy`);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].source, String.raw`\mathbb{A}^1`);
+    assert.equal(calls[0].options.displayMode, false);
+    assert.equal(calls[0].options.trust, false);
+  } finally {
+    if (previous === undefined) delete globalThis.katex;
+    else globalThis.katex = previous;
+  }
 });
 
 test("paper abstracts render only delimited math through the audited KaTeX runtime", () => {

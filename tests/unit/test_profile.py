@@ -1,16 +1,20 @@
+import hashlib
 import json
 import os
 import stat
 import tempfile
 import threading
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
 from arxiv_digest.atomic import atomic_write, exclusive_flock
 from arxiv_digest.profile import (
+    LegacyProfileGenerationError,
     PdfDestination,
     Profile,
+    ProfileCategory,
     ProfileRepository,
     ProfileRevisionError,
     decode_profile,
@@ -20,9 +24,12 @@ from arxiv_digest.profile import (
 
 def sample_profile(destination: Path, revision: int = 1) -> Profile:
     return Profile(
-        schema_version=1,
+        schema_version=2,
         revision=revision,
-        categories=("cs.CL", "stat.ML"),
+        category_coverage=(
+            ProfileCategory("cs.CL", date(2026, 7, 1)),
+            ProfileCategory("stat.ML", date(2026, 7, 8)),
+        ),
         keywords=("verification",),
         phrases=("causal representation",),
         authors=("Alex Example",),
@@ -36,6 +43,139 @@ def repository_at(root: Path) -> ProfileRepository:
 
 
 class ProfileRepositoryTest(unittest.TestCase):
+    def test_categories_projects_category_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = sample_profile(Path(directory) / "papers")
+
+            self.assertEqual(profile.categories, ("cs.CL", "stat.ML"))
+
+    def test_schema_v2_round_trips_category_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            expected = Profile(
+                schema_version=2,
+                revision=1,
+                category_coverage=(
+                    ProfileCategory("cs.CL", date(2026, 7, 1)),
+                    ProfileCategory("stat.ML", date(2026, 7, 8)),
+                ),
+                keywords=("verification",),
+                phrases=("causal representation",),
+                authors=("Alex Example",),
+                seed_papers=("2607.00001",),
+                pdf_destination=PdfDestination("custom", root / "papers"),
+            )
+
+            decoded = decode_profile(encode_profile(expected))
+
+            self.assertEqual(decoded, expected)
+
+    def test_encoded_category_coverage_has_exact_pair_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            encoded = json.loads(
+                encode_profile(sample_profile(Path(directory) / "papers"))
+            )
+
+            self.assertNotIn("categories", encoded)
+            self.assertEqual(
+                encoded["category_coverage"],
+                [
+                    {"category": "cs.CL", "coverage_start": "2026-07-01"},
+                    {"category": "stat.ML", "coverage_start": "2026-07-08"},
+                ],
+            )
+
+    def test_category_coverage_requires_canonical_iso_date(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = json.loads(
+                encode_profile(sample_profile(Path(directory) / "papers"))
+            )
+            value["category_coverage"][0]["coverage_start"] = "20260701"
+
+            with self.assertRaisesRegex(ValueError, "ISO date"):
+                decode_profile(json.dumps(value).encode("utf-8"))
+
+    def test_legacy_profile_is_rejected_without_modifying_its_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repository = repository_at(root)
+            legacy_payload = json.dumps(
+                {
+                    "schema_version": 1,
+                    "revision": 7,
+                    "categories": ["cs.CL"],
+                    "keywords": ["verification"],
+                    "phrases": [],
+                    "authors": [],
+                    "seed_papers": [],
+                    "pdf_destination": {
+                        "kind": "custom",
+                        "path": str(root / "papers"),
+                    },
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+            repository.path.write_bytes(legacy_payload)
+            before = hashlib.sha256(repository.path.read_bytes()).digest()
+
+            with self.assertRaisesRegex(
+                LegacyProfileGenerationError,
+                "Clean reset with recovery copy",
+            ):
+                repository.load()
+
+            after = hashlib.sha256(repository.path.read_bytes()).digest()
+            self.assertEqual(after, before)
+
+    def test_missing_category_coverage_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = json.loads(
+                encode_profile(sample_profile(Path(directory) / "papers"))
+            )
+            del value["category_coverage"]
+
+            with self.assertRaisesRegex(ValueError, "missing profile keys"):
+                decode_profile(json.dumps(value).encode("utf-8"))
+
+    def test_category_coverage_entry_keys_must_be_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = json.loads(
+                encode_profile(sample_profile(Path(directory) / "papers"))
+            )
+            for replacement in (
+                {"category": "cs.CL"},
+                {
+                    "category": "cs.CL",
+                    "coverage_start": "2026-07-01",
+                    "unexpected": True,
+                },
+            ):
+                with self.subTest(replacement=replacement):
+                    value = json.loads(json.dumps(baseline))
+                    value["category_coverage"][0] = replacement
+                    with self.assertRaisesRegex(ValueError, "coverage keys"):
+                        decode_profile(json.dumps(value).encode("utf-8"))
+
+    def test_duplicate_profile_categories_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = json.loads(
+                encode_profile(sample_profile(Path(directory) / "papers"))
+            )
+            value["category_coverage"][1]["category"] = "CS.cl"
+
+            with self.assertRaisesRegex(ValueError, "duplicate category_coverage"):
+                decode_profile(json.dumps(value).encode("utf-8"))
+
+    def test_legacy_categories_cannot_be_aligned_with_category_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = json.loads(
+                encode_profile(sample_profile(Path(directory) / "papers"))
+            )
+            value["categories"] = ["cs.CL", "math.AT"]
+
+            with self.assertRaisesRegex(ValueError, "unknown profile keys"):
+                decode_profile(json.dumps(value).encode("utf-8"))
+
     def test_atomic_profile_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -233,7 +373,7 @@ class ProfileRepositoryTest(unittest.TestCase):
             value = json.loads(
                 encode_profile(sample_profile(Path(directory) / "papers"))
             )
-            value["schema_version"] = 2
+            value["schema_version"] = 1
 
             with self.assertRaisesRegex(ValueError, "schema version"):
                 decode_profile(json.dumps(value).encode("utf-8"))
@@ -265,7 +405,7 @@ class ProfileRepositoryTest(unittest.TestCase):
             value = json.loads(
                 encode_profile(sample_profile(Path(directory) / "papers"))
             )
-            value["categories"] = ["  cs.CL  ", "stat.ML"]
+            value["category_coverage"][0]["category"] = "  cs.CL  "
             value["keywords"] = ["  proof   search "]
             value["phrases"] = [" causal\n representation "]
             value["authors"] = ["  Alex   Example "]
@@ -285,7 +425,6 @@ class ProfileRepositoryTest(unittest.TestCase):
                 encode_profile(sample_profile(Path(directory) / "papers"))
             )
             for field in (
-                "categories",
                 "keywords",
                 "phrases",
                 "authors",
@@ -356,9 +495,11 @@ class ProfileRepositoryTest(unittest.TestCase):
     def test_profile_constructor_normalizes_tuple_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile = Profile(
-                schema_version=1,
+                schema_version=2,
                 revision=1,
-                categories=(" cs.CL ",),
+                category_coverage=(
+                    ProfileCategory(" cs.CL ", date(2026, 7, 1)),
+                ),
                 keywords=(" proof   search ",),
                 phrases=(),
                 authors=(),
@@ -382,9 +523,11 @@ class ProfileRepositoryTest(unittest.TestCase):
             root = Path(directory).resolve()
             with self.assertRaisesRegex(ValueError, "schema version"):
                 Profile(
-                    schema_version=2,
+                    schema_version=1,
                     revision=1,
-                    categories=("cs.CL",),
+                    category_coverage=(
+                        ProfileCategory("cs.CL", date(2026, 7, 1)),
+                    ),
                     keywords=(),
                     phrases=(),
                     authors=(),
@@ -414,9 +557,9 @@ class ProfileRepositoryTest(unittest.TestCase):
             root = Path(directory).resolve()
             with self.assertRaisesRegex(ValueError, "at least one category"):
                 Profile(
-                    schema_version=1,
+                    schema_version=2,
                     revision=1,
-                    categories=(),
+                    category_coverage=(),
                     keywords=(),
                     phrases=(),
                     authors=(),

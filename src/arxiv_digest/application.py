@@ -274,7 +274,10 @@ class _DefaultRuntime:
         self.launcher: Any = None
         self._jobs: dict[str, dict[str, Any]] = {}
         self._jobs_lock = threading.RLock()
+        self._candidate_state_lock = threading.RLock()
         self._candidate_build: Any = None
+        self._candidate_job_id: str | None = None
+        self._candidate_job_revision: int | None = None
         self._suggestions: dict[str, tuple[int, str, str, Any]] = {}
         self._suggestion_ids: dict[tuple[int, str, str, str], str] = {}
         self._picker_choices: dict[str, Any] = {}
@@ -285,7 +288,9 @@ class _DefaultRuntime:
         self._restore_cleanup_timer: threading.Timer | None = None
         self._restore_shutdown = False
         self._sync_cancel = threading.Event()
+        self._sync_start_lock = threading.Lock()
         self._active_sync_job: str | None = None
+        self._sync_follow_up_requested = False
         self._last_sync_report: Any = None
         self._category_values: tuple[Any, ...] | None = None
         self._issued_category_pairs: set[tuple[str, str]] = set()
@@ -304,6 +309,8 @@ class _DefaultRuntime:
         )
 
     def open_database(self) -> Any:
+        self.profiles.load()
+
         from arxiv_digest.downloads import DownloadManager
         from arxiv_digest.candidates import CandidateCache, CandidateCorpusBuilder
         from arxiv_digest.folders import FolderService
@@ -407,47 +414,147 @@ class _DefaultRuntime:
         return True
 
     def status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from arxiv_digest.doctor import _redacted_sync_error_code
+
         sync_job = None
         with self._jobs_lock:
             if self._active_sync_job is not None:
                 sync_job = dict(self._jobs.get(self._active_sync_job, {}))
                 sync_job.pop("result", None)
+        retry = None if sync_job is None else sync_job.get("daily_list_retry")
+        if not isinstance(retry, dict):
+            retry_dates = self._retryable_sync_dates()
+            retry = {
+                "status": (
+                    "running"
+                    if sync_job is not None
+                    and sync_job.get("status") == "running"
+                    and retry_dates
+                    else "idle"
+                ),
+                "completed": 0,
+                "total": len(
+                    {
+                        mailing_date
+                        for dates in retry_dates.values()
+                        for mailing_date in dates
+                    }
+                ),
+            }
+        else:
+            retry = dict(retry)
+        offline = bool(
+            self._last_sync_report is not None
+            and self._last_sync_report.offline
+        )
+        metadata_sync = None
+        daily_list_progress = None
+        progress_snapshot = getattr(getattr(self, "sync", None), "progress", None)
+        if self.profiles.load() is not None and callable(progress_snapshot):
+            report = progress_snapshot(self._sync_configs(), offline=offline)
+            metadata_categories = []
+            daily_list_categories = []
+            for category_progress in report.categories:
+                metadata = getattr(category_progress, "metadata_sync", None)
+                if metadata is not None:
+                    metadata_error = getattr(
+                        metadata, "last_error_code", None
+                    )
+                    metadata_categories.append(
+                        {
+                            "category": category_progress.category,
+                            "status": metadata.status,
+                            "synchronized_through": (
+                                None
+                                if metadata.completed_through_utc is None
+                                else metadata.completed_through_utc.isoformat()
+                            ),
+                            "error_codes": (
+                                []
+                                if metadata_error is None
+                                else [
+                                    _redacted_sync_error_code(metadata_error)
+                                ]
+                            ),
+                        }
+                    )
+                if not hasattr(category_progress, "target_dates"):
+                    continue
+                daily_list_categories.append(
+                    {
+                        "category": category_progress.category,
+                        "target_dates": len(category_progress.target_dates),
+                        "checked_dates": len(category_progress.checked_dates),
+                        "dates_with_papers": len(
+                            category_progress.dates_with_papers
+                        ),
+                        "empty_dates": len(category_progress.empty_dates),
+                        "failed_dates": len(category_progress.failed_dates),
+                        "pending_dates": len(category_progress.pending_dates),
+                        "unavailable_dates": len(
+                            category_progress.unavailable_dates
+                        ),
+                        "status": category_progress.daily_list_status,
+                        "error_codes": sorted(
+                            {
+                                _redacted_sync_error_code(error_code)
+                                for _day, error_code in getattr(
+                                    category_progress,
+                                    "daily_list_errors",
+                                    (),
+                                )
+                                if error_code is not None
+                            }
+                        ),
+                    }
+                )
+            metadata_sync = {
+                "status": (
+                    "complete"
+                    if bool(getattr(report, "metadata_complete", False))
+                    else "incomplete"
+                ),
+                "categories": metadata_categories,
+            }
+            daily_list_progress = {
+                "target_dates": report.target_dates,
+                "checked_dates": report.checked_dates,
+                "dates_with_papers": report.dates_with_papers,
+                "empty_dates": report.empty_dates,
+                "failed_dates": report.failed_dates,
+                "pending_dates": report.pending_dates,
+                "unavailable_dates": report.unavailable_dates,
+                "status": report.daily_list_status,
+            }
+            if daily_list_categories:
+                daily_list_progress["categories"] = daily_list_categories
         return {
             "state": "ready",
             "initialized": self.profiles.load() is not None,
             "sync": sync_job,
-            "offline": bool(
-                self._last_sync_report is not None
-                and self._last_sync_report.offline
-            ),
+            "daily_list_retry": retry,
+            "metadata_sync": metadata_sync,
+            "daily_list_progress": daily_list_progress,
+            "offline": offline,
         }
 
     def _review_date(self, payload: dict[str, Any]) -> Any:
         from arxiv_digest.web.api import ReviewPagePayload
 
         day = date.fromisoformat(payload["date"])
-        snapshot = self.store.review_snapshot(day)
         page = self.review.open_date(
             day,
             anchor_event_id=payload.get("anchor_event_id"),
         )
-        wanted = {card.paper.arxiv_id for card in page.cards}
         versions: dict[str, int] = {}
-        profile = self.profiles.load()
-        if profile is not None:
-            for category in profile.categories:
-                for article in self.store.article_snapshots(category):
-                    arxiv_id = article.metadata.arxiv_id
-                    if arxiv_id not in wanted or not article.versions:
-                        continue
-                    versions[arxiv_id] = max(
-                        versions.get(arxiv_id, 0),
-                        article.versions[-1].number,
-                    )
+        for card in page.cards:
+            article_versions = self.store.article_versions(card.paper.arxiv_id)
+            if article_versions:
+                versions[card.paper.arxiv_id] = article_versions[-1].number
         return ReviewPagePayload(
             page,
-            snapshot.last_finished_revision,
-            versions,
+            page.last_finished_revision,
+            latest_known_versions=versions,
         )
 
     def _review_position(self, payload: dict[str, Any]) -> Any:
@@ -455,12 +562,32 @@ class _DefaultRuntime:
             date.fromisoformat(payload["date"]),
             snapshot_revision=payload["snapshot_revision"],
             anchor_event_id=payload["anchor_event_id"],
+            profile_revision=payload["profile_revision"],
+            projection_revision=payload["projection_revision"],
         )
 
     def _review_finish(self, payload: dict[str, Any]) -> Any:
-        return self.review.finish_date(
+        result = self.review.finish_date(
             date.fromisoformat(payload["date"]),
             through_revision=payload["snapshot_revision"],
+            profile_revision=payload["profile_revision"],
+            projection_revision=payload["projection_revision"],
+            finished_at=datetime.now(timezone.utc),
+        )
+        next_date = self.review.summary().oldest_unreviewed_date
+        return {
+            "reviewed_count": result.reviewed_count,
+            "through_revision": result.through_revision,
+            "next_unreviewed_date": (
+                None if next_date is None else next_date.isoformat()
+            ),
+        }
+
+    def _review_finish_all(self, payload: dict[str, Any]) -> Any:
+        return self.review.finish_all(
+            through_revision=payload["snapshot_revision"],
+            profile_revision=payload["profile_revision"],
+            projection_revision=payload["projection_revision"],
             finished_at=datetime.now(timezone.utc),
         )
 
@@ -642,69 +769,105 @@ class _DefaultRuntime:
         return tuple(documents)
 
     def _start_candidate_corpus(self, payload: dict[str, Any]) -> dict[str, str]:
-        draft = self.setup.load_draft()
-        if draft is None or draft.revision != payload["draft_revision"]:
-            from arxiv_digest.setup import SetupRevisionError
+        with self._candidate_state_lock:
+            draft = self.setup.load_draft()
+            if draft is None or draft.revision != payload["draft_revision"]:
+                from arxiv_digest.setup import SetupRevisionError
 
-            raise SetupRevisionError(
-                payload["draft_revision"],
-                None if draft is None else draft.revision,
-            )
-        configs = self._category_configs(draft)
-        cancellation = threading.Event()
-
-        def build() -> Any:
-            result = (
-                self.candidates.retry(
-                    configs,
-                    cancelled=cancellation.is_set,
+                raise SetupRevisionError(
+                    payload["draft_revision"],
+                    None if draft is None else draft.revision,
                 )
-                if payload["mode"] == "restart"
-                else self.candidates.resume(
-                    configs,
-                    cancelled=cancellation.is_set,
-                )
-            )
-            self._candidate_build = result
-            self._suggestions.clear()
-            self._suggestion_ids.clear()
-            return result
+            configs = self._category_configs(draft)
+            cancellation = threading.Event()
 
-        return {
-            "job_id": self._new_job(
-                "setup",
-                "sync",
-                build,
-                request_cancel=cancellation.set,
-            )
-        }
+            def build() -> Any:
+                result = (
+                    self.candidates.retry(
+                        configs,
+                        cancelled=cancellation.is_set,
+                    )
+                    if payload["mode"] == "restart"
+                    else self.candidates.resume(
+                        configs,
+                        cancelled=cancellation.is_set,
+                    )
+                )
+                self._candidate_build = result
+                self._suggestions.clear()
+                self._suggestion_ids.clear()
+                return result
+
+            with self._jobs_lock:
+                current = (
+                    None
+                    if self._candidate_job_id is None
+                    else self._jobs.get(self._candidate_job_id)
+                )
+            if (
+                self._candidate_job_id is not None
+                and self._candidate_job_revision == draft.revision
+                and current is not None
+                and current.get("status") == "running"
+            ):
+                return {"job_id": self._candidate_job_id}
+            job_id = f"setup_{secrets.token_urlsafe(12)}"
+            self._candidate_job_id = job_id
+            self._candidate_job_revision = draft.revision
+            try:
+                self._new_job(
+                    "setup",
+                    "sync",
+                    build,
+                    job_id=job_id,
+                    request_cancel=cancellation.set,
+                )
+            except Exception:
+                if self._candidate_job_id == job_id:
+                    self._candidate_job_id = None
+                    self._candidate_job_revision = None
+                raise
+            return {"job_id": job_id}
 
     def _accept_candidate_corpus(self, payload: dict[str, Any]) -> Any:
-        draft = self.setup.load_draft()
-        if draft is None or draft.revision != payload["draft_revision"]:
-            from arxiv_digest.setup import SetupRevisionError
+        with self._candidate_state_lock:
+            draft = self.setup.load_draft()
+            if draft is None or draft.revision != payload["draft_revision"]:
+                from arxiv_digest.setup import SetupRevisionError
 
-            raise SetupRevisionError(
-                payload["draft_revision"],
-                None if draft is None else draft.revision,
+                raise SetupRevisionError(
+                    payload["draft_revision"],
+                    None if draft is None else draft.revision,
+                )
+            with self._jobs_lock:
+                active = (
+                    None
+                    if self._candidate_job_id is None
+                    else self._jobs.get(self._candidate_job_id)
+                )
+            if (
+                self._candidate_job_revision == draft.revision
+                and active is not None
+                and active.get("status") == "running"
+            ):
+                raise ValueError("candidate corpus generation is still running")
+            build = self._candidate_build
+            if build is None or build.corpus_hash != payload["corpus_hash"]:
+                raise ValueError("candidate corpus changed; resume it again")
+            if not build.complete and build.minimum_met:
+                build = self.candidates.resume(
+                    self._category_configs(draft),
+                    accept_reduced_breadth=True,
+                )
+                if build.corpus_hash != payload["corpus_hash"]:
+                    raise ValueError("candidate corpus changed; inspect it again")
+                self._candidate_build = build
+            revised = self.setup.accept_candidate_corpus(
+                draft.revision,
+                build,
+                corpus_hash=payload["corpus_hash"],
             )
-        build = self._candidate_build
-        if build is None or build.corpus_hash != payload["corpus_hash"]:
-            raise ValueError("candidate corpus changed; resume it again")
-        if not build.complete and build.minimum_met:
-            build = self.candidates.resume(
-                self._category_configs(draft),
-                accept_reduced_breadth=True,
-            )
-            if build.corpus_hash != payload["corpus_hash"]:
-                raise ValueError("candidate corpus changed; inspect it again")
-            self._candidate_build = build
-        revised = self.setup.accept_candidate_corpus(
-            draft.revision,
-            build,
-            corpus_hash=payload["corpus_hash"],
-        )
-        return self._setup_payload(revised)
+            return self._setup_payload(revised)
 
     @staticmethod
     def _suggestion_identity(kind: str, value: Any) -> str:
@@ -913,13 +1076,70 @@ class _DefaultRuntime:
             **self._paper_value(document),
         }
 
+    def _supported_coverage_bounds(self) -> tuple[date, date]:
+        from arxiv_digest.sync import (
+            DEFAULT_CATCHUP_FINALIZATION_HOUR,
+            SUPPORTED_CATCHUP_WINDOW_DAYS,
+            daily_list_coverage_bounds,
+        )
+
+        sync_bounds = getattr(getattr(self, "sync", None), "coverage_bounds", None)
+        if callable(sync_bounds):
+            return sync_bounds()
+        clock = getattr(getattr(self, "setup", None), "clock", None)
+        observed_at = (
+            clock() if callable(clock) else datetime.now(timezone.utc)
+        )
+        window_days = getattr(
+            getattr(self, "sync", None),
+            "catchup_window_days",
+            SUPPORTED_CATCHUP_WINDOW_DAYS,
+        )
+        if type(window_days) is not int or not (
+            1 <= window_days <= SUPPORTED_CATCHUP_WINDOW_DAYS
+        ):
+            window_days = SUPPORTED_CATCHUP_WINDOW_DAYS
+        finalization_hour = getattr(
+            getattr(self, "sync", None),
+            "catchup_finalization_hour",
+            DEFAULT_CATCHUP_FINALIZATION_HOUR,
+        )
+        if type(finalization_hour) is not int or not 0 <= finalization_hour <= 23:
+            finalization_hour = DEFAULT_CATCHUP_FINALIZATION_HOUR
+        return daily_list_coverage_bounds(
+            observed_at,
+            window_days=window_days,
+            finalization_hour=finalization_hour,
+        )
+
     def _setup_payload(self, draft: Any) -> Any:
         from arxiv_digest.web.api import SetupDraftPayload
 
+        coverage_min, coverage_max = self._supported_coverage_bounds()
         return SetupDraftPayload(
             draft,
             corpus_can_resume=self._candidate_cache_can_resume(draft),
+            corpus_job=self._candidate_job_for_draft(draft),
+            coverage_min=coverage_min,
+            coverage_max=coverage_max,
         )
+
+    def _candidate_job_for_draft(self, draft: Any) -> dict[str, Any] | None:
+        state_lock = getattr(self, "_candidate_state_lock", None)
+        if state_lock is None:
+            return None
+        with state_lock:
+            if (
+                getattr(self, "_candidate_job_id", None) is None
+                or getattr(self, "_candidate_job_revision", None)
+                != getattr(draft, "revision", None)
+            ):
+                return None
+            job_id = self._candidate_job_id
+            try:
+                return self._job_status({"job_id": job_id})
+            except KeyError:
+                return None
 
     def _candidate_cache_can_resume(self, draft: Any) -> bool:
         from arxiv_digest.candidates import CandidateCacheError
@@ -985,6 +1205,7 @@ class _DefaultRuntime:
                 revision,
                 date.fromisoformat(payload["coverage_start"]),
                 earliest_datestamp=earliest,
+                coverage_bounds=self._supported_coverage_bounds(),
             )
         elif step == "seed_papers":
             current = self.setup.load_draft()
@@ -1155,15 +1376,36 @@ class _DefaultRuntime:
     @staticmethod
     def _profile_value(profile: Any, store: Any) -> dict[str, Any]:
         categories = []
+        coverage_by_category = {
+            item.category: item.coverage_start
+            for item in getattr(profile, "category_coverage", ())
+        }
         for category in profile.categories:
             state = store.category_sync_state(category)
             categories.append(
                 {
                     "category": category,
                     "set_spec": state.set_spec,
-                    "coverage_start": state.coverage_start.isoformat(),
+                    "coverage_start": coverage_by_category.get(
+                        category, state.coverage_start
+                    ).isoformat(),
                 }
             )
+        seed_paper_details = []
+        article_metadata = getattr(store, "article_metadata", None)
+        if callable(article_metadata):
+            for arxiv_id in profile.seed_papers:
+                try:
+                    paper = article_metadata(arxiv_id)
+                except KeyError:
+                    continue
+                seed_paper_details.append(
+                    {
+                        "arxiv_id": paper.arxiv_id,
+                        "title": paper.title,
+                        "authors": list(paper.authors),
+                    }
+                )
         return {
             "schema_version": profile.schema_version,
             "revision": profile.revision,
@@ -1172,6 +1414,7 @@ class _DefaultRuntime:
             "phrases": list(profile.phrases),
             "authors": list(profile.authors),
             "seed_papers": list(profile.seed_papers),
+            "seed_paper_details": seed_paper_details,
             "pdf_destination": {"kind": profile.pdf_destination.kind},
         }
 
@@ -1182,34 +1425,134 @@ class _DefaultRuntime:
         )
         return self._profile_value(profile, self.store)
 
-    def _run_sync(self) -> Any:
+    def _retryable_sync_dates(
+        self, configs: tuple[Any, ...] | None = None
+    ) -> dict[str, tuple[date, ...]]:
+        sync = getattr(self, "sync", None)
+        profiles = getattr(self, "profiles", None)
+        progress_snapshot = getattr(sync, "progress", None)
+        if (
+            sync is None
+            or profiles is None
+            or profiles.load() is None
+            or not callable(progress_snapshot)
+        ):
+            return {}
+        selected = self._sync_configs() if configs is None else configs
+        offline = bool(
+            self._last_sync_report is not None
+            and self._last_sync_report.offline
+        )
+        report = progress_snapshot(selected, offline=offline)
+        return {
+            progress.category: tuple(progress.retryable_failed_exact_dates)
+            for progress in report.categories
+            if progress.retryable_failed_exact_dates
+        }
+
+    def _run_sync_pass(self, job_id: str, *, retry_failed_dates: bool) -> Any:
+        configs = self._sync_configs()
+        retry_dates = self._retryable_sync_dates(configs)
+        targets_by_date: dict[date, set[str]] = {}
+        for category, dates in retry_dates.items():
+            for mailing_date in dates:
+                targets_by_date.setdefault(mailing_date, set()).add(category)
+        attempted_pairs: set[tuple[str, date]] = set()
+
+        def record_attempt(category: str, mailing_date: date) -> None:
+            expected = targets_by_date.get(mailing_date)
+            if expected is None or category not in expected:
+                return
+            attempted_pairs.add((category, mailing_date))
+            completed = sum(
+                all(
+                    (category_name, day) in attempted_pairs
+                    for category_name in categories
+                )
+                for day, categories in targets_by_date.items()
+            )
+            with self._jobs_lock:
+                job = self._jobs.get(job_id)
+                if job is not None:
+                    job["daily_list_retry"] = {
+                        "status": "running",
+                        "completed": completed,
+                        "total": len(targets_by_date),
+                    }
+
+        if targets_by_date:
+            with self._jobs_lock:
+                job = self._jobs.get(job_id)
+                if job is not None:
+                    job["daily_list_retry"] = {
+                        "status": "running",
+                        "completed": 0,
+                        "total": len(targets_by_date),
+                    }
+        if retry_failed_dates:
+            report = self.sync.retry_failed_dates(
+                configs,
+                retry_dates,
+                attempted=record_attempt,
+            )
+        elif targets_by_date:
+            report = self.sync.sync(configs, attempted=record_attempt)
+        else:
+            report = self.sync.sync(configs)
+        self._last_sync_report = report
+        return report
+
+    def _run_sync(self, job_id: str, *, retry_failed_dates: bool) -> Any:
         try:
-            report = self.sync.sync(self._sync_configs())
-            self._last_sync_report = report
-            return report
+            while True:
+                report = self._run_sync_pass(
+                    job_id,
+                    retry_failed_dates=retry_failed_dates,
+                )
+                with self._jobs_lock:
+                    if not self._sync_follow_up_requested:
+                        self._active_sync_job = None
+                        return report
+                    self._sync_follow_up_requested = False
+                retry_failed_dates = False
         finally:
             with self._jobs_lock:
-                self._active_sync_job = None
+                if self._active_sync_job == job_id:
+                    self._active_sync_job = None
+                    self._sync_follow_up_requested = False
 
     def _start_sync_job(self, payload: dict[str, Any]) -> dict[str, str]:
-        with self._jobs_lock:
-            if self._active_sync_job is not None:
-                current = self._jobs.get(self._active_sync_job)
-                if current is not None and current["status"] == "running":
-                    return {"job_id": self._active_sync_job}
-            job_id = f"sync_{secrets.token_urlsafe(12)}"
-            self._active_sync_job = job_id
-            # Clear a previous request before the worker can register. Once
-            # registered, maintenance cancellation must never be erased by a
-            # startup race inside the worker thread.
-            self._sync_cancel.clear()
-            self._new_job(
-                "sync",
-                "sync",
-                self._run_sync,
-                job_id=job_id,
-                request_cancel=self._sync_cancel.set,
-            )
+        with self._sync_start_lock:
+            with self._jobs_lock:
+                if self._active_sync_job is not None:
+                    current = self._jobs.get(self._active_sync_job)
+                    if current is not None and current["status"] == "running":
+                        if payload.get("follow_up") is True:
+                            self._sync_follow_up_requested = True
+                        return {"job_id": self._active_sync_job}
+                job_id = f"sync_{secrets.token_urlsafe(12)}"
+                self._active_sync_job = job_id
+                self._sync_follow_up_requested = False
+                # Clear a previous request before the worker can register. Once
+                # registered, maintenance cancellation must never be erased by a
+                # startup race inside the worker thread.
+                self._sync_cancel.clear()
+            try:
+                self._new_job(
+                    "sync",
+                    "sync",
+                    lambda: self._run_sync(
+                        job_id,
+                        retry_failed_dates=payload.get("retry_failed_dates") is True,
+                    ),
+                    job_id=job_id,
+                    request_cancel=self._sync_cancel.set,
+                )
+            except Exception:
+                with self._jobs_lock:
+                    if self._active_sync_job == job_id:
+                        self._active_sync_job = None
+                raise
         return {"job_id": job_id}
 
     def _cancel_sync(self, payload: dict[str, Any]) -> dict[str, bool]:
@@ -1228,6 +1571,7 @@ class _DefaultRuntime:
                 payload["arxiv_id"],
                 payload["version"],
                 save_first=payload["save_first"],
+                save_version=payload.get("save_version"),
                 cancelled=cancellation.is_set,
             ),
             request_cancel=cancellation.set,
@@ -1239,24 +1583,16 @@ class _DefaultRuntime:
         if profile is None:
             raise KeyError("active profile")
         if payload.get("refresh") == "1":
-            from arxiv_digest.models import CategoryConfig
-
-            configs = []
-            for category in profile.categories:
-                state = self.store.category_sync_state(category)
-                configs.append(
-                    CategoryConfig(
-                        category,
-                        state.set_spec,
-                        state.coverage_start,
-                    )
-                )
+            configs = self._sync_configs()
             with self.maintenance.operation():
-                build = self.candidates.resume(tuple(configs))
+                build = self.candidates.resume(configs)
             self._candidate_build = build
             self._suggestions.clear()
             self._suggestion_ids.clear()
         result = self._profile_value(profile, self.store)
+        coverage_min, coverage_max = self._supported_coverage_bounds()
+        result["coverage_min"] = coverage_min.isoformat()
+        result["coverage_max"] = coverage_max.isoformat()
         result["suggestions"] = {
             "categories": self._interest_category_suggestions(profile),
             "seed_papers": [],
@@ -1400,7 +1736,7 @@ class _DefaultRuntime:
             validate_custom_phrase,
         )
         from arxiv_digest.models import CategoryConfig
-        from arxiv_digest.profile import Profile
+        from arxiv_digest.profile import Profile, ProfileCategory
 
         current = self.profiles.load()
         if current is None:
@@ -1425,13 +1761,15 @@ class _DefaultRuntime:
         }
         if len(added_by_category) != len(added_configs):
             raise ValueError("category configuration additions must be unique")
+        active_coverage = {
+            item.category: item.coverage_start
+            for item in current.category_coverage
+        }
         configs = []
         used_added: set[str] = set()
         for selection in selections:
             category = selection["category"]
-            try:
-                state = self.store.category_sync_state(category)
-            except KeyError:
+            if category not in active_coverage:
                 item = added_by_category.get(category)
                 if (
                     item is None
@@ -1441,20 +1779,31 @@ class _DefaultRuntime:
                 ):
                     raise ValueError(
                         "new categories require an exact coverage configuration"
-                    ) from None
+                    )
+                coverage_start = date.fromisoformat(item["coverage_start"])
+                coverage_min, coverage_max = self._supported_coverage_bounds()
+                if not coverage_min <= coverage_start <= coverage_max:
+                    raise ValueError(
+                        "category coverage is outside the supported recovery window"
+                    )
                 configs.append(
                     CategoryConfig(
                         category,
                         selection["set_spec"],
-                        date.fromisoformat(item["coverage_start"]),
+                        coverage_start,
                     )
                 )
                 used_added.add(category)
             else:
+                state = self.store.category_sync_state(category)
                 if state.set_spec != selection["set_spec"]:
                     raise ValueError("stored category set specification changed")
                 configs.append(
-                    CategoryConfig(category, state.set_spec, state.coverage_start)
+                    CategoryConfig(
+                        category,
+                        state.set_spec,
+                        active_coverage[category],
+                    )
                 )
         if used_added != set(added_by_category):
             raise ValueError("category configurations must belong to new selections")
@@ -1468,9 +1817,12 @@ class _DefaultRuntime:
             if value not in current.seed_papers and not self.known_paper(value)
         )
         profile = Profile(
-            schema_version=1,
+            schema_version=2,
             revision=expected + 1,
-            categories=tuple(item["category"] for item in selections),
+            category_coverage=tuple(
+                ProfileCategory(config.category, config.coverage_start)
+                for config in configs
+            ),
             keywords=tuple(
                 validate_custom_keyword(value)
                 for value in payload.get("keywords", current.keywords)
@@ -1492,108 +1844,308 @@ class _DefaultRuntime:
             seed_papers=new_seed_documents,
             expected_revision=expected,
         )
+        if used_added:
+            self._start_sync_job({"follow_up": True})
         return self._profile_value(profile, self.store)
 
-    @staticmethod
-    def _sync_state_value(state: Any, progress: Any) -> dict[str, Any]:
-        if progress.category != state.category:
-            raise ValueError("synchronization progress category does not match state")
-        metadata = progress.metadata_sync
-        backfill = progress.historical_backfill
-        return {
-            "category": state.category,
-            "set_spec": state.set_spec,
-            "coverage_start": state.coverage_start.isoformat(),
-            "metadata_synchronized_through": (
-                None
-                if metadata.completed_through_utc is None
-                else metadata.completed_through_utc.isoformat()
-            ),
-            "historical_backfill": {
-                "status": backfill.status,
-                "start": (
-                    None
-                    if backfill.pending_start is None
-                    else backfill.pending_start.isoformat()
-                ),
-                "until": (
-                    None
-                    if backfill.pending_until is None
-                    else backfill.pending_until.isoformat()
-                ),
-                "error_code": backfill.last_error_code,
-                "error_message": backfill.last_error_message,
-            },
-            "exact_enrichment": {
-                "start": (
-                    None
-                    if progress.exact_start is None
-                    else progress.exact_start.isoformat()
-                ),
-                "end": (
-                    None
-                    if progress.exact_end is None
-                    else progress.exact_end.isoformat()
-                ),
-                "holes": [
-                    missing.isoformat()
-                    for missing in progress.missing_exact_dates
-                ],
-            },
-            "current_sync": {
-                "status": metadata.status,
-                "error_code": metadata.last_error_code,
-                "error_message": metadata.last_error_message,
-            },
-        }
-
     def _settings_get(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from arxiv_digest.web.api import _destination_display_path
+        from arxiv_digest.doctor import _redacted_sync_error_code
+
         profile = self.profiles.load()
         if profile is None:
             raise KeyError("active profile")
-        offline = bool(
-            self._last_sync_report is not None
-            and self._last_sync_report.offline
+        service_status = self.status({})
+        active_sync = service_status.get("sync")
+        coverage_min, coverage_max = self._supported_coverage_bounds()
+        metadata_categories = []
+        coverage_categories = []
+        category_days: dict[str, dict[date, str]] = {}
+        checkpoint_count = 0
+        for profile_category in profile.category_coverage:
+            category = profile_category.category
+            state = self.store.category_sync_state(category)
+            if state.completed_through_utc is not None:
+                checkpoint_count += 1
+            metadata_codes = []
+            if state.last_error_code is not None:
+                metadata_codes.append(
+                    _redacted_sync_error_code(state.last_error_code)
+                )
+            metadata_categories.append(
+                {
+                    "category": category,
+                    "status": state.status,
+                    "synchronized_through": (
+                        None
+                        if state.completed_through_utc is None
+                        else state.completed_through_utc.isoformat()
+                    ),
+                    "error_codes": sorted(set(metadata_codes)),
+                }
+            )
+
+            records = tuple(
+                record
+                for record in self.store.catchup_day_records(category)
+                if record.daily_list_date >= profile_category.coverage_start
+            )
+            category_days[category] = {
+                record.daily_list_date: record.status.value
+                for record in records
+            }
+            category_statuses = [record.status.value for record in records]
+            category_unavailable = sum(
+                self._daily_list_is_unavailable(
+                    [record.status.value],
+                    record.daily_list_date,
+                    coverage_min,
+                )
+                for record in records
+            )
+            error_codes = sorted(
+                {
+                    _redacted_sync_error_code(record.error_code)
+                    for record in records
+                    if record.error_code is not None
+                }
+            )
+            coverage_categories.append(
+                {
+                    "category": category,
+                    "coverage_start": profile_category.coverage_start.isoformat(),
+                    **self._daily_list_counts(
+                        category_statuses,
+                        unavailable=category_unavailable,
+                    ),
+                    "error_codes": error_codes,
+                    "retryable_failed_dates": [
+                        record.daily_list_date.isoformat()
+                        for record in records
+                        if record.status.value == "failed"
+                        and coverage_min <= record.daily_list_date <= coverage_max
+                    ],
+                }
+            )
+
+        global_dates = sorted(
+            {
+                day
+                for statuses in category_days.values()
+                for day in statuses
+            }
         )
-        report = self.sync.progress(self._sync_configs(), offline=offline)
-        progress_by_category = {
-            progress.category: progress for progress in report.categories
-        }
+        global_statuses = []
+        global_unavailable = 0
+        for day in global_dates:
+            statuses = [
+                category_days.get(item.category, {}).get(day, "pending")
+                for item in profile.category_coverage
+                if item.coverage_start <= day
+            ]
+            if statuses:
+                global_statuses.append(self._global_daily_list_status(statuses))
+                global_unavailable += self._daily_list_is_unavailable(
+                    statuses, day, coverage_min
+                )
+        connection = self.store._connect()
+        try:
+            resolution_counts = {
+                row[0]: int(row[1])
+                for row in connection.execute(
+                    """SELECT version_resolution, COUNT(*)
+                       FROM canonical_events GROUP BY version_resolution"""
+                )
+            }
+            canonical_count = sum(resolution_counts.values())
+            saved_count = int(
+                connection.execute("SELECT COUNT(*) FROM saved_papers").fetchone()[0]
+            )
+            pdf_count = int(
+                connection.execute("SELECT COUNT(*) FROM download_files").fetchone()[0]
+            )
+        finally:
+            connection.close()
+
+        cache_root = self.candidates.cache.root
+        cache_file_count = 0
+        cache_status = "missing"
+        try:
+            root_info = cache_root.lstat()
+            if stat.S_ISDIR(root_info.st_mode) and not cache_root.is_symlink():
+                for walk_root, directory_names, file_names in os.walk(
+                    cache_root, followlinks=False
+                ):
+                    directory_names[:] = [
+                        name
+                        for name in directory_names
+                        if not (Path(walk_root) / name).is_symlink()
+                    ]
+                    cache_file_count += sum(
+                        (Path(walk_root) / name).is_file()
+                        and not (Path(walk_root) / name).is_symlink()
+                        for name in file_names
+                    )
+                cache_status = "ready" if cache_file_count else "empty"
+        except OSError:
+            pass
         return {
             "revision": profile.revision,
-            "online": not offline,
-            "categories": [
-                self._sync_state_value(
-                    self.store.category_sync_state(category),
-                    progress_by_category[category],
-                )
-                for category in profile.categories
-            ],
-            "pdf_destination": {"kind": profile.pdf_destination.kind},
+            "online": not bool(service_status.get("offline")),
+            "synchronizing": bool(
+                active_sync is not None
+                and active_sync.get("status") == "running"
+            ),
+            "daily_list_retry": service_status.get(
+                "daily_list_retry",
+                {"status": "idle", "completed": 0, "total": 0},
+            ),
+            "coverage_min": coverage_min.isoformat(),
+            "coverage_max": coverage_max.isoformat(),
+            "metadata_sync": {
+                "checkpoint_count": checkpoint_count,
+                "categories": metadata_categories,
+            },
+            "daily_list_coverage": {
+                **self._daily_list_counts(
+                    global_statuses,
+                    unavailable=global_unavailable,
+                ),
+                "categories": coverage_categories,
+            },
+            "version_resolution": {
+                "canonical_event_count": canonical_count,
+                "atom_confirmed": resolution_counts.get("atom_confirmed", 0),
+                "chronology_matched": resolution_counts.get(
+                    "chronology_matched", 0
+                ),
+                "unconfirmed": resolution_counts.get("unconfirmed", 0),
+            },
+            "candidate_cache": {
+                "status": cache_status,
+                "file_count": cache_file_count,
+            },
+            "library": {"saved_paper_count": saved_count},
+            "pdf_presence": {"downloaded_pdf_count": pdf_count},
+            "pdf_destination": {
+                "kind": profile.pdf_destination.kind,
+                "display_path": _destination_display_path(
+                    profile.pdf_destination.path
+                ),
+            },
             "launcher": self._launcher_value(),
+        }
+
+    @staticmethod
+    def _daily_list_is_unavailable(
+        statuses: list[str],
+        day: date,
+        coverage_min: date,
+    ) -> bool:
+        return day < coverage_min and any(
+            status in {"failed", "pending"} for status in statuses
+        )
+
+    @staticmethod
+    def _global_daily_list_status(
+        statuses: list[str],
+    ) -> str:
+        if "failed" in statuses:
+            return "failed"
+        if "pending" in statuses:
+            return "pending"
+        if "complete" in statuses:
+            return "complete"
+        return "empty"
+
+    @staticmethod
+    def _daily_list_counts(
+        statuses: list[str],
+        *,
+        unavailable: int = 0,
+    ) -> dict[str, int]:
+        with_papers = statuses.count("complete")
+        empty = statuses.count("empty")
+        failed = statuses.count("failed")
+        pending = statuses.count("pending")
+        return {
+            "target": with_papers + empty + failed + pending,
+            "checked": with_papers + empty + failed,
+            "with_papers": with_papers,
+            "empty": empty,
+            "failed": failed,
+            "pending": pending,
+            "unavailable": unavailable,
+            "gaps": failed + pending,
         }
 
     def _settings_coverage(self, payload: dict[str, Any]) -> dict[str, Any]:
         from arxiv_digest.models import CategoryConfig
+        from arxiv_digest.profile import (
+            Profile,
+            ProfileCategory,
+            ProfileRevisionError,
+        )
 
-        state = self.sync.extend_coverage(
-            payload["category"], date.fromisoformat(payload["new_start"])
+        current = self.profiles.load()
+        if current is None:
+            raise KeyError("active profile")
+        expected = payload["expected_revision"]
+        if current.revision != expected:
+            raise ProfileRevisionError(expected, current.revision)
+        category = payload["category"]
+        current_coverage = {
+            item.category: item.coverage_start
+            for item in current.category_coverage
+        }
+        if category not in current_coverage:
+            raise ValueError("coverage can only be extended for an active category")
+        new_start = date.fromisoformat(payload["new_start"])
+        coverage_min, coverage_max = self._supported_coverage_bounds()
+        if not coverage_min <= new_start <= coverage_max:
+            raise ValueError("coverage is outside the supported recovery window")
+        if new_start >= current_coverage[category]:
+            raise ValueError("new coverage start must extend existing coverage")
+
+        self.sync.extend_coverage(category, new_start)
+
+        category_coverage = tuple(
+            ProfileCategory(
+                item.category,
+                new_start if item.category == category else item.coverage_start,
+            )
+            for item in current.category_coverage
         )
-        offline = bool(
-            self._last_sync_report is not None
-            and self._last_sync_report.offline
+        configs = tuple(
+            CategoryConfig(
+                item.category,
+                self.store.category_sync_state(item.category).set_spec,
+                item.coverage_start,
+            )
+            for item in category_coverage
         )
-        progress = self.sync.progress(
-            (
-                CategoryConfig(
-                    state.category,
-                    state.set_spec,
-                    state.coverage_start,
-                ),
-            ),
-            offline=offline,
-        ).categories[0]
-        return self._sync_state_value(state, progress)
+        profile = Profile(
+            schema_version=2,
+            revision=expected + 1,
+            category_coverage=category_coverage,
+            keywords=current.keywords,
+            phrases=current.phrases,
+            authors=current.authors,
+            seed_papers=current.seed_papers,
+            pdf_destination=current.pdf_destination,
+        )
+        self.setup.publish_profile(
+            profile,
+            configs,
+            expected_revision=expected,
+        )
+        sync_job = self._start_sync_job({"follow_up": True})
+        return {
+            "revision": profile.revision,
+            "category": category,
+            "coverage_start": new_start.isoformat(),
+            "sync_job_id": sync_job["job_id"],
+        }
 
     def _settings_cache_clear(self, payload: dict[str, Any]) -> dict[str, bool]:
         root = self.candidates.cache.root
@@ -1615,7 +2167,7 @@ class _DefaultRuntime:
     def _settings_folder_under_lease(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        from arxiv_digest.profile import Profile
+        from arxiv_digest.profile import Profile, ProfileCategory
 
         profile = self.profiles.load()
         if profile is None:
@@ -1630,18 +2182,19 @@ class _DefaultRuntime:
         )
         if registered is None or registered[0] is not None:
             raise ValueError("tested destination is missing, stale, or already used")
+        configs = tuple(self._sync_configs())
         revised = Profile(
-            schema_version=1,
+            schema_version=2,
             revision=expected + 1,
-            categories=profile.categories,
+            category_coverage=tuple(
+                ProfileCategory(config.category, config.coverage_start)
+                for config in configs
+            ),
             keywords=profile.keywords,
             phrases=profile.phrases,
             authors=profile.authors,
             seed_papers=profile.seed_papers,
             pdf_destination=registered[1],
-        )
-        configs = tuple(
-            self._sync_configs()
         )
         self.setup.publish_profile(
             revised,
@@ -1855,7 +2408,7 @@ class _DefaultRuntime:
                 record.record_type == record_type
                 for record in inspection.records
             )
-            for record_type in ("saved_paper", "review_event")
+            for record_type in ("saved_paper", "canonical_event")
         }
         return {
             "pending_restore_id": identifier,
@@ -1868,7 +2421,7 @@ class _DefaultRuntime:
             "summary": {
                 "categories": len(inspection.profile.categories),
                 "saved_papers": record_counts["saved_paper"],
-                "review_events": record_counts["review_event"],
+                "review_events": record_counts["canonical_event"],
                 "profile_revision": inspection.profile.revision,
             },
         }
@@ -1896,25 +2449,32 @@ class _DefaultRuntime:
             destination = self.folder.validate(
                 self._resolve_folder_choice(choice_identifier)
             )
-            with self.maintenance.exclusive(
-                cancel_active=payload["cancel_active"],
-                timeout=_BROWSER_RESTORE_WAIT_SECONDS,
-            ):
-                result = restore_backup(
-                    self.paths,
-                    inspection,
-                    destination,
-                    maintenance=None,
-                )
-                # Reopen under the same exclusive lease so migrations,
-                # integrity checks, and interrupted-run reconciliation finish
-                # before any worker can observe the replacement database.
-                validation = open_database(self.paths.database_path)
-                validation.close()
-                self._candidate_build = None
-                self._suggestions.clear()
-                self._suggestion_ids.clear()
-                self._last_sync_report = None
+            # Acquire candidate ownership before making maintenance exclusive.
+            # A start that won this lock must register its cancellable worker
+            # first; a restore that won it replaces state before another start
+            # is allowed to capture a draft.
+            with self._candidate_state_lock:
+                with self.maintenance.exclusive(
+                    cancel_active=payload["cancel_active"],
+                    timeout=_BROWSER_RESTORE_WAIT_SECONDS,
+                ):
+                    result = restore_backup(
+                        self.paths,
+                        inspection,
+                        destination,
+                        maintenance=None,
+                    )
+                    # Reopen under the same exclusive lease so migrations,
+                    # integrity checks, and interrupted-run reconciliation finish
+                    # before any worker can observe the replacement database.
+                    validation = open_database(self.paths.database_path)
+                    validation.close()
+                    self._candidate_build = None
+                    self._candidate_job_id = None
+                    self._candidate_job_revision = None
+                    self._suggestions.clear()
+                    self._suggestion_ids.clear()
+                    self._last_sync_report = None
         except Exception:
             retain_pending = False
             with self._pending_restores_lock:
@@ -1962,6 +2522,7 @@ class _DefaultRuntime:
             "sync_start": self._start_sync_job,
             "sync_cancel": self._cancel_sync,
             "review_summary": lambda payload: self.review.summary(),
+            "review_finish_all": self._review_finish_all,
             "review_calendar": lambda payload: self.review.calendar(
                 date.fromisoformat(payload["start"]),
                 date.fromisoformat(payload["end"]),
@@ -2018,13 +2579,13 @@ class _DefaultRuntime:
         if profile is None:
             return ()
         values = []
-        for category in profile.categories:
-            state = self.store.category_sync_state(category)
+        for profile_category in profile.category_coverage:
+            state = self.store.category_sync_state(profile_category.category)
             values.append(
                 CategoryConfig(
-                    category,
+                    profile_category.category,
                     state.set_spec,
-                    state.coverage_start,
+                    profile_category.coverage_start,
                 )
             )
         return tuple(values)

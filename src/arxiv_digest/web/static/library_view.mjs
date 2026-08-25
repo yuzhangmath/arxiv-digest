@@ -39,7 +39,12 @@ export class LibraryController {
     const result = await this.api.json(
       "library-pdf",
       "/api/v1/library/pdf",
-      jsonRequest({ arxiv_id: arxivId, version, save_first: false }),
+      jsonRequest({
+        arxiv_id: arxivId,
+        version,
+        save_first: false,
+        save_version: null,
+      }),
     );
     assertJobId(result?.job_id);
     this.downloads.set(result.job_id, Object.freeze({ arxivId, version }));
@@ -116,8 +121,15 @@ export function renderLibraryView(document, container, page, actions = {}) {
   input.setAttribute("id", "library-query");
   input.setAttribute("name", "q");
   input.setAttribute("type", "search");
-  input.value = typeof page?.query === "string" ? page.query : "";
+  const query = typeof page?.query === "string" ? page.query : "";
+  input.value = query;
   search.append(
+    element(
+      document,
+      "p",
+      "Leave the search blank to show all saved papers below.",
+      "library-search-guidance",
+    ),
     label,
     input,
     button(document, "Search", () => actions.search?.(input.value)),
@@ -127,7 +139,13 @@ export function renderLibraryView(document, container, page, actions = {}) {
   const list = element(document, "section", undefined, "library-results");
   list.setAttribute("aria-label", "Saved papers");
   if (entries.length === 0) {
-    list.append(element(document, "p", "No saved papers match this search."));
+    list.append(element(
+      document,
+      "p",
+      query.trim()
+        ? "No saved papers match this search."
+        : "No saved papers yet. Save a paper from Review to add it here.",
+    ));
   }
   for (const entry of entries) {
     const metadata = entry?.metadata ?? {};

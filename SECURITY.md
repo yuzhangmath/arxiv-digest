@@ -6,7 +6,7 @@ URLs as sensitive.
 
 ## Supported version
 
-Security fixes target the current `0.1.x` line until a newer public release
+Security fixes target the current `0.2.x` line until a newer public release
 policy is documented.
 
 ## Report a vulnerability privately

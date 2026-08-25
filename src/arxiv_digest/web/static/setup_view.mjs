@@ -1,7 +1,87 @@
+import { renderInlineMathText } from "./math_view.mjs";
+
 function copiedStrings(values) {
   return Array.isArray(values)
     ? values.filter((value) => typeof value === "string").map(String)
     : [];
+}
+
+function reviewSeedPapers(summary) {
+  const details = Array.isArray(summary?.seed_paper_details)
+    ? summary.seed_paper_details
+    : [];
+  const papers = details
+    .map((source) => ({
+      arxivId: String(source?.arxiv_id ?? "").trim(),
+      title: String(source?.title ?? "").trim(),
+    }))
+    .filter((paper) => paper.arxivId !== "");
+  if (papers.length > 0) return papers;
+  return copiedStrings(summary?.seed_papers).map((arxivId) => ({
+    arxivId,
+    title: "",
+  }));
+}
+
+function seedPaperSummaryDetail(document, summary) {
+  const detail = element(document, "dd");
+  const papers = reviewSeedPapers(summary);
+  if (papers.length === 0) {
+    detail.textContent = "None";
+    return detail;
+  }
+  const list = element(document, "ul", undefined, "setup-summary-seed-papers");
+  for (const paper of papers) {
+    const row = element(document, "li", undefined, "setup-summary-seed-paper");
+    row.append(element(document, "span", paper.arxivId, "setup-summary-seed-id"));
+    if (paper.title) {
+      row.append(element(document, "span", "—", "setup-summary-seed-separator"));
+      const title = element(document, "span", undefined, "setup-summary-seed-title");
+      if (globalThis.katex?.render) {
+        renderInlineMathText(title, paper.title, globalThis.katex, document);
+      } else {
+        title.textContent = paper.title;
+      }
+      row.append(title);
+    }
+    list.append(row);
+  }
+  detail.append(list);
+  return detail;
+}
+
+function pdfDestinationSummaryDetail(document, summary) {
+  const kind = String(summary?.pdf_destination_kind ?? "");
+  const projectedPath = typeof summary?.pdf_destination_display_path === "string"
+    ? summary.pdf_destination_display_path.trim()
+    : "";
+  const fallbackPath = kind === "downloads"
+    ? "Downloads / Arxiv Digest"
+    : kind === "documents"
+      ? "Documents / Arxiv Digest"
+      : kind === "custom"
+        ? "Chosen folder"
+        : "No folder selected";
+  const detail = element(document, "dd", undefined, "setup-summary-destination");
+  detail.append(
+    element(
+      document,
+      "code",
+      projectedPath || fallbackPath,
+      "setup-summary-destination-path",
+    ),
+  );
+  if (kind) {
+    detail.append(
+      element(
+        document,
+        "span",
+        "Tested and ready for PDF downloads.",
+        "setup-summary-destination-status",
+      ),
+    );
+  }
+  return detail;
 }
 
 function frozenSnapshot(suggestions, custom) {
@@ -101,8 +181,51 @@ function optionLabel(source) {
   );
 }
 
-function suggestionChecklist(document, kind, options, actions) {
-  const list = element(document, "div", undefined, "suggestion-list");
+function hasOptionalSelections(options, customValues) {
+  return (
+    (Array.isArray(options) && options.some((option) => option?.checked === true)) ||
+    copiedStrings(customValues).some((value) => value.trim() !== "")
+  );
+}
+
+export function categorySetupActionLabel(count) {
+  const total = Number.isInteger(count) && count > 0 ? count : 0;
+  if (total === 0) return "Continue";
+  return `Continue with ${total} selected ${total === 1 ? "category" : "categories"}`;
+}
+
+export function optionalSetupActionLabel(model) {
+  const step = canonicalStep(String(model?.current_step ?? model?.step ?? ""));
+  const acceptedCount = Number(model?.acceptedSelectionCounts?.[step] ?? 0);
+  if (step === "seed_papers") {
+    return acceptedCount > 0 || hasOptionalSelections(model?.paperOptions, model?.customPaperIds)
+      ? "Continue with selected seed papers"
+      : "Continue without seed papers";
+  }
+  if (step === "terms") {
+    const termOptions = [
+      ...(Array.isArray(model?.keywordOptions) ? model.keywordOptions : []),
+      ...(Array.isArray(model?.phraseOptions) ? model.phraseOptions : []),
+    ];
+    return acceptedCount > 0 || hasOptionalSelections(termOptions, model?.customTerms)
+      ? "Continue with selected terms"
+      : "Continue without terms";
+  }
+  if (step === "authors") {
+    return acceptedCount > 0 || hasOptionalSelections(model?.authorOptions, model?.customAuthors)
+      ? "Continue with selected authors"
+      : "Continue without author preferences";
+  }
+  return null;
+}
+
+export function isMathematicsCategory(source) {
+  const category = String(source?.category ?? "");
+  return category === "math" || category.startsWith("math.");
+}
+
+function suggestionChecklist(document, kind, options, actions, target = null) {
+  const list = target ?? element(document, "div", undefined, "suggestion-list");
   for (const source of Array.isArray(options) ? options : []) {
     const stable =
       kind === "categories"
@@ -119,16 +242,82 @@ function suggestionChecklist(document, kind, options, actions) {
     input.addEventListener("change", () =>
       actions.onSuggestion?.(kind, stable, input.checked),
     );
-    row.append(input, document.createTextNode(` ${optionLabel(source)}`));
+    const label = element(document, "span", undefined, "suggestion-label");
+    const labelText = optionLabel(source);
+    if (kind === "categories") {
+      const category = String(source?.category ?? "");
+      label.textContent = category && category !== labelText
+        ? `${labelText} · ${category}`
+        : labelText;
+    } else if (kind === "seed_papers" && globalThis.katex?.render) {
+      renderInlineMathText(label, labelText, globalThis.katex, document);
+    } else {
+      label.textContent = labelText;
+    }
+    row.append(input, label);
     list.append(row);
   }
   return list;
 }
 
-function searchControl(document, kind, actions, labelText = "Search") {
+function categoryChoices(document, model, actions) {
+  const options = Array.isArray(model?.categoryOptions) ? model.categoryOptions : [];
+  const mathematics = options.filter(isMathematicsCategory);
+  const moreCategories = options.filter((option) => !isMathematicsCategory(option));
+  const result = element(document, "div", undefined, "category-groups");
+
+  if (mathematics.length > 0) {
+    const section = element(
+      document,
+      "section",
+      undefined,
+      "category-group category-group-mathematics",
+    );
+    section.append(
+      element(document, "h3", "Mathematics"),
+      suggestionChecklist(document, "categories", mathematics, actions),
+    );
+    result.append(section);
+  }
+  if (moreCategories.length > 0) {
+    const details = element(
+      document,
+      "details",
+      undefined,
+      "category-group category-group-more",
+    );
+    details.open = String(model?.categorySearchQuery ?? "").trim() !== "";
+    details.append(
+      element(document, "summary", "More categories"),
+      suggestionChecklist(document, "categories", moreCategories, actions),
+    );
+    result.append(details);
+  }
+  const query = String(model?.categorySearchQuery ?? "").trim();
+  if (options.length === 0 && query !== "") {
+    result.append(
+      element(
+        document,
+        "p",
+        "No categories match this search. Try a category name or code.",
+        "empty-state",
+      ),
+    );
+  }
+  return result;
+}
+
+function searchControl(
+  document,
+  kind,
+  actions,
+  labelText = "Search",
+  initialValue = "",
+) {
   const group = element(document, "div", undefined, "search-control");
   const { label, input } = inputWithLabel(document, labelText);
   input.setAttribute("autocomplete", "off");
+  input.value = String(initialValue);
   group.append(
     label,
     button(document, "Search", () => actions.onSearch?.(kind, input.value)),
@@ -140,41 +329,45 @@ function customEntries(document, kind, values, actions, labelText) {
   const section = element(document, "section", undefined, "custom-entries");
   section.append(element(document, "h3", labelText));
   for (const [index, value] of copiedStrings(values).entries()) {
+    const row = element(document, "div", undefined, "custom-entry");
     const { label, input } = inputWithLabel(document, `${labelText} ${index + 1}`);
     input.value = value;
     input.addEventListener("input", () =>
       actions.onCustomChange?.(kind, index, input.value),
     );
-    label.append(
-      button(document, "Remove", () => actions.onCustomRemove?.(kind, index)),
+    const remove = button(
+      document,
+      "Remove",
+      () => actions.onCustomRemove?.(kind, index),
     );
-    section.append(label);
+    remove.setAttribute(
+      "aria-label",
+      `Remove ${labelText.toLocaleLowerCase("en-US")} ${index + 1}`,
+    );
+    row.append(label, remove);
+    section.append(row);
   }
-  section.append(button(document, `Add ${labelText.toLowerCase()}`, () => actions.onCustomAdd?.(kind)));
+  const add = button(
+    document,
+    `Add ${labelText.toLocaleLowerCase("en-US")}`,
+    () => actions.onCustomAdd?.(kind),
+  );
+  add.setAttribute("data-custom-add", kind);
+  section.append(add);
   return section;
 }
 
-function destinationRadio(document, labelText, value, selected, actions) {
-  const label = element(document, "label", undefined, "destination-choice");
-  const input = element(document, "input");
-  input.setAttribute("type", "radio");
-  input.setAttribute("name", "pdf-destination");
-  input.value = value;
-  input.checked = selected === value;
-  input.addEventListener("change", () => {
-    if (input.checked) actions.onDestinationChoice?.(value);
-  });
-  const choose = button(document, labelText, () => actions.onDestinationChoice?.(value));
-  label.append(input, choose);
-  return label;
-}
-
 export function renderSetupError(document, container, message, retry) {
-  const notice = element(document, "section", undefined, "error-banner");
+  let notice = container.querySelector(".error-banner");
+  if (!notice) {
+    notice = element(document, "section", undefined, "error-banner");
+    container.append(notice);
+  }
   notice.setAttribute("role", "alert");
-  notice.append(element(document, "p", String(message)));
-  notice.append(button(document, "Retry", retry));
-  container.append(notice);
+  notice.replaceChildren(
+    element(document, "p", String(message)),
+    button(document, "Retry", retry),
+  );
   return notice;
 }
 
@@ -193,26 +386,46 @@ export function renderSetupView(document, container, model, actions = {}) {
   const sourceStep = String(model?.current_step ?? model?.step ?? "categories");
   const step = canonicalStep(sourceStep);
   view.dataset.step = step;
-  view.append(element(document, "h2", step.replaceAll("_", " ")));
+  const heading = step === "categories"
+    ? "Choose categories to monitor"
+    : step.replaceAll("_", " ");
+  view.append(element(document, "h2", heading));
 
   let canContinue = true;
   let continueLabel = "Continue";
   if (step === "categories") {
-    view.append(searchControl(document, "categories", actions, "Search categories"));
     view.append(
-      suggestionChecklist(document, "categories", model?.categoryOptions, actions),
+      element(
+        document,
+        "p",
+        "Choose one or more arXiv categories to monitor. arXiv Digest uses these choices to find new papers. Search by category name or code. You can change them later in Interests.",
+        "step-guidance",
+      ),
+      searchControl(
+        document,
+        "categories",
+        actions,
+        "Search by category name or code",
+        model?.categorySearchQuery,
+      ),
+      categoryChoices(document, model, actions),
     );
-    const selected = Array.isArray(model?.categorySelections)
-      ? model.categorySelections
-      : Array.isArray(model?.categories)
-        ? model.categories
-        : [];
-    canContinue = selected.length > 0;
+    const selectedCount = Number(model?.categorySelectionCount ?? 0);
+    canContinue = selectedCount > 0;
+    continueLabel = categorySetupActionLabel(selectedCount);
+    const requirement = element(
+      document,
+      "p",
+      "Select at least one category to continue.",
+      "required-guidance",
+    );
+    requirement.hidden = canContinue;
+    view.append(requirement);
   } else if (step === "coverage") {
     const note = element(
       document,
       "p",
-      "The recommended initial history is 30 days. Older history may take longer and can be resumed.",
+      "The chosen start controls confirmed historical daily lists in Review and Calendar. Choose a date within the recoverable window shown by this picker.",
     );
     view.append(note);
     const recommended = String(model?.recommendedCoverageStart ?? "");
@@ -223,35 +436,69 @@ export function renderSetupView(document, container, model, actions = {}) {
     );
     const { label, input } = inputWithLabel(document, "Coverage start", "date");
     input.value = String(model?.coverageStart ?? model?.coverage_start ?? recommended);
+    const coverageMin = String(model?.coverageMin ?? model?.coverage_min ?? "");
+    const coverageMax = String(model?.coverageMax ?? model?.coverage_max ?? "");
+    if (coverageMin) input.setAttribute("min", coverageMin);
+    if (coverageMax) input.setAttribute("max", coverageMax);
     input.addEventListener("change", () => actions.onCoverageChange?.(input.value));
     view.append(label);
-    if (model?.coverageWarning || (recommended && input.value && input.value < recommended)) {
-      const warning = element(
-        document,
-        "p",
-        String(
-          model?.coverageWarning ??
-            "Older results use inferred metadata/version dates and may include bulk-update dates.",
-        ),
-        "warning",
-      );
-      warning.setAttribute("role", "note");
-      view.append(warning);
-    }
-    canContinue = Boolean(input.value);
+    canContinue = Boolean(
+      input.value &&
+      (!coverageMin || input.value >= coverageMin) &&
+      (!coverageMax || input.value <= coverageMax),
+    );
   } else if (step === "corpus") {
     const job = model?.corpusJob ?? {};
+    const working = job.status === "starting" || job.status === "running";
+    const workingMessage = job.status === "starting"
+      ? "Starting corpus generation… This can take up to five minutes."
+      : "Generating corpus… This can take up to five minutes.";
+    const defaultMessage = working
+      ? workingMessage
+      : job.failed
+        ? "Corpus generation did not complete."
+        : job.complete && job.corpus_complete === true
+          ? "Corpus ready."
+          : job.complete && job.minimum_met === true
+            ? job.can_resume
+              ? "This corpus pass finished. The required minimum is ready; resume for broader coverage or accept reduced breadth."
+              : "This corpus pass finished. The required minimum is ready; accept reduced breadth to continue or restart generation."
+            : job.complete
+              ? job.can_resume
+                ? "This corpus pass finished, but more papers are needed."
+                : "This corpus pass finished, but more papers are needed. Restart generation to try again."
+          : "arXiv Digest will gather a bounded sample of recent papers from your selected categories. It uses this sample to suggest seed papers, terms, and authors in the next steps. Candidate papers do not populate Review, Calendar, or Library.";
     const progress = element(
       document,
       "p",
-      String(job.message ?? "Build a bounded local candidate corpus from the selected categories."),
+      String(job.message ?? defaultMessage),
     );
-    progress.setAttribute("role", "status");
-    progress.setAttribute("aria-live", "polite");
+    if (job.failed) progress.setAttribute("role", "alert");
     view.append(progress);
-    if (!job.complete) {
+    if (working) {
+      view.setAttribute("aria-busy", "true");
+      if (job.message) {
+        view.append(
+          element(
+            document,
+            "p",
+            workingMessage,
+            "working-detail",
+          ),
+        );
+      }
+      const activity = element(document, "progress", undefined, "corpus-progress");
+      activity.setAttribute("aria-label", "Corpus generation in progress");
+      view.append(activity);
+      canContinue = false;
+    } else if (!job.complete) {
+      const startLabel = job.can_resume
+        ? "Resume corpus"
+        : job.failed
+          ? "Retry corpus"
+          : "Generate corpus";
       view.append(
-        button(document, job.can_resume ? "Resume corpus" : "Generate corpus", () =>
+        button(document, startLabel, () =>
           actions.onCorpus?.(job.can_resume ? "resume" : "restart"),
         ),
       );
@@ -262,18 +509,21 @@ export function renderSetupView(document, container, model, actions = {}) {
     } else {
       if (job.corpus_complete === true) {
         canContinue = typeof job.corpus_hash === "string";
+        continueLabel = "Use this corpus and continue";
       } else {
         canContinue = false;
         if (job.can_resume) {
-          view.append(button(document, "Resume", () => actions.onCorpus?.("resume")));
+          view.append(button(document, "Resume corpus", () => actions.onCorpus?.("resume")));
         }
-        view.append(button(document, "Retry", () => actions.onCorpus?.("restart")));
+        view.append(button(document, "Restart corpus", () => actions.onCorpus?.("restart")));
         if (!job.minimum_met) {
           view.append(
             element(
               document,
               "p",
-              "The candidate corpus is below the required minimum. Resume or retry generation before continuing.",
+              job.can_resume
+                ? "The candidate corpus is below the required minimum. Resume or restart generation before continuing."
+                : "The candidate corpus is below the required minimum. Restart generation before continuing.",
               "warning",
             ),
           );
@@ -282,7 +532,9 @@ export function renderSetupView(document, container, model, actions = {}) {
             element(
               document,
               "p",
-              "The required minimum is available. You can resume for broader suggestions or explicitly accept this reduced breadth.",
+              job.can_resume
+                ? "The required minimum is available. You can resume for broader suggestions or explicitly accept this reduced breadth."
+                : "The required minimum is available. Explicitly accept this reduced breadth to continue, or restart generation.",
               "warning",
             ),
           );
@@ -295,39 +547,119 @@ export function renderSetupView(document, container, model, actions = {}) {
       }
     }
   } else if (step === "seed_papers") {
-    view.append(searchControl(document, "seed_papers", actions, "Search by title or author"));
+    view.append(
+      element(
+        document,
+        "p",
+        "Choose papers that represent what you want to read. arXiv Digest uses selected seed papers to boost textually similar papers in future reviews and tailor the term and author suggestions that follow. This step is optional. Selecting a seed paper does not populate Review, Calendar, or Library; it does not save the paper or download its PDF. You can add or change these later in Interests.",
+        "step-guidance",
+      ),
+    );
+    view.append(
+      searchControl(
+        document,
+        "seed_papers",
+        actions,
+        "Search by title, author, or arXiv ID",
+      ),
+    );
     view.append(suggestionChecklist(document, "seed_papers", model?.paperOptions, actions));
     view.append(customEntries(document, "paper_ids", model?.customPaperIds, actions, "Custom paper ID"));
+    continueLabel = optionalSetupActionLabel(model);
   } else if (step === "terms") {
-    view.append(element(document, "h3", "Suggested keywords"));
-    view.append(suggestionChecklist(document, "keywords", model?.keywordOptions, actions));
-    view.append(customEntries(document, "keywords", model?.customKeywords, actions, "Custom keyword"));
-    view.append(element(document, "h3", "Suggested phrases"));
-    view.append(suggestionChecklist(document, "phrases", model?.phraseOptions, actions));
-    view.append(customEntries(document, "phrases", model?.customPhrases, actions, "Custom phrase"));
+    view.append(
+      element(
+        document,
+        "p",
+        "Optional. Choose or add terms that describe work you want to prioritize. You can change them later in Interests.",
+        "step-guidance",
+      ),
+    );
+    view.append(element(document, "h3", "Suggested terms"));
+    const termSuggestions = suggestionChecklist(
+      document,
+      "keywords",
+      model?.keywordOptions,
+      actions,
+    );
+    suggestionChecklist(
+      document,
+      "phrases",
+      model?.phraseOptions,
+      actions,
+      termSuggestions,
+    );
+    view.append(termSuggestions);
+    view.append(customEntries(document, "terms", model?.customTerms, actions, "Custom term"));
+    continueLabel = optionalSetupActionLabel(model);
   } else if (step === "authors") {
+    view.append(
+      element(
+        document,
+        "p",
+        "Optional. Choose authors whose work you want to prioritize. You can add or change these later in Interests.",
+        "step-guidance",
+      ),
+    );
     view.append(searchControl(document, "authors", actions, "Search authors"));
     view.append(suggestionChecklist(document, "authors", model?.authorOptions, actions));
     view.append(customEntries(document, "authors", model?.customAuthors, actions, "Custom author"));
+    continueLabel = optionalSetupActionLabel(model);
   } else if (step === "pdf_destination") {
-    const selected = String(model?.destinationChoice ?? "downloads");
+    const selected = String(model?.destinationChoice ?? "");
+    const hasSelectedFolder = /^picker_[A-Za-z0-9_-]{8,120}$/.test(selected);
+    const selectedFolderName = String(model?.destinationDisplayName ?? "").trim();
+    view.append(
+      element(
+        document,
+        "p",
+        "Choose the folder where arXiv Digest will place paper PDFs if you download them. Setup will not download any PDFs. After choosing a folder, test it to confirm the app can create and remove files there.",
+        "step-guidance",
+      ),
+    );
     const choices = element(document, "div", undefined, "destination-choices");
     choices.append(
-      destinationRadio(document, "Use Downloads", "downloads", selected, actions),
-      destinationRadio(document, "Use Documents", "documents", selected, actions),
-      button(document, "Choose another folder", () => actions.onPickDestination?.()),
+      button(
+        document,
+        hasSelectedFolder ? "Choose another folder" : "Choose PDF folder",
+        () => actions.onPickDestination?.(),
+      ),
     );
     view.append(choices);
+    if (hasSelectedFolder) {
+      view.append(
+        element(
+          document,
+          "p",
+          selectedFolderName
+            ? `Selected folder: ${selectedFolderName}`
+            : "A folder has been selected.",
+          "selected-destination",
+        ),
+      );
+    }
     const pickerMessages = {
-      cancelled: "Folder selection was cancelled; the previous destination is unchanged.",
-      unwritable: "The selected folder is unwritable; the previous destination is unchanged.",
-      unavailable: "The native folder picker is unavailable. Use Downloads or Documents.",
-      tested: "The selected destination is writable.",
+      cancelled: hasSelectedFolder
+        ? "Folder selection was cancelled; the previously selected folder is unchanged."
+        : "Folder selection was cancelled; no folder was selected.",
+      unwritable: "The folder could not be used. Choose a folder and try again.",
+      unavailable: "The native folder picker is unavailable on this system. You can use an app-managed fallback folder instead.",
+      tested: "The selected folder is writable. The temporary test file was removed.",
     };
     if (pickerMessages[model?.pickerState]) {
       view.append(element(document, "p", pickerMessages[model.pickerState], "picker-status"));
     }
-    if (!model?.testedDestinationToken) {
+    if (model?.pickerState === "unavailable") {
+      const fallbacks = element(document, "div", undefined, "destination-fallbacks");
+      fallbacks.append(
+        button(document, "Test and use Downloads fallback", () =>
+          actions.onTestDestination?.("downloads")),
+        button(document, "Test and use Documents fallback", () =>
+          actions.onTestDestination?.("documents")),
+      );
+      view.append(fallbacks);
+    }
+    if (hasSelectedFolder && !model?.testedDestinationToken) {
       view.append(
         button(document, "Test selected destination", () =>
           actions.onTestDestination?.(selected),
@@ -337,22 +669,33 @@ export function renderSetupView(document, container, model, actions = {}) {
     canContinue = typeof model?.testedDestinationToken === "string";
   } else if (step === "review") {
     const summary = model?.profileSummary ?? model?.review_summary ?? {};
+    const terms = [
+      ...copiedStrings(summary.keywords),
+      ...copiedStrings(summary.phrases),
+    ];
+    const categories = copiedStrings(summary.categories);
+    const authors = copiedStrings(summary.authors);
+    const coverageStart = typeof summary.coverage_start === "string"
+      ? summary.coverage_start
+      : "";
     const list = element(document, "dl", undefined, "setup-summary");
-    for (const [label, value] of [
-      ["Categories", summary.categories],
-      ["Seed papers", summary.seed_papers],
-      ["Keywords", summary.keywords],
-      ["Phrases", summary.phrases],
-      ["Authors", summary.authors],
-      ["PDF destination", summary.pdf_destination_kind],
-    ]) {
-      list.append(
-        element(document, "dt", label),
-        element(document, "dd", Array.isArray(value) ? value.join(", ") : String(value ?? "None")),
-      );
-    }
+    list.append(
+      element(document, "dt", "Categories"),
+      element(document, "dd", categories.length > 0 ? categories.join(", ") : "None"),
+      element(document, "dt", "Initial review history"),
+      element(document, "dd", coverageStart ? `Starts ${coverageStart}` : "Not set"),
+      element(document, "dt", "Seed papers"),
+      seedPaperSummaryDetail(document, summary),
+      element(document, "dt", "Terms"),
+      element(document, "dd", terms.length > 0 ? terms.join(", ") : "None"),
+      element(document, "dt", "Authors"),
+      element(document, "dd", authors.length > 0 ? authors.join(", ") : "None"),
+      element(document, "dt", "PDF download folder"),
+      pdfDestinationSummaryDetail(document, summary),
+    );
     view.append(list);
     canContinue = typeof model?.profileSummarySha256 === "string";
+    continueLabel = "Confirm profile and continue";
   } else if (step === "launcher") {
     view.append(
       element(
@@ -368,6 +711,7 @@ export function renderSetupView(document, container, model, actions = {}) {
     );
     view.append(choices);
     canContinue = model?.launcherChoice === "create" || model?.launcherChoice === "not_now";
+    continueLabel = "Finish setup";
   }
 
   const continueButton = button(document, continueLabel, () => {
@@ -375,6 +719,7 @@ export function renderSetupView(document, container, model, actions = {}) {
     else actions.onSubmit?.(step);
     actions.onContinue?.();
   });
+  continueButton.dataset.setupContinue = "";
   continueButton.disabled = !canContinue;
   view.append(continueButton);
   container.append(view);

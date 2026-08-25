@@ -19,6 +19,7 @@ from arxiv_digest.storage.store import DownloadFileRecord, Store
 
 _RESERVED_FILENAME_CHARACTERS = re.compile(r'[/\\:*?"<>|\x00-\x1f\x7f]')
 _MAX_FILENAME_BYTES = 180
+_SAVE_DOWNLOAD_VERSION = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +167,7 @@ class DownloadManager:
         version: int,
         *,
         save_first: bool = False,
+        save_version: int | None | object = _SAVE_DOWNLOAD_VERSION,
         cancelled: Callable[[], bool] | None = None,
     ) -> DownloadResult:
         def check_cancelled() -> None:
@@ -176,7 +178,14 @@ class DownloadManager:
         metadata = self.store.article_metadata(arxiv_id)
         self.store.article_version(arxiv_id, version)
         if save_first:
-            self.store.save_paper(metadata.arxiv_id, version)
+            version_to_save = (
+                version
+                if save_version is _SAVE_DOWNLOAD_VERSION
+                else save_version
+            )
+            if version_to_save is not None and type(version_to_save) is not int:
+                raise TypeError("save_version must be an integer or null")
+            self.store.save_paper(metadata.arxiv_id, version_to_save)
         profile = self.profiles.load()
         if profile is None:
             raise DownloadError("an active profile is required for PDF downloads")

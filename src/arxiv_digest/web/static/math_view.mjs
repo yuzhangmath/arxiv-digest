@@ -1,5 +1,10 @@
 const MAX_SOURCE_CHARS = 200_000;
 const MAX_MATH_CHARS = 10_000;
+const MATH_DELIMITERS = Object.freeze([
+  Object.freeze({ open: "$$", close: "$$", display: true }),
+  Object.freeze({ open: "\\(", close: "\\)", display: false }),
+  Object.freeze({ open: "$", close: "$", display: false }),
+]);
 
 function isEscaped(source, index) {
   let slashes = 0;
@@ -11,23 +16,22 @@ function isEscaped(source, index) {
 
 function nextDelimiter(source, start) {
   for (let index = start; index < source.length; index++) {
-    if (source[index] !== "$" || isEscaped(source, index)) continue;
-    return {
-      index,
-      delimiter: source[index + 1] === "$" ? "$$" : "$",
-    };
+    const delimiter = MATH_DELIMITERS.find(({ open }) =>
+      source.startsWith(open, index)
+    );
+    if (delimiter && !isEscaped(source, index)) {
+      return { index, ...delimiter };
+    }
   }
   return null;
 }
 
 function closingDelimiter(source, start, delimiter) {
   for (let index = start; index < source.length; index++) {
-    if (source[index] !== "$" || isEscaped(source, index)) continue;
-    if (delimiter === "$$") {
-      if (source[index + 1] === "$") return index;
-      continue;
-    }
-    return index;
+    if (
+      source.startsWith(delimiter.close, index) &&
+      !isEscaped(source, index)
+    ) return index;
   }
   return -1;
 }
@@ -52,19 +56,19 @@ export function splitMathSegments(source) {
       break;
     }
     appendText(segments, source.slice(cursor, opener.index));
-    const contentStart = opener.index + opener.delimiter.length;
-    const close = closingDelimiter(source, contentStart, opener.delimiter);
+    const contentStart = opener.index + opener.open.length;
+    const close = closingDelimiter(source, contentStart, opener);
     if (close < 0) {
       appendText(segments, source.slice(opener.index));
       break;
     }
-    const end = close + opener.delimiter.length;
+    const end = close + opener.close.length;
     const value = source.slice(contentStart, close);
     segments.push({
       kind: "math",
       value,
       raw: source.slice(opener.index, end),
-      display: opener.delimiter === "$$",
+      display: opener.display,
     });
     cursor = end;
   }
@@ -72,11 +76,12 @@ export function splitMathSegments(source) {
   return segments;
 }
 
-export function renderMathText(
+function renderMathSegments(
   container,
   source,
   katex,
-  documentImpl = globalThis.document,
+  documentImpl,
+  inlineOnly,
 ) {
   if (!container?.replaceChildren || !documentImpl?.createElement) {
     throw new TypeError("A DOM container and document are required");
@@ -90,7 +95,8 @@ export function renderMathText(
       container.append(documentImpl.createTextNode(segment.value));
       continue;
     }
-    const output = documentImpl.createElement(segment.display ? "div" : "span");
+    const displayMode = segment.display && !inlineOnly;
+    const output = documentImpl.createElement(displayMode ? "div" : "span");
     if (segment.value.length > MAX_MATH_CHARS) {
       output.textContent = segment.raw;
       container.append(output);
@@ -98,7 +104,7 @@ export function renderMathText(
     }
     try {
       katex.render(segment.value, output, {
-        displayMode: segment.display,
+        displayMode,
         throwOnError: true,
         trust: false,
         strict: "error",
@@ -111,6 +117,24 @@ export function renderMathText(
     }
     container.append(output);
   }
+}
+
+export function renderMathText(
+  container,
+  source,
+  katex,
+  documentImpl = globalThis.document,
+) {
+  renderMathSegments(container, source, katex, documentImpl, false);
+}
+
+export function renderInlineMathText(
+  container,
+  source,
+  katex,
+  documentImpl = globalThis.document,
+) {
+  renderMathSegments(container, source, katex, documentImpl, true);
 }
 
 export const MATH_RENDER_LIMITS = Object.freeze({

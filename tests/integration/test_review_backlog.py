@@ -6,15 +6,15 @@ from pathlib import Path
 
 from arxiv_digest.models import (
     AnnounceType,
-    Confidence,
-    DateBasis,
-    EventCandidate,
-    EventEvidence,
+    CatchupDay,
+    CatchupEntry,
+    CatchupPage,
+    EnrichmentStatus,
     EvidenceSource,
     PaperMetadata,
-    PaperVersion,
+    SourceObservation,
 )
-from arxiv_digest.profile import PdfDestination, Profile
+from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
 from arxiv_digest.review import ReviewService
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import Store
@@ -28,40 +28,68 @@ class Profiles:
         return self.value
 
 
-def _populate(store: Store, number: int, day: date) -> int:
-    arxiv_id = f"2608.{number:05d}"
-    metadata = PaperMetadata(
-        arxiv_id=arxiv_id,
-        title=f"Backlog fixture {number}",
-        authors=(f"Synthetic Author {number % 11}",),
-        abstract="A deterministic paper in the two-hundred-card backlog.",
-        primary_category="cs.SE",
-        categories=("cs.SE",),
+def _populate_day(store: Store, numbers: range, day: date) -> set[int]:
+    metadata = tuple(
+        PaperMetadata(
+            arxiv_id=f"2608.{number:05d}",
+            title=f"Backlog fixture {number}",
+            authors=(f"Synthetic Author {number % 11}",),
+            abstract="A deterministic paper in the two-hundred-card backlog.",
+            primary_category="cs.SE",
+            categories=("cs.SE",),
+        )
+        for number in numbers
     )
-    version = PaperVersion(
-        1, datetime(2026, 8, (number % 28) + 1, tzinfo=timezone.utc)
+    entries = tuple(
+        CatchupEntry(
+            metadata=paper,
+            section=AnnounceType.NEW,
+            mailing_date=day,
+            position=index,
+        )
+        for index, paper in enumerate(metadata)
     )
-    evidence = EventEvidence(
-        source_key=f"atom:cs.SE:{day}:{arxiv_id}:v1:new",
-        source=EvidenceSource.ATOM,
-        confidence=Confidence.CURRENT,
+    observations = tuple(
+        SourceObservation(
+            source_key=f"catchup:cs.SE:{day}:{paper.arxiv_id}:{index}",
+            arxiv_id=paper.arxiv_id,
+            source=EvidenceSource.CATCHUP,
+            category="cs.SE",
+            announce_type=AnnounceType.NEW,
+            daily_list_date=day,
+            announced_version=None,
+            list_position=index,
+            oai_datestamp=None,
+            response_sha256="a" * 64,
+            observed_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        )
+        for index, paper in enumerate(metadata)
+    )
+    result = CatchupDay(
         category="cs.SE",
-        announce_type=AnnounceType.NEW,
         mailing_date=day,
-        announced_version=1,
-        list_position=number,
-        oai_datestamp=None,
-        raw_sha256=f"{number % 16:x}" * 64,
-        observed_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        status=EnrichmentStatus.COMPLETE,
+        pages=(
+            CatchupPage(
+                category="cs.SE",
+                mailing_date=day,
+                page=1,
+                total_pages=1,
+                entries=entries,
+                raw_sha256="a" * 64,
+            ),
+        ),
+        error_code=None,
+        error_message=None,
     )
-    candidate = EventCandidate(
-        arxiv_id,
-        1,
-        day,
-        DateBasis.FEED_MAILING,
-        evidence,
-    )
-    return store.apply_event_batch(metadata, (version,), (candidate,))[0].event_id
+    return {
+        event.event_id
+        for event in store.apply_catchup_day(
+            result,
+            observations,
+            datetime(2026, 8, 22, tzinfo=timezone.utc),
+        )
+    }
 
 
 def _walk_date(
@@ -86,10 +114,13 @@ def test_two_hundred_papers_remain_reachable_across_review_navigation(
     database_path = tmp_path / "state.sqlite3"
     open_database(database_path).close()
     store = Store(database_path)
+    store.ensure_category_state("cs.SE", "cs:SE", date(2026, 7, 1))
     profile = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=1,
-        categories=("cs.SE",),
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 7, 1)),
+        ),
         keywords=(),
         phrases=(),
         authors=(),
@@ -105,7 +136,7 @@ def test_two_hundred_papers_remain_reachable_across_review_navigation(
     )
     expected: dict[date, set[int]] = {}
     for day, numbers in allocation:
-        expected[day] = {_populate(store, number, day) for number in numbers}
+        expected[day] = _populate_day(store, numbers, day)
 
     summary = service.summary()
     assert summary.unreviewed_dates == 3
@@ -119,6 +150,8 @@ def test_two_hundred_papers_remain_reachable_across_review_navigation(
         first.day,
         snapshot_revision=first.snapshot_revision,
         anchor_event_id=next_anchor,
+        profile_revision=first.profile_revision,
+        projection_revision=first.projection_revision,
     )
     reopened = ReviewService(store, profiles).open_date(first.day)
     assert reopened.anchor_event_id == next_anchor
@@ -130,6 +163,8 @@ def test_two_hundred_papers_remain_reachable_across_review_navigation(
     service.finish_date(
         date(2026, 7, 30),
         through_revision=first_revision,
+        profile_revision=first.profile_revision,
+        projection_revision=first.projection_revision,
         finished_at=datetime(2026, 8, 22, 13, tzinfo=timezone.utc),
     )
     assert service.next_unreviewed().day == date(2026, 8, 3)
@@ -144,6 +179,8 @@ def test_two_hundred_papers_remain_reachable_across_review_navigation(
     service.finish_date(
         date(2026, 8, 3),
         through_revision=middle_revision,
+        profile_revision=jumped.profile_revision,
+        projection_revision=jumped.projection_revision,
         finished_at=datetime(2026, 8, 22, 14, tzinfo=timezone.utc),
     )
     reached_last, last_revision = _walk_date(
@@ -153,6 +190,8 @@ def test_two_hundred_papers_remain_reachable_across_review_navigation(
     service.finish_date(
         date(2026, 8, 7),
         through_revision=last_revision,
+        profile_revision=jumped.profile_revision,
+        projection_revision=jumped.projection_revision,
         finished_at=datetime(2026, 8, 22, 15, tzinfo=timezone.utc),
     )
 

@@ -30,8 +30,8 @@ node --test tests/js/*.test.mjs
 .venv/bin/python -m pytest tests/browser -q
 .venv/bin/python -m pytest tests/integration/test_package_contents.py -q
 .venv/bin/python scripts/privacy_scan.py tree . --expected-remote-from-project
-.venv/bin/python scripts/privacy_scan.py archive dist/arxiv_digest-0.1.0.tar.gz
-.venv/bin/python scripts/privacy_scan.py archive dist/arxiv_digest-0.1.0-py3-none-any.whl
+.venv/bin/python scripts/privacy_scan.py archive dist/arxiv_digest-0.2.0.tar.gz
+.venv/bin/python scripts/privacy_scan.py archive dist/arxiv_digest-0.2.0-py3-none-any.whl
 ```
 
 The tree command above assumes that the checkout's sole `origin` is the

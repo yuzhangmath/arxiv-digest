@@ -30,17 +30,7 @@
           <raw:title>
             Phase Gardens Across Imaginary Orbits
           </raw:title>
-          <raw:authors>
-            <raw:author>
-              <raw:keyname>Quasar</raw:keyname>
-              <raw:forenames>Iona</raw:forenames>
-            </raw:author>
-            <raw:author>
-              <raw:keyname>Ember</raw:keyname>
-              <raw:forenames>Sol</raw:forenames>
-              <raw:suffix>III</raw:suffix>
-            </raw:author>
-          </raw:authors>
+          <raw:authors>Iona Quasar, Sol Ember III</raw:authors>
           <raw:categories>synthetic.orbital synthetic.quantum</raw:categories>
           <raw:comments>Eleven fictional pages</raw:comments>
           <raw:journal-ref>Journal of Imaginary Dynamics 1 (2026)</raw:journal-ref>

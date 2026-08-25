@@ -8,13 +8,14 @@ Already have Python 3.11+, Git, and `pipx`? Open a terminal and run these
 commands one at a time:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.1.0
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.0
 arxiv-digest init
 ```
 
 ## Contents
 
 - [What it does](#what-it-does)
+- [How ranking works](#how-ranking-works)
 - [Requirements](#requirements)
 - [Install](#install)
 - [Set up your first digest](#set-up-your-first-digest)
@@ -30,17 +31,38 @@ arxiv-digest init
 
 arXiv Digest retrieves paper metadata for the categories you choose, builds a
 review queue using interests you explicitly select, and explains why each
-paper was ranked. You can review papers by announcement date, save papers to a
-local library, and optionally download PDFs to a folder you choose.
+paper was ranked. Review and Calendar show a paper only after the app has
+recovered its daily-list membership for that category and date. You can save
+papers to a local library and optionally download PDFs to a folder you choose.
 
 The application does not run a scheduled or background service. It runs only
 while you have started it from a terminal or the optional desktop launcher.
+
+## How ranking works
+
+Papers are ranked locally and deterministically, separately for each arXiv
+announcement date. Interest matches ignore case and punctuation but otherwise
+require whole terms. The app first groups every paper into **Top**, **Possible**,
+or **Other**. **Top** contains papers with an exact selected-author match, a
+selected phrase in the title, or two distinct selected term or author matches.
+One other selected term match puts a paper in **Possible**. A selected category
+adds only a small baseline score and does not change the group by itself.
+
+The app also compares title-and-abstract text with selected seed papers and
+papers saved in the local Library using TF-IDF similarity. Strong similarity
+to a seed paper can promote a paper to **Top**; similarity to a seed or saved
+paper can promote it to **Possible**. Within each group, papers are ordered by
+a fixed weighted score: authors and title matches carry more weight than
+abstract matches, and seed-paper similarity carries more weight than
+saved-paper similarity. Ties use arXiv mailing order when known, then stable
+paper identifiers. No paper is discarded for a low rank; expand **Why this
+ranking** on a card to see the signals that contributed.
 
 ## Requirements
 
 You need:
 
-- macOS or Linux; Windows is not supported in version 0.1
+- macOS or Linux; Windows is not supported in version 0.2.0
 - Python 3.11 or newer
 - Git
 - a current `pipx`
@@ -117,7 +139,7 @@ pipx --version
 In that terminal, install from the public HTTPS repository:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.1.0
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.0
 ```
 
 When installation finishes, verify that the installed command works:
@@ -126,7 +148,7 @@ When installation finishes, verify that the installed command works:
 arxiv-digest doctor
 ```
 
-On a fresh installation, `doctor` should report version `0.1.0`, a missing
+On a fresh installation, `doctor` should report version `0.2.0`, a missing
 profile and database, and `arxiv-digest init` as the next step. If your shell
 cannot find `arxiv-digest`, open a new terminal after `pipx ensurepath` and try
 again.
@@ -144,18 +166,27 @@ Keep the terminal process running while you use the dashboard. Setup guides
 you through these choices:
 
 1. Choose one or more arXiv categories.
-2. Choose the initial history range. The recommended starting point is 30 days.
+2. Choose the start of confirmed historical daily-list coverage. The
+   recommended starting point is 30 days ago.
 3. Let the app build a bounded 90-day candidate sample from live arXiv data.
    This requires internet access. Each candidate-building attempt is capped at
    five minutes; if more data is needed or the connection is interrupted, the
-   dashboard offers **Resume** or **Retry**.
-4. Review candidate papers and choose seed papers, keywords, phrases, and
-   authors. Only checked suggestions and entries you explicitly type become
+   dashboard offers **Resume corpus** or **Restart corpus**.
+4. Review candidate papers and optionally choose seed papers, terms, and
+   authors. The **Terms** step presents multiword **Suggested terms** and one
+   **Custom term** control. A one-word custom term is saved as a keyword; a
+   custom term of 2–12 words is saved as a phrase. Setup and Interests present
+   both together as terms while preserving that classification. Only
+   checked suggestions and nonblank entries you explicitly type become
    interests; searching, navigating, and paging do not select anything.
 5. Choose and test a PDF folder.
-6. Choose whether to create the optional desktop launcher. **Not now** is a
+6. Review the summary and confirm the profile.
+7. Choose whether to create the optional desktop launcher. **Not now** is a
    complete and supported choice.
-7. Review the summary and confirm the profile.
+
+The candidate corpus does not populate Review, Calendar, or Library. Selecting
+a seed paper affects ranking preferences but does not save it. A paper enters
+Library only when you explicitly save it.
 
 Downloaded PDFs stay in the selected folder and are not included in portable
 backups.
@@ -166,7 +197,7 @@ After you confirm setup, the app opens Review and starts synchronization. Wait
 for papers to appear, then use the still-open dashboard for a practical smoke
 test:
 
-1. Read **Why this ranking** on a paper card and check that it matches your
+1. Open **Why this ranking** on a paper card and check that it matches your
    selected interests.
 2. Save one paper to the Library.
 3. Download one PDF and confirm that it appears in your chosen folder.
@@ -196,10 +227,17 @@ at most 20 paper cards; date navigation and paging do not change your
 interests. Use **Finish date** explicitly when you are done with a date, and
 use **Quit** when you want to stop the local application.
 
-Cards label date evidence as **current**, **recovered**, or **inferred**.
-Current and recovered dates come from exact announcement evidence. Inferred
-dates are a best reconstruction from durable metadata and may not equal the
-original mailing date.
+Review and Calendar require recovered daily-list membership. The app uses Atom
+and OAI as hidden support for current metadata and version resolution; neither
+source creates a visible review date by itself. If daily-list recovery fails,
+the affected category and date remain a visible coverage gap in Settings and
+their papers stay out of Review and Calendar until recovery succeeds. Coverage
+progress distinguishes checked dates with papers, confirmed empty dates,
+pending dates, retryable failures, and dates that are no longer available.
+
+Library is independent of the active Review and Calendar categories. Saving a
+paper does not create daily-list membership, and removing a category does not
+remove saved papers or separately downloaded PDFs.
 
 ## Useful commands
 
@@ -227,6 +265,10 @@ loopback interface. Paper metadata, interests, review progress, and the library
 remain in the platform data directories described in
 [Data and backup](docs/data-and-backup.md).
 
+This release uses application-data generation 2, profile schema 2, and
+portable backup format 2. Earlier databases, profiles, and portable backups
+are rejected without modification; they are not converted or imported.
+
 `arxiv-digest doctor` prints aggregate, redacted diagnostics. You can share
 that output when asking for troubleshooting help, but do not share your
 database, profile, backup, downloaded PDFs, or a dashboard URL containing a
@@ -234,19 +276,14 @@ session token.
 
 ## Maintenance and troubleshooting
 
-Quit the dashboard before upgrading. Then open a terminal and export a backup.
-Only run the upgrade command after the export finishes successfully:
+Generation-2 backups contain interests and Library state, so keep them
+private. Export refuses to overwrite an existing file. Cache deletion is safe:
+it does not erase the profile, synchronization checkpoints, review progress,
+or saved Library. Moving from an earlier data generation requires the documented
+**Clean reset with recovery copy**; do not import the old database, profile, or
+backup into generation 2.
 
-```bash
-arxiv-digest export arxiv-digest-backup.zip
-pipx install --force git+https://github.com/yuzhangmath/arxiv-digest.git@v0.1.0
-```
-
-Export refuses to overwrite an existing file. Backups contain interests and
-library state, so keep them private. Cache deletion is safe: it does not erase
-the profile, synchronization checkpoints, review progress, or saved library.
-
-See [Installation](docs/installation.md) for upgrades and uninstalling, and
+See [Installation](docs/installation.md) for clean resets and uninstalling, and
 [Troubleshooting](docs/troubleshooting.md) for dashboard, synchronization,
 PDF, launcher, backup, and recovery guidance.
 

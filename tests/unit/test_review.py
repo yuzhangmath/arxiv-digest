@@ -9,20 +9,17 @@ import pytest
 
 from arxiv_digest.models import (
     AnnounceType,
-    Confidence,
-    DateBasis,
-    EventCandidate,
-    EventEvidence,
+    CatchupDay,
+    CatchupEntry,
+    CatchupPage,
+    EnrichmentStatus,
     EvidenceSource,
     PaperMetadata,
     PaperVersion,
+    SourceObservation,
 )
-from arxiv_digest.profile import PdfDestination, Profile
-from arxiv_digest.review import (
-    ReviewService,
-    confidence_label,
-    review_date_label,
-)
+from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
+from arxiv_digest.review import ReviewService
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import Store
 
@@ -43,9 +40,11 @@ def _profile(
     seed_papers: tuple[str, ...] = (),
 ) -> Profile:
     return Profile(
-        schema_version=1,
+        schema_version=2,
         revision=revision,
-        categories=("cs.SE",),
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 7, 1)),
+        ),
         keywords=keywords,
         phrases=(),
         authors=(),
@@ -59,7 +58,7 @@ def _add(
     number: int,
     day: date,
     *,
-    source: EvidenceSource = EvidenceSource.ATOM,
+    source: EvidenceSource = EvidenceSource.CATCHUP,
     version: int | None = 1,
     title: str | None = None,
 ) -> int:
@@ -72,47 +71,70 @@ def _add(
         primary_category="cs.SE",
         categories=("cs.SE",),
     )
-    confidence = {
-        EvidenceSource.ATOM: Confidence.CURRENT,
-        EvidenceSource.CATCHUP: Confidence.RECOVERED,
-        EvidenceSource.OAI: Confidence.INFERRED,
-    }[source]
-    date_basis = {
-        EvidenceSource.ATOM: DateBasis.FEED_MAILING,
-        EvidenceSource.CATCHUP: DateBasis.CATCHUP_MAILING,
-        EvidenceSource.OAI: DateBasis.VERSION_HISTORY_UTC,
-    }[source]
-    evidence = EventEvidence(
-        source_key=f"{source.value}:cs.SE:{day}:{arxiv_id}:{version}",
-        source=source,
-        confidence=confidence,
+    if source is not EvidenceSource.CATCHUP:
+        raise ValueError("Review fixtures require catch-up support")
+    existing = tuple(
+        observation
+        for observation in store.source_observations()
+        if observation.source is EvidenceSource.CATCHUP
+        and observation.category == "cs.SE"
+        and observation.daily_list_date == day
+    )
+    observation = SourceObservation(
+        source_key=f"catchup:cs.SE:{day}:{arxiv_id}:{number}",
+        arxiv_id=arxiv_id,
+        source=EvidenceSource.CATCHUP,
         category="cs.SE",
         announce_type=AnnounceType.NEW,
-        mailing_date=None if source is EvidenceSource.OAI else day,
-        announced_version=version,
-        list_position=(None if source is EvidenceSource.OAI else number),
-        oai_datestamp=(day if source is EvidenceSource.OAI else None),
-        raw_sha256=f"{number % 16:x}" * 64,
+        daily_list_date=day,
+        announced_version=None,
+        list_position=number,
+        oai_datestamp=None,
+        response_sha256=f"{number % 16:x}" * 64,
         observed_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
     )
-    candidate = EventCandidate(
-        arxiv_id=arxiv_id,
-        announced_version=version,
-        effective_date=day,
-        date_basis=date_basis,
-        evidence=evidence,
+    observations = tuple(
+        sorted((*existing, observation), key=lambda item: item.list_position or 0)
     )
-    versions = (
-        ()
-        if version is None
-        else (
-            PaperVersion(
-                version,
-                datetime(2026, 8, min(number, 28), tzinfo=timezone.utc),
+    entries = tuple(
+        CatchupEntry(
+            metadata=(
+                metadata
+                if item.arxiv_id == arxiv_id
+                else store.article_metadata(item.arxiv_id)
             ),
+            section=item.announce_type or AnnounceType.NEW,
+            mailing_date=day,
+            position=item.list_position or 0,
         )
+        for item in observations
     )
-    return store.apply_event_batch(metadata, versions, (candidate,))[0].event_id
+    result = CatchupDay(
+        category="cs.SE",
+        mailing_date=day,
+        status=EnrichmentStatus.COMPLETE,
+        pages=(
+            CatchupPage(
+                category="cs.SE",
+                mailing_date=day,
+                page=1,
+                total_pages=1,
+                entries=entries,
+                raw_sha256="f" * 64,
+            ),
+        ),
+        error_code=None,
+        error_message=None,
+    )
+    return next(
+        event.event_id
+        for event in store.apply_catchup_day(
+            result,
+            observations,
+            datetime(2026, 8, 22, tzinfo=timezone.utc),
+        )
+        if event.arxiv_id == arxiv_id
+    )
 
 
 @pytest.fixture
@@ -120,6 +142,7 @@ def review(tmp_path: Path) -> tuple[Store, Profiles, ReviewService]:
     database_path = tmp_path / "state.sqlite3"
     open_database(database_path).close()
     store = Store(database_path)
+    store.ensure_category_state("cs.SE", "cs:SE", date(2026, 7, 1))
     profiles = Profiles(_profile(tmp_path))
     return store, profiles, ReviewService(store, profiles)
 
@@ -127,7 +150,7 @@ def review(tmp_path: Path) -> tuple[Store, Profiles, ReviewService]:
 def test_oldest_first_finish_and_later_discovery(
     review: tuple[Store, Profiles, ReviewService],
 ) -> None:
-    store, _profiles, service = review
+    store, profiles, service = review
     first_day = date(2026, 7, 31)
     second_day = date(2026, 8, 3)
     first_id = _add(store, 1, first_day)
@@ -135,11 +158,15 @@ def test_oldest_first_finish_and_later_discovery(
 
     summary = service.summary()
     assert (summary.unreviewed_dates, summary.unreviewed_papers) == (2, 2)
+    assert summary.profile_revision == profiles.profile.revision
+    assert summary.projection_revision == 0
     assert service.start().day == first_day
     page = service.open_date(first_day)
     service.finish_date(
         first_day,
         through_revision=page.snapshot_revision,
+        profile_revision=page.profile_revision,
+        projection_revision=page.projection_revision,
         finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
     )
     assert service.summary().oldest_unreviewed_date == second_day
@@ -161,6 +188,32 @@ def test_oldest_first_finish_and_later_discovery(
     }
 
 
+def test_finish_all_reviews_current_backlog_and_leaves_later_discoveries(
+    review: tuple[Store, Profiles, ReviewService],
+) -> None:
+    store, profiles, service = review
+    first_day = date(2026, 7, 31)
+    second_day = date(2026, 8, 3)
+    _add(store, 1, first_day)
+    _add(store, 2, second_day)
+    confirmed = service.summary()
+    late_id = _add(store, 3, first_day)
+
+    finished = service.finish_all(
+        through_revision=confirmed.snapshot_revision,
+        profile_revision=profiles.profile.revision,
+        projection_revision=0,
+        finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc)
+    )
+
+    assert finished.reviewed_count == 2
+    reopened = service.summary()
+    assert reopened.unreviewed_papers == 1
+    assert reopened.oldest_unreviewed_date == first_day
+    assert reopened.newly_discovered == 1
+    assert store.review_event(late_id).reviewed_at is None
+
+
 def test_reopened_date_tiers_new_cards_against_the_complete_date(
     review: tuple[Store, Profiles, ReviewService],
 ) -> None:
@@ -176,10 +229,9 @@ def test_reopened_date_tiers_new_cards_against_the_complete_date(
         primary_category="cs.SE",
         categories=("cs.SE",),
     )
-    store.apply_event_batch(
+    store.apply_article_snapshot(
         seed,
         (PaperVersion(1, datetime(2025, 1, 1, tzinfo=timezone.utc)),),
-        (),
     )
     profiles.profile = _profile(tmp_path=Path("/tmp"), seed_papers=(seed_id,))
     day = date(2026, 8, 3)
@@ -194,6 +246,8 @@ def test_reopened_date_tiers_new_cards_against_the_complete_date(
     service.finish_date(
         day,
         through_revision=opened.snapshot_revision,
+        profile_revision=opened.profile_revision,
+        projection_revision=opened.projection_revision,
         finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
     )
 
@@ -225,16 +279,18 @@ def test_pagination_resume_and_navigation_do_not_finish(
         day,
         snapshot_revision=second.snapshot_revision,
         anchor_event_id=second.anchor_event_id,
+        profile_revision=second.profile_revision,
+        projection_revision=second.projection_revision,
     )
     profiles.profile = _profile(Path("/tmp"), revision=2)
     resumed = service.open_date(day)
-    assert resumed.page_number == 2
+    assert resumed.page_number == 1
     assert service.summary().unreviewed_papers == 27
     assert service.previous_date(date(2026, 9, 1)) == date(2026, 8, 31)
     assert service.next_date(date(2026, 8, 31)) == date(2026, 9, 1)
 
 
-def test_calendar_jump_missing_anchor_and_labels(
+def test_calendar_jump_and_missing_anchor_use_confirmed_dates(
     review: tuple[Store, Profiles, ReviewService],
 ) -> None:
     store, _profiles, service = review
@@ -247,40 +303,39 @@ def test_calendar_jump_missing_anchor_and_labels(
     assert service.calendar(date(2026, 8, 4), date(2026, 8, 31))[0].day == date(
         2026, 8, 5
     )
-    assert confidence_label(Confidence.CURRENT) == "Current announcement"
-    assert confidence_label(Confidence.RECOVERED) == "Recovered announcement"
-    assert confidence_label(Confidence.INFERRED) == "Inferred update"
-    assert review_date_label(DateBasis.VERSION_HISTORY_UTC) == "Inferred catch-up date"
+    assert page.cards[0].event.daily_list_date == date(2026, 8, 5)
+    assert all(
+        item.source is EvidenceSource.CATCHUP
+        for item in page.cards[0].event.observations
+    )
     with pytest.raises(KeyError):
         service.open_date(date(2026, 8, 4))
     with pytest.raises(ValueError):
         service.calendar(date(2026, 8, 5), date(2026, 8, 4))
 
 
-def test_finish_snapshot_does_not_review_event_relocated_into_date_later(
+def test_finish_snapshot_does_not_review_event_recovered_into_date_later(
     review: tuple[Store, Profiles, ReviewService],
 ) -> None:
     store, _profiles, service = review
     open_day = date(2026, 8, 3)
     _add(store, 1, open_day)
-    provisional_id = _add(
-        store,
-        2,
-        date(2026, 8, 1),
-        source=EvidenceSource.OAI,
-    )
     snapshot = service.open_date(open_day)
 
-    relocated_id = _add(store, 2, open_day, source=EvidenceSource.ATOM)
-    assert relocated_id == provisional_id
-    assert store.review_event(relocated_id).queue_revision > snapshot.snapshot_revision
+    recovered_id = _add(store, 2, open_day, version=None)
+    assert (
+        store.review_event(recovered_id).queue_revision
+        > snapshot.snapshot_revision
+    )
     service.finish_date(
         open_day,
         through_revision=snapshot.snapshot_revision,
+        profile_revision=snapshot.profile_revision,
+        projection_revision=snapshot.projection_revision,
         finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
     )
 
-    assert store.review_event(relocated_id).reviewed_at is None
+    assert store.review_event(recovered_id).reviewed_at is None
     assert service.summary().oldest_unreviewed_date == open_day
 
 
@@ -301,6 +356,8 @@ def test_profile_change_reranks_without_resetting_review_state(
     service.finish_date(
         day,
         through_revision=reranked.snapshot_revision,
+        profile_revision=reranked.profile_revision,
+        projection_revision=reranked.projection_revision,
         finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
     )
     profiles.profile = _profile(Path("/tmp"), revision=3, keywords=("other",))
@@ -320,10 +377,9 @@ def test_review_builds_seed_vectors_from_durable_metadata(
         primary_category="cs.SE",
         categories=("cs.SE",),
     )
-    store.apply_event_batch(
+    store.apply_article_snapshot(
         seed,
         (PaperVersion(1, datetime(2026, 8, 1, tzinfo=timezone.utc)),),
-        (),
     )
     day = date(2026, 8, 3)
     related_id = _add(store, 1, day, title="Quantum widget methods")

@@ -7,12 +7,18 @@ from threading import Event
 
 import pytest
 
-from arxiv_digest.models import AnnounceType, EnrichmentStatus
+from arxiv_digest.models import (
+    AnnounceType,
+    CatchupDay,
+    EnrichmentStatus,
+    EvidenceSource,
+)
 from arxiv_digest.rate_limit import HttpResponse, Interface
 from arxiv_digest.sources.catchup import (
     CatchupError,
     CatchupLayoutError,
     CatchupSource,
+    catchup_observations,
     failed_day,
     parse_catchup_page,
 )
@@ -22,6 +28,8 @@ FIXTURES = Path(__file__).parents[2] / "fixtures" / "catchup"
 MAILING_DATE = date(2026, 8, 20)
 PAGE_1_URL = "https://arxiv.org/catchup/cs.CL/2026-08-20"
 PAGE_2_URL = f"{PAGE_1_URL}?skip=3&show=3"
+CURRENT_PAGE_1_URL = f"{PAGE_1_URL}?abs=False&page=1"
+CURRENT_PAGE_2_URL = f"{PAGE_1_URL}?abs=False&page=2"
 
 
 def fixture(name: str) -> bytes:
@@ -86,6 +94,41 @@ def test_parse_catchup_page_retains_new_announcement_evidence() -> None:
     assert entry.metadata.doi == "10.0000/fixture.11001"
 
 
+def test_catchup_day_normalizes_exact_daily_list_observations() -> None:
+    page = parse_catchup_page(
+        fixture("mixed-page-1.html"),
+        "cs.CL",
+        MAILING_DATE,
+        PAGE_1_URL,
+    )
+    day = CatchupDay(
+        category="cs.CL",
+        mailing_date=MAILING_DATE,
+        status=EnrichmentStatus.COMPLETE,
+        pages=(page,),
+        error_code=None,
+        error_message=None,
+    )
+    observed_at = datetime(2026, 8, 22, tzinfo=timezone.utc)
+
+    observations = catchup_observations(day, observed_at)
+
+    first = observations[0]
+    assert first.source_key == (
+        "catchup:cs.CL:2026-08-20:2608.11001:0"
+    )
+    assert first.arxiv_id == "2608.11001"
+    assert first.source is EvidenceSource.CATCHUP
+    assert first.category == "cs.CL"
+    assert first.announce_type is AnnounceType.NEW
+    assert first.daily_list_date == MAILING_DATE
+    assert first.announced_version is None
+    assert first.list_position == 0
+    assert first.oai_datestamp is None
+    assert first.response_sha256 == page.raw_sha256
+    assert first.observed_at == observed_at
+
+
 def test_parse_catchup_page_maps_all_html_sections_in_list_order() -> None:
     page = parse_catchup_page(
         fixture("mixed-page-1.html"),
@@ -108,6 +151,74 @@ def test_parse_catchup_page_maps_all_html_sections_in_list_order() -> None:
     )
 
 
+def test_parse_current_nested_listing_without_abstracts() -> None:
+    payload = fixture("current-page-1.html")
+
+    page = parse_catchup_page(
+        payload,
+        "cs.CL",
+        MAILING_DATE,
+        CURRENT_PAGE_1_URL,
+    )
+
+    assert page.page == 1
+    assert page.total_pages == 2
+    assert tuple(entry.section for entry in page.entries) == (
+        AnnounceType.NEW,
+        AnnounceType.CROSS,
+        AnnounceType.REPLACE,
+    )
+    entry = page.entries[0]
+    assert entry.metadata.abstract == ""
+    assert entry.metadata.primary_category == "cs.CL"
+    assert entry.metadata.categories == ("cs.CL", "stat.ML", "cs.IT")
+
+
+def test_current_page_number_comes_from_url_when_it_has_no_self_link() -> None:
+    page = parse_catchup_page(
+        fixture("current-page-2.html"),
+        "cs.CL",
+        MAILING_DATE,
+        CURRENT_PAGE_2_URL,
+    )
+
+    assert page.page == 2
+    assert page.total_pages == 2
+    assert tuple(entry.position for entry in page.entries) == (3, 4)
+
+
+def test_current_heading_count_must_match_the_parsed_section() -> None:
+    payload = fixture("current-page-1.html").replace(
+        b"New submissions (showing first 1 of 2 entries)",
+        b"New submissions (showing 2 of 2 entries)",
+        1,
+    )
+
+    with pytest.raises(CatchupLayoutError):
+        parse_catchup_page(
+            payload,
+            "cs.CL",
+            MAILING_DATE,
+            CURRENT_PAGE_1_URL,
+        )
+
+
+def test_current_pagination_rejects_an_unreasonable_page_count() -> None:
+    payload = fixture("current-page-1.html").replace(
+        b"</nav>",
+        b'<a href="?abs=False&amp;page=101">101</a></nav>',
+        1,
+    )
+
+    with pytest.raises(CatchupLayoutError):
+        parse_catchup_page(
+            payload,
+            "cs.CL",
+            MAILING_DATE,
+            CURRENT_PAGE_1_URL,
+        )
+
+
 def test_current_metadata_never_claims_a_historical_announced_version() -> None:
     page = parse_catchup_page(
         fixture("current-version-history.html"),
@@ -128,8 +239,14 @@ def test_current_metadata_never_claims_a_historical_announced_version() -> None:
 def test_fetch_day_follows_same_path_pages_in_source_order_once() -> None:
     client = FakeHttpClient(
         {
-            PAGE_1_URL: response(PAGE_1_URL, fixture("mixed-page-1.html")),
-            PAGE_2_URL: response(PAGE_2_URL, fixture("mixed-page-2.html")),
+            CURRENT_PAGE_1_URL: response(
+                CURRENT_PAGE_1_URL,
+                fixture("current-page-1.html"),
+            ),
+            CURRENT_PAGE_2_URL: response(
+                CURRENT_PAGE_2_URL,
+                fixture("current-page-2.html"),
+            ),
         }
     )
 
@@ -153,16 +270,90 @@ def test_fetch_day_follows_same_path_pages_in_source_order_once() -> None:
         "2608.11004",
         "hep-th/9901001",
     )
-    assert [request[0] for request in client.requests] == [PAGE_1_URL, PAGE_2_URL]
+    assert [request[0] for request in client.requests] == [
+        CURRENT_PAGE_1_URL,
+        CURRENT_PAGE_2_URL,
+    ]
     assert all(request[1] is Interface.CATCHUP for request in client.requests)
     assert all("text/html" in request[2] for request in client.requests)
+
+
+def test_fetch_day_rejects_a_day_wide_entry_count_mismatch() -> None:
+    page_one = fixture("current-page-1.html").replace(
+        b"Total of 5 entries",
+        b"Total of 6 entries",
+    )
+    page_two = fixture("current-page-2.html").replace(
+        b"Total of 5 entries",
+        b"Total of 6 entries",
+    )
+    client = FakeHttpClient(
+        {
+            CURRENT_PAGE_1_URL: response(CURRENT_PAGE_1_URL, page_one),
+            CURRENT_PAGE_2_URL: response(CURRENT_PAGE_2_URL, page_two),
+        }
+    )
+
+    day = CatchupSource(client).fetch_day("cs.CL", MAILING_DATE)
+
+    assert day.status is EnrichmentStatus.FAILED
+    assert day.error_code == "catchup_layout_changed"
+    assert len(day.pages) == 2
+
+
+def test_fetch_day_synthesizes_unadvertised_intermediate_pages() -> None:
+    page_3_url = f"{PAGE_1_URL}?abs=False&page=3"
+    first_payload = fixture("current-page-1.html").replace(
+        b"?abs=False&amp;page=2",
+        b"?abs=False&amp;page=3",
+        1,
+    ).replace(b"Total of 5 entries", b"Total of 7 entries").replace(
+        b"first 1 of 2 entries", b"first 1 of 3 entries"
+    )
+    middle_payload = fixture("current-page-2.html").replace(
+        b"</nav>",
+        b'<a href="?abs=False&amp;page=3">3</a></nav>',
+        1,
+    ).replace(b"Total of 5 entries", b"Total of 7 entries").replace(
+        b"last 1 of 2 entries", b"1 of 3 entries"
+    )
+    last_payload = (
+        fixture("current-page-2.html")
+        .replace(b"Total of 5 entries", b"Total of 7 entries")
+        .replace(b"last 1 of 2 entries", b"last 1 of 3 entries")
+        .replace(b'name="item4"', b'name="item6"')
+        .replace(b'name="item5"', b'name="item7"')
+    )
+    client = FakeHttpClient(
+        {
+            CURRENT_PAGE_1_URL: response(CURRENT_PAGE_1_URL, first_payload),
+            CURRENT_PAGE_2_URL: response(CURRENT_PAGE_2_URL, middle_payload),
+            page_3_url: response(page_3_url, last_payload),
+        }
+    )
+
+    day = CatchupSource(client).fetch_day("cs.CL", MAILING_DATE)
+
+    assert day.status is EnrichmentStatus.COMPLETE
+    assert [request[0] for request in client.requests] == [
+        CURRENT_PAGE_1_URL,
+        CURRENT_PAGE_2_URL,
+        page_3_url,
+    ]
+    assert tuple(page.page for page in day.pages) == (1, 2, 3)
 
 
 def test_fetch_day_forwards_one_cancellation_signal_to_every_page() -> None:
     client = FakeHttpClient(
         {
-            PAGE_1_URL: response(PAGE_1_URL, fixture("mixed-page-1.html")),
-            PAGE_2_URL: response(PAGE_2_URL, fixture("mixed-page-2.html")),
+            CURRENT_PAGE_1_URL: response(
+                CURRENT_PAGE_1_URL,
+                fixture("current-page-1.html"),
+            ),
+            CURRENT_PAGE_2_URL: response(
+                CURRENT_PAGE_2_URL,
+                fixture("current-page-2.html"),
+            ),
         }
     )
     cancellation = Event()
@@ -193,8 +384,8 @@ def test_old_style_detail_id_is_versionless_replacement_evidence() -> None:
 
 def test_fetch_day_distinguishes_an_explicitly_empty_date() -> None:
     mailing_date = date(2026, 8, 16)
-    url = "https://arxiv.org/catchup/cs.CL/2026-08-16"
-    payload = fixture("empty-day.html")
+    url = "https://arxiv.org/catchup/cs.CL/2026-08-16?abs=False&page=1"
+    payload = fixture("current-empty-day.html")
     client = FakeHttpClient({url: response(url, payload)})
 
     day = CatchupSource(client).fetch_day("cs.CL", mailing_date)
@@ -223,8 +414,11 @@ def test_failed_day_preserves_only_safe_diagnostics() -> None:
 def test_fetch_day_is_failed_when_an_advertised_page_does_not_succeed() -> None:
     client = FakeHttpClient(
         {
-            PAGE_1_URL: response(PAGE_1_URL, fixture("mixed-page-1.html")),
-            PAGE_2_URL: RuntimeError("private transport detail"),
+            CURRENT_PAGE_1_URL: response(
+                CURRENT_PAGE_1_URL,
+                fixture("current-page-1.html"),
+            ),
+            CURRENT_PAGE_2_URL: RuntimeError("private transport detail"),
         }
     )
 
@@ -236,6 +430,26 @@ def test_fetch_day_is_failed_when_an_advertised_page_does_not_succeed() -> None:
     assert day.error_code == "catchup_fetch_failed"
     assert day.error_message == "The arXiv catch-up page could not be retrieved."
     assert "private transport detail" not in day.error_message
+
+
+def test_failed_multi_page_day_does_not_normalize_partial_observations() -> None:
+    client = FakeHttpClient(
+        {
+            CURRENT_PAGE_1_URL: response(
+                CURRENT_PAGE_1_URL,
+                fixture("current-page-1.html"),
+            ),
+            CURRENT_PAGE_2_URL: RuntimeError("private transport detail"),
+        }
+    )
+    day = CatchupSource(client).fetch_day("cs.CL", MAILING_DATE)
+
+    observations = catchup_observations(
+        day,
+        datetime(2026, 8, 22, tzinfo=timezone.utc),
+    )
+
+    assert observations == ()
 
 
 def test_missing_structural_anchor_is_a_typed_layout_error() -> None:
@@ -255,7 +469,12 @@ def test_missing_structural_anchor_is_a_typed_layout_error() -> None:
 
 def test_fetch_day_marks_a_layout_change_failed_instead_of_empty() -> None:
     client = FakeHttpClient(
-        {PAGE_1_URL: response(PAGE_1_URL, fixture("schema-changed.html"))}
+        {
+            CURRENT_PAGE_1_URL: response(
+                CURRENT_PAGE_1_URL,
+                fixture("schema-changed.html"),
+            )
+        }
     )
 
     day = CatchupSource(client).fetch_day("cs.CL", MAILING_DATE)
@@ -266,3 +485,23 @@ def test_fetch_day_marks_a_layout_change_failed_instead_of_empty() -> None:
     assert day.error_message == (
         "The arXiv catch-up page layout was not recognized."
     )
+
+
+def test_fetch_day_rejects_a_redirect_to_a_different_historical_date() -> None:
+    redirected_url = (
+        "https://arxiv.org/catchup/cs.CL/2026-08-19?abs=False&page=1"
+    )
+    client = FakeHttpClient(
+        {
+            CURRENT_PAGE_1_URL: response(
+                redirected_url,
+                fixture("current-page-1.html"),
+            )
+        }
+    )
+
+    day = CatchupSource(client).fetch_day("cs.CL", MAILING_DATE)
+
+    assert day.status is EnrichmentStatus.FAILED
+    assert day.pages == ()
+    assert day.error_code == "catchup_layout_changed"

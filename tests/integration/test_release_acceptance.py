@@ -26,23 +26,27 @@ from arxiv_digest.models import (
     AnnounceType,
     AtomBatch,
     CategoryConfig,
+    CatchupEntry,
+    CatchupPage,
     CatchupDay,
-    Confidence,
-    DateBasis,
     EnrichmentStatus,
-    EventCandidate,
-    EventEvidence,
     EvidenceSource,
     OaiArticle,
     PaperMetadata,
     PaperVersion,
+    SourceObservation,
 )
 from arxiv_digest.paths import AppPaths, resolve_paths
-from arxiv_digest.profile import PdfDestination, Profile, ProfileRepository
+from arxiv_digest.profile import (
+    PdfDestination,
+    Profile,
+    ProfileCategory,
+    ProfileRepository,
+)
 from arxiv_digest.rate_limit import HttpResponse, Interface
 from arxiv_digest.review import ReviewService
 from arxiv_digest.setup import CategorySelection, SetupService, SetupStateError
-from arxiv_digest.sources.oai import OaiIdentify, OaiPage
+from arxiv_digest.sources.oai import OaiIdentify, OaiPage, oai_observations
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import DownloadFileRecord, Store
 from arxiv_digest.sync import SyncService
@@ -201,7 +205,7 @@ def _complete_setup(
     draft = service.select_seed_papers(draft.revision, (corpus.documents[0],))
     draft = service.select_terms(
         draft.revision,
-        keywords=(recurring_keyword, str(explicit["custom_keyword"])),
+        keywords=(str(explicit["custom_keyword"]),),
         phrases=(recurring_phrase, str(explicit["custom_phrase"])),
     )
     draft = service.select_authors(
@@ -309,10 +313,7 @@ def test_empty_first_run_composes_explicit_setup_pdf_and_launcher_choices(
     assert isinstance(explicit, dict)
     assert profile.categories == corpus.categories
     assert profile.seed_papers == (seed.paper.arxiv_id,)
-    assert profile.keywords == (
-        str(raw_corpus["recurring_keyword"]),
-        str(explicit["custom_keyword"]),
-    )
+    assert profile.keywords == (str(explicit["custom_keyword"]),)
     assert profile.phrases == (
         str(raw_corpus["recurring_phrase"]),
         str(explicit["custom_phrase"]),
@@ -558,7 +559,7 @@ def _long_gap_article(
     )
 
 
-def test_long_absence_recovers_versions_merges_categories_and_ignores_admin_edits(
+def test_long_absence_refreshes_hidden_metadata_without_creating_review_events(
     tmp_path: Path,
 ) -> None:
     store, oai, atom, _catchup, service = _sync_service(tmp_path)
@@ -588,10 +589,9 @@ def test_long_absence_recovers_versions_merges_categories_and_ignores_admin_edit
         )
     first = service.sync(configs, catchup_dates={})
     assert first.metadata_complete is True
-    original_admin_event_ids = {
-        event.event_id for event in store.events_for_date(date(2026, 4, 15))
-    }
-    assert len(original_admin_event_ids) == 1
+    assert store.events_for_date(date(2026, 4, 15)) == ()
+    assert store.canonical_event_count() == 0
+    assert store.article_versions("2604.00001") == administrative_version
 
     shared_versions = (
         PaperVersion(1, datetime(2026, 5, 1, 9, tzinfo=timezone.utc)),
@@ -634,28 +634,14 @@ def test_long_absence_recovers_versions_merges_categories_and_ignores_admin_edit
         call[1] == date(2026, 4, 29)
         for call in oai.first_calls[len(configs) : 2 * len(configs)]
     )
-    recovered_events = [
-        event
-        for day in (date(2026, 5, 1), date(2026, 6, 15), date(2026, 8, 10))
-        for event in store.events_for_date(day)
-        if event.arxiv_id == "2605.00002"
-    ]
-    assert [event.announced_version for event in recovered_events] == [1, 2, 3]
-    assert len({event.event_id for event in recovered_events}) == 3
-    assert all(
-        {item.category for item in event.evidence}
-        == {"synthetic.alpha", "synthetic.beta"}
-        for event in recovered_events
-    )
-    identities = [
-        (event.arxiv_id, event.announced_version, event.effective_date)
-        for day in store.list_review_dates()
-        for event in store.events_for_date(day)
-    ]
-    assert len(identities) == len(set(identities))
+    assert store.article_versions("2605.00002") == shared_versions
     assert {
-        event.event_id for event in store.events_for_date(date(2026, 4, 15))
-    } == original_admin_event_ids
+        item.announced_version
+        for item in store.source_observations("2605.00002")
+        if item.source is EvidenceSource.OAI
+    } == {1, 2, 3}
+    assert store.list_review_dates() == ()
+    assert store.canonical_event_count() == 0
     admin_metadata = store.article_metadata("2604.00001")
     assert admin_metadata.title == "Updated administrative fixture"
     assert admin_metadata.journal_ref == "Synthetic Journal 1 (2026)"
@@ -723,9 +709,11 @@ def test_interrupted_page_chain_keeps_checkpoint_and_replay_has_no_duplicates(
         (config.oai_set_spec, config.coverage_start),
         (config.oai_set_spec, config.coverage_start),
     ]
-    events = store.events_for_date(date(2026, 8, 5))
-    assert len(events) == 1
-    assert len({event.event_id for event in events}) == 1
+    assert store.events_for_date(date(2026, 8, 5)) == ()
+    assert store.article_versions("2608.00003") == article.versions
+    observations = store.source_observations("2608.00003")
+    assert len(observations) == 1
+    assert observations[0].source is EvidenceSource.OAI
 
 
 def _isolated_paths(root: Path) -> AppPaths:
@@ -747,9 +735,11 @@ def _publish_acceptance_profile(paths: AppPaths, destination: Path) -> ProfileRe
     repository = ProfileRepository(paths.profile_path, paths.profile_lock_path)
     SetupService(paths.database_path, repository, clock=lambda: NOW).publish_profile(
         Profile(
-            schema_version=1,
+            schema_version=2,
             revision=1,
-            categories=("synthetic.alpha",),
+            category_coverage=(
+                ProfileCategory("synthetic.alpha", date(2026, 5, 1)),
+            ),
             keywords=("orchard",),
             phrases=("spectral garden",),
             authors=("Taylor Fixture",),
@@ -776,27 +766,88 @@ def _insert_backlog_event(store: Store, serial: int, day: date) -> int:
         1,
         datetime.combine(day, time(9), tzinfo=timezone.utc),
     )
-    source_key = f"acceptance:backlog:{day}:{arxiv_id}"
-    candidate = EventCandidate(
-        arxiv_id=arxiv_id,
-        announced_version=1,
-        effective_date=day,
-        date_basis=DateBasis.FEED_MAILING,
-        evidence=EventEvidence(
-            source_key=source_key,
-            source=EvidenceSource.ATOM,
-            confidence=Confidence.CURRENT,
-            category="synthetic.alpha",
-            announce_type=AnnounceType.NEW,
-            mailing_date=day,
-            announced_version=1,
-            list_position=serial,
-            oai_datestamp=None,
-            raw_sha256=sha256(source_key.encode()).hexdigest(),
-            observed_at=NOW,
-        ),
+    oai_hash = sha256(f"acceptance:oai:{arxiv_id}".encode()).hexdigest()
+    article = OaiArticle(
+        oai_identifier=f"oai:arXiv.org:{arxiv_id}",
+        oai_datestamp=NOW.date(),
+        set_specs=("synthetic:alpha",),
+        metadata=metadata,
+        versions=(version,),
     )
-    return store.apply_event_batch(metadata, (version,), (candidate,))[0].event_id
+    page = OaiPage(NOW, (article,), None, oai_hash)
+    run_id = store.begin_sync_run(
+        "synthetic.alpha", "incremental", day, None, NOW
+    )
+    store.apply_oai_page(
+        run_id,
+        "synthetic.alpha",
+        page.records,
+        oai_observations(page),
+        page.raw_sha256,
+        page.response_date,
+    )
+    store.complete_incremental_run(run_id, NOW.date(), NOW, NOW)
+
+    catchup_hash = sha256(
+        f"acceptance:catchup:{day}:{arxiv_id}".encode()
+    ).hexdigest()
+    entry = CatchupEntry(
+        metadata=metadata,
+        section=AnnounceType.NEW,
+        mailing_date=day,
+        position=serial,
+    )
+    prior_observations = tuple(
+        item
+        for item in store.source_observations()
+        if item.source is EvidenceSource.CATCHUP
+        and item.category == "synthetic.alpha"
+        and item.daily_list_date == day
+    )
+    prior_entries = tuple(
+        CatchupEntry(
+            metadata=store.article_metadata(item.arxiv_id),
+            section=item.announce_type,
+            mailing_date=day,
+            position=item.list_position,
+        )
+        for item in prior_observations
+        if item.announce_type is not None and item.list_position is not None
+    )
+    result = CatchupDay(
+        category="synthetic.alpha",
+        mailing_date=day,
+        status=EnrichmentStatus.COMPLETE,
+        pages=(
+            CatchupPage(
+                category="synthetic.alpha",
+                mailing_date=day,
+                page=1,
+                total_pages=1,
+                entries=prior_entries + (entry,),
+                raw_sha256=catchup_hash,
+            ),
+        ),
+        error_code=None,
+        error_message=None,
+    )
+    observation = SourceObservation(
+        source_key=f"catchup:synthetic.alpha:{day}:{serial}:{arxiv_id}",
+        arxiv_id=arxiv_id,
+        source=EvidenceSource.CATCHUP,
+        category="synthetic.alpha",
+        announce_type=AnnounceType.NEW,
+        daily_list_date=day,
+        announced_version=None,
+        list_position=serial,
+        oai_datestamp=None,
+        response_sha256=catchup_hash,
+        observed_at=NOW,
+    )
+    events = store.apply_catchup_day(
+        result, prior_observations + (observation,), NOW
+    )
+    return next(item.event_id for item in events if item.arxiv_id == arxiv_id)
 
 
 def _walk_review_date(
@@ -852,6 +903,8 @@ def test_two_hundred_card_review_resumes_finishes_reopens_and_survives_cache_cle
         first_day,
         snapshot_revision=first.snapshot_revision,
         anchor_event_id=next_anchor,
+        profile_revision=first.profile_revision,
+        projection_revision=first.projection_revision,
     )
     resumed = ReviewService(store, repository).start()
     assert resumed is not None
@@ -873,6 +926,8 @@ def test_two_hundred_card_review_resumes_finishes_reopens_and_survives_cache_cle
     finished = service.finish_date(
         first_day,
         through_revision=finish_snapshot.snapshot_revision,
+        profile_revision=finish_snapshot.profile_revision,
+        projection_revision=finish_snapshot.projection_revision,
         finished_at=NOW,
     )
     assert finished.reviewed_count == 45
@@ -1008,7 +1063,6 @@ def test_portable_backup_restore_round_trip_excludes_machine_local_state(
         pdf_payload,
         b"acceptance-cache-marker",
         b"acceptance-runtime-token",
-        b"download_file",
     ):
         assert excluded not in archive_bytes
 
@@ -1018,9 +1072,13 @@ def test_portable_backup_restore_round_trip_excludes_machine_local_state(
         "article",
         "version",
         "category_sync",
-        "review_event",
+        "source_observation",
+        "catchup_day",
+        "canonical_event",
+        "canonical_event_observation",
         "review_date_state",
         "saved_paper",
+        "download_file",
     }
     assert b"acceptance-cache-marker" not in state_payload
 

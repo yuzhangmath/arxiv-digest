@@ -5,6 +5,7 @@ import threading
 import time
 from dataclasses import replace
 from datetime import date, datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -105,6 +106,76 @@ def test_mutations_require_the_exact_local_origin() -> None:
     assert accepted.status == 200
 
 
+def test_sync_start_accepts_a_scoped_failed_date_retry() -> None:
+    from arxiv_digest.web.api import ApiRouter
+
+    seen = []
+    router = ApiRouter(
+        token=TOKEN,
+        host=HOST,
+        handlers={
+            "sync_start": lambda payload: seen.append(payload)
+            or {"job_id": "sync_retry_1234"}
+        },
+    )
+
+    response = router.dispatch(
+        _request(
+            "POST",
+            "/api/v1/sync/start",
+            origin=ORIGIN,
+            content_type="application/json",
+            body=b'{"retry_failed_dates":true}',
+        )
+    )
+
+    assert response.status == 200
+    assert seen == [{"retry_failed_dates": True}]
+
+
+def test_settings_coverage_requires_profile_revision() -> None:
+    from arxiv_digest.web.api import ApiRouter
+
+    seen = []
+    router = ApiRouter(
+        token=TOKEN,
+        host=HOST,
+        handlers={"settings_coverage": lambda payload: seen.append(payload) or {}},
+    )
+
+    missing = router.dispatch(
+        _request(
+            "PUT",
+            "/api/v1/settings/coverage",
+            origin=ORIGIN,
+            content_type="application/json",
+            body=b'{"category":"cs.SE","new_start":"2026-07-01"}',
+        )
+    )
+    accepted = router.dispatch(
+        _request(
+            "PUT",
+            "/api/v1/settings/coverage",
+            origin=ORIGIN,
+            content_type="application/json",
+            body=(
+                b'{"category":"cs.SE","new_start":"2026-07-01",'
+                b'"expected_revision":7}'
+            ),
+        )
+    )
+
+    assert missing.status == 400
+    assert accepted.status == 200
+    assert seen == [
+        {
+            "category": "cs.SE",
+            "new_start": "2026-07-01",
+            "expected_revision": 7,
+        }
+    ]
+
+
 def test_json_mutations_reject_duplicate_keys_and_unknown_fields() -> None:
     from arxiv_digest.web.api import ApiRouter
 
@@ -190,7 +261,7 @@ def test_nonfinite_json_and_nested_interest_fields_are_rejected() -> None:
             "/api/v1/interests",
             origin=ORIGIN,
             content_type="application/json",
-            body=b'{"expected_revision":1,"category_configs":[{"category":"cs.SE","set_spec":"cs:SE","coverage_start":"2026-07-23","path":"/tmp/private"}]}',
+            body=b'{"expected_revision":1,"category_configs":[{"category":"cs.SE","set_spec":"cs:SE","coverage_start":"2026-07-23","path":"forged"}]}',
         )
     )
 
@@ -211,7 +282,14 @@ def test_unwired_or_crashing_domain_handlers_return_redacted_envelopes() -> None
         handlers={
             "status": lambda payload: (_ for _ in ()).throw(
                 RuntimeError(
-                    "/" + "/".join(("Users", "private", "token=secret"))
+                    "/"
+                    + "/".join(
+                        (
+                            "redacted-root",
+                            "sensitive-" + "segment",
+                            "credential=" + "value",
+                        )
+                    )
                 )
             )
         },
@@ -221,7 +299,7 @@ def test_unwired_or_crashing_domain_handlers_return_redacted_envelopes() -> None
     assert _json(unavailable)["error"]["code"] == "service_unavailable"
     assert crashing.status == 500
     assert _json(crashing)["error"]["code"] == "internal_error"
-    assert b"private" not in crashing.body
+    assert b"sensitive-segment" not in crashing.body
 
 
 def test_maintenance_conflicts_return_structured_safe_errors() -> None:
@@ -303,6 +381,183 @@ def test_known_route_wrong_method_is_405_and_unknown_route_is_404() -> None:
     assert unknown.status == 404
 
 
+def test_review_finish_all_route_dispatches_the_confirmed_projection_snapshot() -> None:
+    from arxiv_digest.web.api import ApiRouter
+
+    seen = []
+    router = ApiRouter(
+        token=TOKEN,
+        host=HOST,
+        handlers={
+            "review_finish_all": lambda payload: seen.append(payload) or {
+                "reviewed_count": 2,
+                "through_revision": 9,
+            }
+        },
+    )
+
+    response = router.dispatch(
+        _request(
+            "POST",
+            "/api/v1/review/finish",
+            origin=ORIGIN,
+            content_type="application/json",
+            body=(
+                b'{"snapshot_revision":9,"profile_revision":4,'
+                b'"projection_revision":6}'
+            ),
+        )
+    )
+
+    assert response.status == 200
+    assert seen == [
+        {
+            "snapshot_revision": 9,
+            "profile_revision": 4,
+            "projection_revision": 6,
+        }
+    ]
+    assert _json(response)["data"] == {
+        "reviewed_count": 2,
+        "through_revision": 9,
+    }
+
+
+def test_pdf_route_keeps_nullable_save_version_separate_from_download_version() -> None:
+    from arxiv_digest.web.api import ApiRouter
+
+    seen = []
+    router = ApiRouter(
+        token=TOKEN,
+        host=HOST,
+        handlers={
+            "library_pdf": lambda payload: seen.append(payload)
+            or {"job_id": "download_1234"}
+        },
+        known_paper=lambda arxiv_id: arxiv_id == "2608.02001",
+    )
+
+    missing = router.dispatch(
+        _request(
+            "POST",
+            "/api/v1/library/pdf",
+            origin=ORIGIN,
+            content_type="application/json",
+            body=(
+                b'{"arxiv_id":"2608.02001","version":3,'
+                b'"save_first":true}'
+            ),
+        )
+    )
+    accepted = router.dispatch(
+        _request(
+            "POST",
+            "/api/v1/library/pdf",
+            origin=ORIGIN,
+            content_type="application/json",
+            body=(
+                b'{"arxiv_id":"2608.02001","version":3,'
+                b'"save_first":true,"save_version":null}'
+            ),
+        )
+    )
+
+    assert missing.status == 400
+    assert accepted.status == 200
+    assert seen == [
+        {
+            "arxiv_id": "2608.02001",
+            "version": 3,
+            "save_first": True,
+            "save_version": None,
+        }
+    ]
+
+
+def test_stale_review_projection_is_an_explicit_conflict() -> None:
+    from arxiv_digest.storage.store import ReviewSnapshotConflict
+    from arxiv_digest.web.api import ApiRouter
+
+    def stale(_payload):
+        raise ReviewSnapshotConflict("the active Review projection changed")
+
+    router = ApiRouter(
+        token=TOKEN,
+        host=HOST,
+        handlers={"review_finish": stale},
+    )
+    response = router.dispatch(
+        _request(
+            "POST",
+            "/api/v1/review/date/finish",
+            origin=ORIGIN,
+            content_type="application/json",
+            body=(
+                b'{"date":"2026-08-22","snapshot_revision":9,'
+                b'"profile_revision":4,"projection_revision":6}'
+            ),
+        )
+    )
+
+    assert response.status == 409
+    assert _json(response)["error"] == {
+        "code": "review_snapshot_stale",
+        "message": "The active Review projection changed; reload and try again.",
+    }
+
+
+def test_review_date_mutations_require_all_opened_snapshot_revisions() -> None:
+    from arxiv_digest.web.api import ApiRouter
+
+    seen = []
+    router = ApiRouter(
+        token=TOKEN,
+        host=HOST,
+        handlers={
+            "review_position": lambda payload: seen.append(payload) or {},
+            "review_finish": lambda payload: seen.append(payload) or {},
+        },
+    )
+    position = (
+        b'{"date":"2026-08-22","snapshot_revision":9,'
+        b'"profile_revision":4,"projection_revision":6,'
+        b'"anchor_event_id":7}'
+    )
+    finish = (
+        b'{"date":"2026-08-22","snapshot_revision":9,'
+        b'"profile_revision":4,"projection_revision":6}'
+    )
+
+    for method, target, body in (
+        ("PUT", "/api/v1/review/date/position", position),
+        ("POST", "/api/v1/review/date/finish", finish),
+    ):
+        missing = json.loads(body)
+        del missing["projection_revision"]
+        rejected = router.dispatch(
+            _request(
+                method,
+                target,
+                origin=ORIGIN,
+                content_type="application/json",
+                body=json.dumps(missing).encode(),
+            )
+        )
+        accepted = router.dispatch(
+            _request(
+                method,
+                target,
+                origin=ORIGIN,
+                content_type="application/json",
+                body=body,
+            )
+        )
+        assert rejected.status == 400
+        assert accepted.status == 200
+
+    assert seen == [json.loads(position), json.loads(finish)]
+
+
 def test_api_v1_route_surface_is_exact() -> None:
     from arxiv_digest.web.api import API_ROUTE_SURFACE
 
@@ -328,6 +583,7 @@ def test_api_v1_route_surface_is_exact() -> None:
             ("POST", "/api/v1/sync/start"),
             ("POST", "/api/v1/sync/cancel"),
             ("GET", "/api/v1/review/summary"),
+            ("POST", "/api/v1/review/finish"),
             ("GET", "/api/v1/review/calendar"),
             ("GET", "/api/v1/review/date"),
             ("PUT", "/api/v1/review/date/position"),
@@ -537,30 +793,29 @@ def test_first_setup_categories_update_accepts_revision_zero() -> None:
 def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None:
     from arxiv_digest.models import (
         AnnounceType,
-        Confidence,
-        DateBasis,
-        EventEvidence,
         EvidenceSource,
         PaperMetadata,
         ReviewEvent,
+        SourceObservation,
+        VersionResolution,
     )
     from arxiv_digest.ranking import RankedPaper, RankingReason, RankingTier
     from arxiv_digest.review import ReviewPage
     from arxiv_digest.web.api import ReviewPagePayload, project_review_page
 
     day = date(2026, 8, 22)
-    evidence = tuple(
-        EventEvidence(
+    observations = tuple(
+        SourceObservation(
             source_key=f"catchup:{category}",
+            arxiv_id="2608.02001",
             source=EvidenceSource.CATCHUP,
-            confidence=Confidence.RECOVERED,
             category=category,
             announce_type=AnnounceType.REPLACE,
-            mailing_date=day,
+            daily_list_date=day,
             announced_version=None,
             list_position=index,
             oai_datestamp=None,
-            raw_sha256="a" * 64,
+            response_sha256="a" * 64,
             observed_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
         )
         for index, category in enumerate(("cs.SE", "cs.LG"), start=1)
@@ -569,10 +824,9 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
         event_id=7,
         arxiv_id="2608.02001",
         announced_version=2,
-        effective_date=day,
-        date_basis=DateBasis.CATCHUP_MAILING,
-        confidence=Confidence.RECOVERED,
-        evidence=evidence,
+        daily_list_date=day,
+        version_resolution=VersionResolution.CHRONOLOGY_MATCHED,
+        observations=observations,
         queue_revision=7,
         reviewed_at=None,
     )
@@ -595,6 +849,8 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
         day=day,
         cards=(card,),
         snapshot_revision=7,
+        profile_revision=4,
+        projection_revision=9,
         anchor_event_id=7,
         previous_anchor_event_id=None,
         next_anchor_event_id=None,
@@ -607,30 +863,34 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
     )
 
     projected = project_review_page(
-        ReviewPagePayload(page=page, last_finished_revision=5)
+        ReviewPagePayload(
+            page=page,
+            last_finished_revision=5,
+            latest_known_versions={event.arxiv_id: 3},
+        )
     )
 
     assert projected["previous_date"] == "2026-08-20"
     assert projected["next_unreviewed_date"] == "2026-08-25"
+    assert projected["profile_revision"] == 4
+    assert projected["projection_revision"] == 9
     assert projected["cards"] == [
         {
             "event_id": 7,
             "arxiv_id": "2608.02001",
-            "announced_version": 2,
-            "download_version": 2,
+            "daily_list_date": "2026-08-22",
+            "event_label": "Replacement",
+            "version_resolution": "chronology_matched",
+            "version_label": "Version v2 — matched by chronology",
+            "support_categories": ["cs.LG", "cs.SE"],
+            "resolved_announcement_version": 2,
+            "latest_known_version": 3,
             "title": "Safe synthetic title <script>",
             "authors": ["Aster Vale"],
             "abstract": "Safe synthetic abstract.",
             "comments": "",
             "journal_ref": "",
             "doi": None,
-            "primary_category": "cs.SE",
-            "categories": ["cs.SE", "cs.LG"],
-            "category_observations": ["cs.LG", "cs.SE"],
-            "effective_date": "2026-08-22",
-            "date_label": "arXiv mailing date",
-            "confidence": "recovered",
-            "confidence_label": "Recovered announcement",
             "newly_discovered": True,
             "reviewed": False,
             "tier": "top",
@@ -638,23 +898,29 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
             "reasons": [
                 {"kind": "author", "label": "Matched Aster Vale", "location": "authors"}
             ],
-            "evidence": [
-                {
-                    "source": "catchup",
-                    "confidence": "recovered",
-                    "confidence_label": "Recovered announcement",
-                    "category": category,
-                    "announce_type": "replace",
-                    "mailing_date": "2026-08-22",
-                    "announced_version": None,
-                    "list_position": index,
-                }
-                for index, category in enumerate(("cs.SE", "cs.LG"), start=1)
-            ],
         }
     ]
 
-    versionless = replace(event, announced_version=None)
+    forbidden = {
+        "announced_version",
+        "announced_version_exact",
+        "download_version",
+        "effective_date",
+        "date_basis",
+        "date_label",
+        "confidence",
+        "confidence_label",
+        "categories",
+        "category_observations",
+        "evidence",
+    }
+    assert forbidden.isdisjoint(projected["cards"][0])
+
+    versionless = replace(
+        event,
+        announced_version=None,
+        version_resolution=VersionResolution.UNCONFIRMED,
+    )
     versionless_page = replace(
         page,
         cards=(replace(card, event=versionless),),
@@ -663,18 +929,65 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
         ReviewPagePayload(
             page=versionless_page,
             last_finished_revision=5,
-            download_versions={event.arxiv_id: 3},
+            latest_known_versions={event.arxiv_id: 3},
         )
     )
-    assert projected_versionless["cards"][0]["announced_version"] is None
-    assert projected_versionless["cards"][0]["download_version"] == 3
+    unconfirmed = projected_versionless["cards"][0]
+    assert unconfirmed["resolved_announcement_version"] is None
+    assert unconfirmed["latest_known_version"] == 3
+    assert unconfirmed["version_label"] == "Version not confirmed"
+    assert unconfirmed["event_label"] == "Replacement"
+
+    atom_confirmed = project_review_page(
+        ReviewPagePayload(
+            page=replace(
+                page,
+                cards=(
+                    replace(
+                        card,
+                        event=replace(
+                            event,
+                            version_resolution=VersionResolution.ATOM_CONFIRMED,
+                        ),
+                    ),
+                ),
+            ),
+            last_finished_revision=5,
+            latest_known_versions={event.arxiv_id: 3},
+        )
+    )["cards"][0]
+    assert atom_confirmed["version_label"] == "Announced v2 — Atom-confirmed"
 
 
-def test_setup_draft_projection_never_exposes_destination_paths() -> None:
+def test_destination_display_path_is_home_relative_and_component_aware() -> None:
+    from arxiv_digest.web.api import _destination_display_path
+
+    home = Path("/") / "synthetic-home"
+
+    assert _destination_display_path(home, home=home) == "~"
+    assert (
+        _destination_display_path(home / "Documents" / "Papers", home=home)
+        == "~/Documents/Papers"
+    )
+    outside = Path("/") / "synthetic-home-other" / "Papers"
+    assert (
+        _destination_display_path(outside, home=home)
+        == str(outside.resolve(strict=False))
+    )
+
+
+def test_setup_draft_projection_uses_a_read_only_home_relative_destination_path() -> None:
     from arxiv_digest.profile import PdfDestination
     from arxiv_digest.setup import SetupDraft, SetupStep
     from arxiv_digest.web.api import SetupDraftPayload, project_setup_draft
 
+    seed = SimpleNamespace(
+        paper=SimpleNamespace(
+            arxiv_id="2205.13427",
+            title="A titled seed paper",
+        )
+    )
+    destination = Path.home() / "Private Project" / "PDFs"
     draft = SetupDraft(
         schema_version=1,
         revision=6,
@@ -686,13 +999,13 @@ def test_setup_draft_projection_never_exposes_destination_paths() -> None:
         corpus_categories=("cs.SE",),
         corpus_complete=True,
         corpus_reduced_breadth=False,
-        seed_papers=(),
+        seed_papers=(seed,),
         keywords=("testing",),
         phrases=(),
         authors=("Aster Vale",),
         pdf_destination=PdfDestination(
             "custom",
-            __import__("pathlib").Path("/") / "Users" / "private" / "research",
+            destination,
         ),
         destination_tested=True,
         review_confirmed=False,
@@ -701,15 +1014,37 @@ def test_setup_draft_projection_never_exposes_destination_paths() -> None:
         updated_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
     )
 
-    projected = project_setup_draft(SetupDraftPayload(draft))
+    corpus_job = {
+        "job_id": "setup_reload1234",
+        "status": "running",
+        "complete": False,
+        "failed": False,
+    }
+    projected = project_setup_draft(
+        SetupDraftPayload(draft, corpus_job=corpus_job)
+    )
     encoded = json.dumps(projected)
 
     assert projected["current_step"] == "review"
     assert projected["recommended_coverage_start"] == "2026-07-23"
+    assert projected["coverage_min"] == "2026-05-25"
+    assert projected["coverage_max"] == "2026-08-22"
+    assert projected["seed_papers"] == ["2205.13427"]
+    assert projected["profile_summary"]["seed_paper_details"] == [
+        {
+            "arxiv_id": "2205.13427",
+            "title": "A titled seed paper",
+        }
+    ]
     assert projected["pdf_destination"] == {"kind": "custom"}
     assert projected["profile_summary"]["pdf_destination_kind"] == "custom"
+    assert (
+        projected["profile_summary"]["pdf_destination_display_path"]
+        == "~/Private Project/PDFs"
+    )
     assert len(projected["profile_summary_sha256"]) == 64
-    assert ("/" + "/".join(("Users", "private"))) not in encoded
+    assert projected["corpus_job"] == corpus_job
+    assert str(destination) not in encoded
 
 
 def test_setup_draft_get_reports_a_resumable_partial_candidate_cache() -> None:
@@ -881,6 +1216,30 @@ def test_category_browsing_deduplicates_current_oai_hierarchy() -> None:
     }
 
 
+def test_category_browsing_searches_names_and_codes_case_insensitively() -> None:
+    from arxiv_digest.application import _DefaultRuntime
+
+    runtime = object.__new__(_DefaultRuntime)
+    runtime._category_values = (
+        SimpleNamespace(
+            set_spec="arXiv:math.AG",
+            display_name="Algebraic Geometry",
+        ),
+        SimpleNamespace(
+            set_spec="arXiv:stat.ML",
+            display_name="Machine Learning",
+        ),
+    )
+    runtime._issued_category_pairs = set()
+
+    for query in ("AG", "algebraic", "math.AG"):
+        result = runtime._categories({"q": query})["categories"]
+        assert [
+            (item["category"], item["set_spec"])
+            for item in result
+        ] == [("math.AG", "arXiv:math.AG")]
+
+
 def test_setup_authorizes_only_category_pairs_returned_to_the_browser() -> None:
     from arxiv_digest.application import _DefaultRuntime
     from arxiv_digest.web.api import ApiRouter
@@ -945,6 +1304,7 @@ def test_failed_browser_restore_retains_validated_pending_inspection(
     runtime.folder = SimpleNamespace(validate=lambda choice: "destination")
     runtime.paths = SimpleNamespace()
     runtime.maintenance = MaintenanceBarrier()
+    runtime._candidate_state_lock = threading.RLock()
     runtime._expire_pending_restores = lambda: None
     monkeypatch.setattr(
         arxiv_digest.backup,
@@ -982,8 +1342,8 @@ def test_browser_backup_inspection_returns_safe_renderable_summary(
     runtime._pending_restore_reservations = {}
     runtime._pending_restores = {}
     manifest = SimpleNamespace(
-        format_version=1,
-        application_version="0.1.0",
+        format_version=2,
+        application_version="0.2.0",
         created_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
     )
     profile = SimpleNamespace(
@@ -998,8 +1358,8 @@ def test_browser_backup_inspection_returns_safe_renderable_summary(
             profile=profile,
             records=(
                 SimpleNamespace(record_type="saved_paper"),
-                SimpleNamespace(record_type="review_event"),
-                SimpleNamespace(record_type="review_event"),
+                SimpleNamespace(record_type="canonical_event"),
+                SimpleNamespace(record_type="canonical_event"),
             ),
         )
 
@@ -1032,8 +1392,8 @@ def test_browser_backup_inspection_bounds_concurrent_pending_archives(
     runtime._pending_restore_reservations = {}
     runtime._pending_restores = {}
     manifest = SimpleNamespace(
-        format_version=1,
-        application_version="0.1.0",
+        format_version=2,
+        application_version="0.2.0",
         created_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
     )
     profile = SimpleNamespace(revision=1, categories=())
@@ -1092,8 +1452,8 @@ def test_browser_backup_inspection_bounds_total_pending_archive_bytes(
     runtime._pending_restore_reservations = {}
     runtime._pending_restores = {}
     manifest = SimpleNamespace(
-        format_version=1,
-        application_version="0.1.0",
+        format_version=2,
+        application_version="0.2.0",
         created_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
     )
     profile = SimpleNamespace(revision=1, categories=())
@@ -1196,6 +1556,14 @@ def test_interests_api_projects_bounded_current_corpus_suggestions_without_savin
         title="Existing seed",
         authors=("Aster Vale",),
     )
+    stored_papers = {
+        "2608.00001": candidate_paper,
+        "2608.99999": SimpleNamespace(
+            arxiv_id="2608.99999",
+            title="Older stored seed",
+            authors=("Legacy Researcher",),
+        ),
+    }
     suggested_paper = SimpleNamespace(
         arxiv_id="2608.00002",
         title="Suggested paper",
@@ -1249,7 +1617,10 @@ def test_interests_api_projects_bounded_current_corpus_suggestions_without_savin
     )
     runtime = object.__new__(_DefaultRuntime)
     runtime.profiles = SimpleNamespace(load=lambda: profile)
-    runtime.store = SimpleNamespace(category_sync_state=lambda category: state)
+    runtime.store = SimpleNamespace(
+        category_sync_state=lambda category: state,
+        article_metadata=lambda arxiv_id: stored_papers[arxiv_id],
+    )
     runtime._candidate_build = SimpleNamespace(
         corpus=corpus,
         corpus_hash="b" * 64,
@@ -1269,10 +1640,12 @@ def test_interests_api_projects_bounded_current_corpus_suggestions_without_savin
     runtime._suggestions = {}
     runtime._suggestion_ids = {}
     runtime.setup = SimpleNamespace(
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
         publish_profile=lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("GET /interests must not publish a profile")
         )
     )
+    runtime.sync = SimpleNamespace(catchup_window_days=60)
 
     response = ApiRouter(
         token=TOKEN,
@@ -1283,6 +1656,20 @@ def test_interests_api_projects_bounded_current_corpus_suggestions_without_savin
 
     assert response.status == 200
     assert result["revision"] == 7
+    assert result["coverage_min"] == "2026-06-24"
+    assert result["coverage_max"] == "2026-08-21"
+    assert result["seed_paper_details"] == [
+        {
+            "arxiv_id": "2608.00001",
+            "title": "Existing seed",
+            "authors": ["Aster Vale"],
+        },
+        {
+            "arxiv_id": "2608.99999",
+            "title": "Older stored seed",
+            "authors": ["Legacy Researcher"],
+        },
+    ]
     assert result["suggestions_generated_at"] == "2026-08-22T12:00:00+00:00"
     assert len(result["suggestions"]["categories"]) == 30
     assert result["suggestions"]["categories"][0] == {
@@ -1310,6 +1697,284 @@ def test_interests_api_projects_bounded_current_corpus_suggestions_without_savin
     assert ("cs.ZZ00", "cs:ZZ00") in runtime._issued_category_pairs
 
 
+def test_interests_edit_publishes_profile_v2_with_exact_active_coverage() -> None:
+    from arxiv_digest.application import _DefaultRuntime
+    from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
+
+    coverage_start = date(2026, 7, 1)
+    current = Profile(
+        schema_version=2,
+        revision=3,
+        category_coverage=(ProfileCategory("cs.SE", coverage_start),),
+        keywords=("testing",),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+    )
+    state = SimpleNamespace(
+        category="cs.SE",
+        set_spec="cs:SE",
+        coverage_start=date(2025, 1, 1),
+    )
+    published = []
+    runtime = object.__new__(_DefaultRuntime)
+    runtime.profiles = SimpleNamespace(load=lambda: current)
+    runtime.store = SimpleNamespace(category_sync_state=lambda _category: state)
+    runtime.candidates = SimpleNamespace()
+    runtime.known_paper = lambda _arxiv_id: False
+    runtime._issued_category_pairs = set()
+    runtime.setup = SimpleNamespace(
+        publish_profile=lambda profile, configs, **kwargs: published.append(
+            (profile, configs, kwargs)
+        )
+    )
+    runtime._profile_value = lambda profile, _store: {
+        "revision": profile.revision
+    }
+
+    result = runtime._interests_put(
+        {"expected_revision": 3, "keywords": ["verification"]}
+    )
+
+    assert result == {"revision": 4}
+    assert len(published) == 1
+    profile, configs, options = published[0]
+    assert profile.schema_version == 2
+    assert profile.category_coverage == (
+        ProfileCategory("cs.SE", coverage_start),
+    )
+    assert tuple(
+        (config.category, config.coverage_start) for config in configs
+    ) == (("cs.SE", coverage_start),)
+    assert options == {"seed_papers": (), "expected_revision": 3}
+
+
+def test_profile_projection_reports_authoritative_profile_coverage() -> None:
+    from arxiv_digest.application import _DefaultRuntime
+    from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
+
+    profile = Profile(
+        schema_version=2,
+        revision=3,
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 7, 1)),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+    )
+    state = SimpleNamespace(
+        set_spec="cs:SE",
+        coverage_start=date(2025, 1, 1),
+    )
+    store = SimpleNamespace(category_sync_state=lambda _category: state)
+
+    projected = _DefaultRuntime._profile_value(profile, store)
+
+    assert projected["categories"] == [
+        {
+            "category": "cs.SE",
+            "set_spec": "cs:SE",
+            "coverage_start": "2026-07-01",
+        }
+    ]
+
+
+def test_interests_readd_requires_fresh_coverage_when_sync_state_is_retained(
+) -> None:
+    from arxiv_digest.application import _DefaultRuntime
+    from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
+
+    current = Profile(
+        schema_version=2,
+        revision=4,
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 7, 1)),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+    )
+    states = {
+        "cs.SE": SimpleNamespace(
+            set_spec="cs:SE", coverage_start=date(2026, 7, 1)
+        ),
+        "cs.LG": SimpleNamespace(
+            set_spec="cs:LG", coverage_start=date(2025, 1, 1)
+        ),
+    }
+    published = []
+    runtime = object.__new__(_DefaultRuntime)
+    runtime.profiles = SimpleNamespace(load=lambda: current)
+    runtime.store = SimpleNamespace(
+        category_sync_state=lambda category: states[category]
+    )
+    runtime.candidates = SimpleNamespace()
+    runtime.known_paper = lambda _arxiv_id: False
+    runtime._issued_category_pairs = {("cs.LG", "cs:LG")}
+    runtime.setup = SimpleNamespace(
+        publish_profile=lambda *args, **kwargs: published.append((args, kwargs))
+    )
+    runtime._profile_value = lambda profile, _store: {
+        "revision": profile.revision
+    }
+
+    with __import__("pytest").raises(
+        ValueError, match="exact coverage configuration"
+    ):
+        runtime._interests_put(
+            {
+                "expected_revision": 4,
+                "categories": [
+                    {"category": "cs.SE", "set_spec": "cs:SE"},
+                    {"category": "cs.LG", "set_spec": "cs:LG"},
+                ],
+            }
+        )
+
+    assert published == []
+
+
+def test_interests_readd_rejects_coverage_outside_supported_window() -> None:
+    from arxiv_digest.application import _DefaultRuntime
+    from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
+
+    current = Profile(
+        schema_version=2,
+        revision=4,
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 7, 1)),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+    )
+    published = []
+    runtime = object.__new__(_DefaultRuntime)
+    runtime.profiles = SimpleNamespace(load=lambda: current)
+    runtime.store = SimpleNamespace(
+        category_sync_state=lambda category: SimpleNamespace(
+            set_spec="cs:LG" if category == "cs.LG" else "cs:SE",
+            coverage_start=date(2025, 1, 1),
+        )
+    )
+    runtime.candidates = SimpleNamespace()
+    runtime.known_paper = lambda _arxiv_id: False
+    runtime._issued_category_pairs = {("cs.LG", "cs:LG")}
+    runtime.setup = SimpleNamespace(
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
+        publish_profile=lambda *args, **kwargs: published.append((args, kwargs)),
+    )
+    runtime.sync = SimpleNamespace(catchup_window_days=90)
+
+    with __import__("pytest").raises(ValueError, match="recovery window"):
+        runtime._interests_put(
+            {
+                "expected_revision": 4,
+                "categories": [
+                    {"category": "cs.SE", "set_spec": "cs:SE"},
+                    {"category": "cs.LG", "set_spec": "cs:LG"},
+                ],
+                "category_configs": [
+                    {
+                        "category": "cs.LG",
+                        "set_spec": "cs:LG",
+                        "coverage_start": "2026-05-24",
+                    }
+                ],
+            }
+        )
+
+    assert published == []
+
+
+def test_interests_readd_uses_fresh_coverage_not_the_retained_boundary() -> None:
+    from arxiv_digest.application import _DefaultRuntime
+    from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
+
+    current = Profile(
+        schema_version=2,
+        revision=4,
+        category_coverage=(
+            ProfileCategory("cs.SE", date(2026, 7, 1)),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+    )
+    states = {
+        "cs.SE": SimpleNamespace(
+            set_spec="cs:SE", coverage_start=date(2026, 7, 1)
+        ),
+        "cs.LG": SimpleNamespace(
+            set_spec="cs:LG", coverage_start=date(2025, 1, 1)
+        ),
+    }
+    published = []
+    sync_starts = []
+    runtime = object.__new__(_DefaultRuntime)
+    runtime.profiles = SimpleNamespace(load=lambda: current)
+    runtime.store = SimpleNamespace(
+        category_sync_state=lambda category: states[category]
+    )
+    runtime.candidates = SimpleNamespace()
+    runtime.known_paper = lambda _arxiv_id: False
+    runtime._issued_category_pairs = {("cs.LG", "cs:LG")}
+    runtime.setup = SimpleNamespace(
+        publish_profile=lambda profile, configs, **kwargs: published.append(
+            (profile, configs, kwargs)
+        )
+    )
+    runtime._profile_value = lambda profile, _store: {
+        "revision": profile.revision
+    }
+    runtime._start_sync_job = lambda payload: sync_starts.append(payload) or {
+        "job_id": "sync_existing"
+    }
+
+    result = runtime._interests_put(
+        {
+            "expected_revision": 4,
+            "categories": [
+                {"category": "cs.SE", "set_spec": "cs:SE"},
+                {"category": "cs.LG", "set_spec": "cs:LG"},
+            ],
+            "category_configs": [
+                {
+                    "category": "cs.LG",
+                    "set_spec": "cs:LG",
+                    "coverage_start": "2026-08-01",
+                }
+            ],
+        }
+    )
+
+    assert result == {"revision": 5}
+    profile, configs, options = published[0]
+    assert profile.category_coverage == (
+        ProfileCategory("cs.SE", date(2026, 7, 1)),
+        ProfileCategory("cs.LG", date(2026, 8, 1)),
+    )
+    assert tuple(
+        (config.category, config.oai_set_spec, config.coverage_start)
+        for config in configs
+    ) == (
+        ("cs.SE", "cs:SE", date(2026, 7, 1)),
+        ("cs.LG", "cs:LG", date(2026, 8, 1)),
+    )
+    assert options == {"seed_papers": (), "expected_revision": 4}
+    assert sync_starts == [{"follow_up": True}]
+
+
 def test_fresh_interests_suggestions_resume_the_current_profile_candidate_corpus(
     monkeypatch,
 ) -> None:
@@ -1319,9 +1984,17 @@ def test_fresh_interests_suggestions_resume_the_current_profile_candidate_corpus
     from arxiv_digest.web.api import ApiRouter
 
     profile = SimpleNamespace(
-        schema_version=1,
+        schema_version=2,
         revision=8,
         categories=("cs.SE", "cs.LG"),
+        category_coverage=(
+            SimpleNamespace(
+                category="cs.SE", coverage_start=date(2026, 7, 1)
+            ),
+            SimpleNamespace(
+                category="cs.LG", coverage_start=date(2026, 8, 1)
+            ),
+        ),
         keywords=("testing",),
         phrases=(),
         authors=(),
@@ -1332,12 +2005,12 @@ def test_fresh_interests_suggestions_resume_the_current_profile_candidate_corpus
         "cs.SE": SimpleNamespace(
             category="cs.SE",
             set_spec="cs:SE",
-            coverage_start=date(2026, 7, 1),
+            coverage_start=date(2025, 7, 1),
         ),
         "cs.LG": SimpleNamespace(
             category="cs.LG",
             set_spec="cs:LG",
-            coverage_start=date(2026, 8, 1),
+            coverage_start=date(2025, 8, 1),
         ),
     }
     corpus = SimpleNamespace(

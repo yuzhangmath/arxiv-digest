@@ -1,46 +1,63 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
-from arxiv_digest.rate_limit import ArxivRequestCancelled
 from arxiv_digest.models import (
-    AnnounceType,
-    AtomBatch,
-    AtomEntry,
     CategoryConfig,
     CatchupDay,
-    Confidence,
-    DateBasis,
+    CatchupDayStatus,
     EnrichmentStatus,
-    EventCandidate,
-    EventEvidence,
-    EvidenceSource,
-    OaiArticle,
 )
+from arxiv_digest.rate_limit import ArxivRequestCancelled
+from arxiv_digest.sources.atom import atom_observations
+from arxiv_digest.sources.catchup import catchup_observations
 from arxiv_digest.sources.oai import (
     OaiPage,
     OaiProtocolError,
     durable_protocol_error_code,
+    oai_observations,
 )
-from arxiv_digest.storage.store import (
-    CategorySyncRecord,
-    EnrichmentDayRecord,
-    Store,
-    StoredArticleSnapshot,
-)
+from arxiv_digest.storage.store import CategorySyncRecord, Store
 
 
-_SOURCE_STRENGTH = {
-    EvidenceSource.ATOM: 0,
-    EvidenceSource.CATCHUP: 1,
-    EvidenceSource.OAI: 2,
-}
 _MAILING_TIME_ZONE = ZoneInfo("America/New_York")
+SUPPORTED_CATCHUP_WINDOW_DAYS = 90
+DEFAULT_CATCHUP_FINALIZATION_HOUR = 20
+
+
+def daily_list_coverage_bounds(
+    observed_at: datetime,
+    *,
+    window_days: int = SUPPORTED_CATCHUP_WINDOW_DAYS,
+    finalization_hour: int = DEFAULT_CATCHUP_FINALIZATION_HOUR,
+    mailing_today: date | None = None,
+) -> tuple[date, date]:
+    """Return recoverable bounds under the New York mailing-day policy."""
+
+    if observed_at.tzinfo is None or observed_at.utcoffset() != timedelta(0):
+        raise ValueError("coverage clock must return UTC")
+    if type(window_days) is not int or not (
+        1 <= window_days <= SUPPORTED_CATCHUP_WINDOW_DAYS
+    ):
+        raise ValueError("catch-up window must be between 1 and 90 days")
+    if type(finalization_hour) is not int or not 0 <= finalization_hour <= 23:
+        raise ValueError("catch-up finalization hour must be between 0 and 23")
+    local_now = observed_at.astimezone(_MAILING_TIME_ZONE)
+    today = local_now.date() if mailing_today is None else mailing_today
+    if type(today) is not date:
+        raise TypeError("mailing today must be a calendar date")
+    latest_finalized = (
+        today
+        if local_now.hour >= finalization_hour
+        else today - timedelta(days=1)
+    )
+    return (
+        today - timedelta(days=window_days - 1),
+        latest_finalized,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +85,17 @@ class CategoryProgress:
     exact_start: date | None
     exact_end: date | None
     missing_exact_dates: tuple[date, ...]
+    failed_exact_dates: tuple[date, ...]
+    retryable_failed_exact_dates: tuple[date, ...]
+    target_dates: tuple[date, ...] = ()
+    checked_dates: tuple[date, ...] = ()
+    dates_with_papers: tuple[date, ...] = ()
+    empty_dates: tuple[date, ...] = ()
+    failed_dates: tuple[date, ...] = ()
+    pending_dates: tuple[date, ...] = ()
+    unavailable_dates: tuple[date, ...] = ()
+    daily_list_status: str = "idle"
+    daily_list_errors: tuple[tuple[date, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,258 +106,18 @@ class SyncReport:
     exact_start: date | None
     exact_end: date | None
     missing_exact_dates: tuple[date, ...]
+    target_dates: int = 0
+    checked_dates: int = 0
+    dates_with_papers: int = 0
+    empty_dates: int = 0
+    failed_dates: int = 0
+    pending_dates: int = 0
+    unavailable_dates: int = 0
+    daily_list_status: str = "idle"
 
 
 class SyncCancelled(Exception):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class AssociatedEvent:
-    arxiv_id: str
-    announced_version: int | None
-    effective_date: date
-    date_basis: DateBasis
-    confidence: Confidence
-    evidence: tuple[EventEvidence, ...]
-
-    def as_candidates(self) -> tuple[EventCandidate, ...]:
-        return tuple(
-            EventCandidate(
-                arxiv_id=self.arxiv_id,
-                announced_version=self.announced_version,
-                effective_date=self.effective_date,
-                date_basis=self.date_basis,
-                evidence=item,
-            )
-            for item in self.evidence
-        )
-
-
-def associate_evidence(
-    candidates: tuple[EventCandidate, ...],
-) -> tuple[AssociatedEvent, ...]:
-    parents = list(range(len(candidates)))
-
-    def find(index: int) -> int:
-        while parents[index] != index:
-            parents[index] = parents[parents[index]]
-            index = parents[index]
-        return index
-
-    def union(left: int, right: int) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            left_versions = {
-                candidate.announced_version
-                for index, candidate in enumerate(candidates)
-                if find(index) == left_root
-                and candidate.announced_version is not None
-            }
-            right_versions = {
-                candidate.announced_version
-                for index, candidate in enumerate(candidates)
-                if find(index) == right_root
-                and candidate.announced_version is not None
-            }
-            if len(left_versions | right_versions) > 1:
-                return
-            survivor = min(left_root, right_root)
-            parents[max(left_root, right_root)] = survivor
-
-    for left_index, left in enumerate(candidates):
-        for right_index in range(left_index + 1, len(candidates)):
-            right = candidates[right_index]
-            if left.arxiv_id != right.arxiv_id:
-                continue
-            if (
-                left.announced_version == right.announced_version
-                and left.effective_date == right.effective_date
-            ):
-                union(left_index, right_index)
-                continue
-            pair = {left.evidence.source, right.evidence.source}
-            if pair == {EvidenceSource.ATOM, EvidenceSource.OAI}:
-                if (
-                    left.announced_version is not None
-                    and left.announced_version == right.announced_version
-                ):
-                    union(left_index, right_index)
-            elif pair == {EvidenceSource.ATOM, EvidenceSource.CATCHUP}:
-                # Resolve below only after checking all matching Atom versions.
-                continue
-
-    for catchup_index, catchup in enumerate(candidates):
-        if catchup.evidence.source is not EvidenceSource.CATCHUP:
-            continue
-        compatible_atoms = [
-            index
-            for index, atom in enumerate(candidates)
-            if atom.evidence.source is EvidenceSource.ATOM
-            and atom.arxiv_id == catchup.arxiv_id
-            and atom.effective_date == catchup.effective_date
-            and atom.evidence.category == catchup.evidence.category
-        ]
-        atom_versions = {
-            candidates[index].announced_version for index in compatible_atoms
-        }
-        if len(atom_versions) == 1:
-            for atom_index in compatible_atoms:
-                union(catchup_index, atom_index)
-
-    for catchup_index, catchup in enumerate(candidates):
-        if catchup.evidence.source is not EvidenceSource.CATCHUP:
-            continue
-        compatible = [
-            index
-            for index, inferred in enumerate(candidates)
-            if inferred.evidence.source is EvidenceSource.OAI
-            and inferred.arxiv_id == catchup.arxiv_id
-            and inferred.effective_date == catchup.effective_date
-            and inferred.evidence.category == catchup.evidence.category
-            and inferred.announced_version is not None
-        ]
-        if len(compatible) == 1:
-            union(catchup_index, compatible[0])
-
-    groups: dict[int, list[tuple[int, EventCandidate]]] = {}
-    for index, candidate in enumerate(candidates):
-        groups.setdefault(find(index), []).append((index, candidate))
-
-    associated: list[tuple[int, AssociatedEvent]] = []
-    for values in groups.values():
-        first_index = min(index for index, _ in values)
-        ordered = sorted(
-            (candidate for _, candidate in values),
-            key=lambda candidate: (
-                _SOURCE_STRENGTH[candidate.evidence.source],
-                candidate.evidence.source_key,
-            ),
-        )
-        strongest = ordered[0]
-        announced_version = strongest.announced_version
-        if announced_version is None:
-            announced_version = next(
-                (
-                    candidate.announced_version
-                    for candidate in ordered
-                    if candidate.announced_version is not None
-                ),
-                None,
-            )
-        associated.append(
-            (
-                first_index,
-                AssociatedEvent(
-                    arxiv_id=strongest.arxiv_id,
-                    announced_version=announced_version,
-                    effective_date=strongest.effective_date,
-                    date_basis=strongest.date_basis,
-                    confidence=strongest.evidence.confidence,
-                    evidence=tuple(candidate.evidence for candidate in ordered),
-                ),
-            )
-        )
-    return tuple(value for _, value in sorted(associated, key=lambda item: item[0]))
-
-
-def diff_oai_article(
-    previous: StoredArticleSnapshot | None,
-    current: OaiArticle,
-    category: str,
-    coverage_start: date,
-    *,
-    set_spec: str | None = None,
-    raw_sha256: str | None = None,
-    observed_at: datetime | None = None,
-) -> tuple[EventCandidate, ...]:
-    if raw_sha256 is None or observed_at is None:
-        if previous is None:
-            raise ValueError("OAI inference requires response provenance")
-        raw_sha256 = previous.last_raw_sha256
-        observed_at = previous.last_seen_at
-    effective_set_spec = category if set_spec is None else set_spec
-    known_versions = (
-        set() if previous is None else {version.number for version in previous.versions}
-    )
-    candidates: list[EventCandidate] = []
-    for version in current.versions:
-        effective_date = version.submitted_at.date()
-        if version.number in known_versions or effective_date < coverage_start:
-            continue
-        announce_type = (
-            AnnounceType.NEW if version.number == 1 else AnnounceType.REPLACE
-        )
-        evidence = EventEvidence(
-            source_key=(
-                f"oai:{effective_set_spec}:{current.metadata.arxiv_id}:"
-                f"v{version.number}"
-            ),
-            source=EvidenceSource.OAI,
-            confidence=Confidence.INFERRED,
-            category=category,
-            announce_type=announce_type,
-            mailing_date=None,
-            announced_version=version.number,
-            list_position=None,
-            oai_datestamp=current.oai_datestamp,
-            raw_sha256=raw_sha256,
-            observed_at=observed_at,
-        )
-        candidates.append(
-            EventCandidate(
-                arxiv_id=current.metadata.arxiv_id,
-                announced_version=version.number,
-                effective_date=effective_date,
-                date_basis=DateBasis.VERSION_HISTORY_UTC,
-                evidence=evidence,
-            )
-        )
-    if (
-        previous is not None
-        and not candidates
-        and category != current.metadata.primary_category
-        and category in current.metadata.categories
-        and category not in previous.observed_categories
-        and current.versions
-    ):
-        supporting_version = current.versions[-1]
-        effective_date = supporting_version.submitted_at.date()
-        if effective_date >= coverage_start:
-            category_set_hash = hashlib.sha256(
-                json.dumps(
-                    sorted(current.metadata.categories),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-            evidence = EventEvidence(
-                source_key=(
-                    f"oai-category:{category}:{current.metadata.arxiv_id}:"
-                    f"{category_set_hash}"
-                ),
-                source=EvidenceSource.OAI,
-                confidence=Confidence.INFERRED,
-                category=category,
-                announce_type=AnnounceType.CROSS,
-                mailing_date=None,
-                announced_version=None,
-                list_position=None,
-                oai_datestamp=current.oai_datestamp,
-                raw_sha256=raw_sha256,
-                observed_at=observed_at,
-            )
-            candidates.append(
-                EventCandidate(
-                    arxiv_id=current.metadata.arxiv_id,
-                    announced_version=None,
-                    effective_date=effective_date,
-                    date_basis=DateBasis.VERSION_HISTORY_UTC,
-                    evidence=evidence,
-                )
-            )
-    return tuple(candidates)
 
 
 class SyncService:
@@ -345,20 +133,25 @@ class SyncService:
         clock: Callable[[], datetime] | None = None,
         today: Callable[[], date] | None = None,
         cancelled: Callable[[], bool] | None = None,
-        catchup_window_days: int = 90,
+        catchup_window_days: int = SUPPORTED_CATCHUP_WINDOW_DAYS,
+        catchup_finalization_hour: int = DEFAULT_CATCHUP_FINALIZATION_HOUR,
     ) -> None:
         if catchup_window_days < 1 or catchup_window_days > 90:
             raise ValueError("catch-up window must be between 1 and 90 days")
+        if not 0 <= catchup_finalization_hour <= 23:
+            raise ValueError("catch-up finalization hour must be between 0 and 23")
         self.store = store
         self.oai_source = oai_source
         self.atom_source = atom_source
         self.catchup_source = catchup_source
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._today_override = today
         self._today = today or (
             lambda: self._now().astimezone(_MAILING_TIME_ZONE).date()
         )
         self._cancelled = cancelled or (lambda: False)
         self.catchup_window_days = catchup_window_days
+        self.catchup_finalization_hour = catchup_finalization_hour
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -369,6 +162,25 @@ class SyncService:
     def _check_cancelled(self) -> None:
         if self._cancelled():
             raise SyncCancelled("synchronization was cancelled")
+
+    def _daily_list_date_is_finalized(self, value: date) -> bool:
+        return value <= self.coverage_bounds()[1]
+
+    def coverage_bounds(self) -> tuple[date, date]:
+        """Return the recoverable start and latest finalized mailing date."""
+
+        observed_at = self._now()
+        mailing_today = (
+            observed_at.astimezone(_MAILING_TIME_ZONE).date()
+            if self._today_override is None
+            else self._today()
+        )
+        return daily_list_coverage_bounds(
+            observed_at,
+            window_days=self.catchup_window_days,
+            finalization_hour=self.catchup_finalization_hour,
+            mailing_today=mailing_today,
+        )
 
     @staticmethod
     def _raise_cancelled(error: Exception) -> None:
@@ -406,6 +218,7 @@ class SyncService:
         configs: tuple[CategoryConfig, ...],
         *,
         catchup_dates: Mapping[str, Iterable[date]] | None = None,
+        attempted: Callable[[str, date], None] | None = None,
     ) -> SyncReport:
         if not configs:
             return SyncReport((), False, True, None, None, ())
@@ -419,15 +232,33 @@ class SyncService:
         network_successes = 0
         network_failures = 0
 
-        # Phase 1: finish each current OAI chain before slower enrichments.
+        # Exact daily-list recovery leads the network work so Review can fill
+        # while the hidden metadata sources are still running.
+        requested_by_category: dict[str, tuple[date, ...]] = {}
         for config in configs:
-            self._check_cancelled()
-            if self._sync_incremental(config):
-                network_successes += 1
-            else:
-                network_failures += 1
+            requested = self._eligible_catchup_dates(config, catchup_dates)
+            requested_by_category[config.category] = requested
+            self.store.ensure_catchup_targets(config.category, requested)
+        target_dates = sorted(
+            {
+                mailing_date
+                for requested in requested_by_category.values()
+                for mailing_date in requested
+            }
+        )
+        for mailing_date in target_dates:
+            for config in configs:
+                if mailing_date not in requested_by_category[config.category]:
+                    continue
+                self._check_cancelled()
+                if self._sync_catchup_day(config, mailing_date):
+                    network_successes += 1
+                else:
+                    network_failures += 1
+                if attempted is not None:
+                    attempted(config.category, mailing_date)
 
-        # Phase 2: current Atom remains independent of every OAI result.
+        # Atom and OAI enrich confirmed events but never create visible ones.
         for config in configs:
             self._check_cancelled()
             if self._sync_atom(config):
@@ -435,7 +266,13 @@ class SyncService:
             else:
                 network_failures += 1
 
-        # Phase 3: pending bounded history never blocks current checkpoints.
+        for config in configs:
+            self._check_cancelled()
+            if self._sync_incremental(config):
+                network_successes += 1
+            else:
+                network_failures += 1
+
         for config in configs:
             self._check_cancelled()
             state = self.store.category_sync_state(config.category)
@@ -446,17 +283,38 @@ class SyncService:
             else:
                 network_failures += 1
 
-        # Phase 4: best-effort exact mailing evidence is deliberately last.
+        return self.progress(
+            configs,
+            offline=network_failures > 0 and network_successes == 0,
+        )
+
+    def retry_failed_dates(
+        self,
+        configs: tuple[CategoryConfig, ...],
+        dates: Mapping[str, Iterable[date]],
+        *,
+        attempted: Callable[[str, date], None] | None = None,
+    ) -> SyncReport:
+        """Retry only the supplied exact daily-list dates."""
+
+        if len({config.category for config in configs}) != len(configs):
+            raise ValueError("selected categories must be unique")
+        network_successes = 0
+        network_failures = 0
         for config in configs:
-            self._check_cancelled()
-            requested = self._eligible_catchup_dates(config, catchup_dates)
+            self.store.ensure_category_state(
+                config.category, config.oai_set_spec, config.coverage_start
+            )
+            requested = self._eligible_catchup_dates(config, dates)
+            self.store.ensure_catchup_targets(config.category, requested)
             for mailing_date in requested:
                 self._check_cancelled()
                 if self._sync_catchup_day(config, mailing_date):
                     network_successes += 1
                 else:
                     network_failures += 1
-
+                if attempted is not None:
+                    attempted(config.category, mailing_date)
         return self.progress(
             configs,
             offline=network_failures > 0 and network_successes == 0,
@@ -492,8 +350,6 @@ class SyncService:
                     run_id,
                     config,
                     page,
-                    coverage_start=state.coverage_start,
-                    coverage_end=None,
                 )
                 completed_at = self._now()
                 self.store.complete_incremental_run(
@@ -517,50 +373,15 @@ class SyncService:
         run_id: int,
         config: CategoryConfig,
         first_page: OaiPage,
-        *,
-        coverage_start: date,
-        coverage_end: date | None,
     ) -> datetime:
         page = first_page
         while True:
-            self._check_cancelled()
-            identifiers = {
-                record.metadata.arxiv_id
-                for record in page.records
-                if isinstance(record, OaiArticle)
-            }
-            previous = {
-                snapshot.metadata.arxiv_id: snapshot
-                for snapshot in self.store.article_snapshots(
-                    config.category, identifiers
-                )
-            }
-            candidates: list[EventCandidate] = []
-            for record in page.records:
-                self._check_cancelled()
-                if not isinstance(record, OaiArticle):
-                    continue
-                inferred = diff_oai_article(
-                    previous.get(record.metadata.arxiv_id),
-                    record,
-                    config.category,
-                    coverage_start,
-                    set_spec=config.oai_set_spec,
-                    raw_sha256=page.raw_sha256,
-                    observed_at=page.response_date,
-                )
-                candidates.extend(
-                    candidate
-                    for candidate in inferred
-                    if coverage_end is None
-                    or candidate.effective_date <= coverage_end
-                )
             self._check_cancelled()
             self.store.apply_oai_page(
                 run_id,
                 config.category,
                 page.records,
-                tuple(candidates),
+                oai_observations(page),
                 page.raw_sha256,
                 page.response_date,
             )
@@ -572,33 +393,6 @@ class SyncService:
                 cancelled=self._cancelled,
             )
 
-    @staticmethod
-    def _atom_candidate(batch: AtomBatch, entry: AtomEntry) -> EventCandidate:
-        evidence = EventEvidence(
-            source_key=(
-                f"atom:{batch.category}:{entry.mailing_date}:"
-                f"{entry.metadata.arxiv_id}:v{entry.version.number}:"
-                f"{entry.announce_type.value}"
-            ),
-            source=EvidenceSource.ATOM,
-            confidence=Confidence.CURRENT,
-            category=batch.category,
-            announce_type=entry.announce_type,
-            mailing_date=entry.mailing_date,
-            announced_version=entry.version.number,
-            list_position=entry.position,
-            oai_datestamp=None,
-            raw_sha256=batch.raw_sha256,
-            observed_at=batch.fetched_at,
-        )
-        return EventCandidate(
-            arxiv_id=entry.metadata.arxiv_id,
-            announced_version=entry.version.number,
-            effective_date=entry.mailing_date,
-            date_basis=DateBasis.FEED_MAILING,
-            evidence=evidence,
-        )
-
     def _sync_atom(self, config: CategoryConfig) -> bool:
         try:
             self._check_cancelled()
@@ -609,41 +403,10 @@ class SyncService:
             self._check_cancelled()
             if batch.category != config.category:
                 raise ValueError("Atom category does not match the request")
-            for entry in batch.entries:
-                self._check_cancelled()
-                candidate = self._atom_candidate(batch, entry)
-                self.store.apply_event_batch(
-                    entry.metadata, (entry.version,), (candidate,)
-                )
-            self.store.record_enrichment_day(
-                EnrichmentDayRecord(
-                    category=config.category,
-                    mailing_date=batch.mailing_date,
-                    source="atom",
-                    status=(
-                        EnrichmentStatus.COMPLETE
-                        if batch.entries
-                        else EnrichmentStatus.EMPTY
-                    ),
-                    fetched_at=batch.fetched_at,
-                    raw_sha256=batch.raw_sha256,
-                )
-            )
+            self.store.apply_atom_batch(batch, atom_observations(batch))
             return True
         except Exception as error:
             self._raise_cancelled(error)
-            code, message = self._error(error, "Atom")
-            self.store.record_enrichment_day(
-                EnrichmentDayRecord(
-                    category=config.category,
-                    mailing_date=self._today(),
-                    source="atom",
-                    status=EnrichmentStatus.FAILED,
-                    fetched_at=self._now(),
-                    error_code=code,
-                    error_message=message,
-                )
-            )
             return False
 
     def extend_coverage(self, category: str, new_start: date) -> CategorySyncRecord:
@@ -657,6 +420,11 @@ class SyncService:
             and new_start >= state.pending_backfill_start
         ):
             return state
+        earliest, latest_finalized = self.coverage_bounds()
+        if not earliest <= new_start <= latest_finalized:
+            raise ValueError(
+                "requested coverage is outside the catch-up recovery window"
+            )
         identify = self.oai_source.identify(cancelled=self._cancelled)
         if new_start < identify.earliest_datestamp:
             raise ValueError("requested coverage predates the OAI repository")
@@ -672,47 +440,6 @@ class SyncService:
         pending_until = state.pending_backfill_until
         if pending_start is None or pending_until is None:
             raise ValueError("pending backfill interval is incomplete")
-
-        # Re-evaluate durable histories first, retaining original provenance.
-        try:
-            for snapshot in self.store.article_snapshots(config.category):
-                self._check_cancelled()
-                reconstructed = OaiArticle(
-                    oai_identifier=f"oai:arXiv.org:{snapshot.metadata.arxiv_id}",
-                    oai_datestamp=snapshot.last_oai_datestamp,
-                    set_specs=(config.oai_set_spec,),
-                    metadata=snapshot.metadata,
-                    versions=snapshot.versions,
-                )
-                candidates = tuple(
-                    candidate
-                    for candidate in diff_oai_article(
-                        None,
-                        reconstructed,
-                        config.category,
-                        pending_start,
-                        set_spec=config.oai_set_spec,
-                        raw_sha256=snapshot.last_raw_sha256,
-                        observed_at=snapshot.last_seen_at,
-                    )
-                    if candidate.effective_date <= pending_until
-                )
-                if candidates:
-                    self.store.apply_event_batch(
-                        snapshot.metadata, snapshot.versions, candidates
-                    )
-        except Exception as error:
-            self._raise_cancelled(error)
-            run_id = self.store.begin_sync_run(
-                config.category,
-                "coverage_backfill",
-                pending_start,
-                pending_until,
-                self._now(),
-            )
-            code, message = self._error(error, "historical backfill")
-            self.store.fail_sync_run(run_id, code, message, self._now())
-            return False
 
         run_id = self.store.begin_sync_run(
             config.category,
@@ -733,8 +460,6 @@ class SyncService:
                 run_id,
                 config,
                 page,
-                coverage_start=pending_start,
-                coverage_end=pending_until,
             )
             self.store.complete_backfill_run(
                 run_id, pending_start, final_response_at, self._now()
@@ -762,26 +487,17 @@ class SyncService:
         else:
             requested = supplied.get(config.category, ())
         successful = {
-            record.mailing_date
-            for record in self.store.enrichment_records(config.category)
-            if record.status in {EnrichmentStatus.COMPLETE, EnrichmentStatus.EMPTY}
+            record.daily_list_date
+            for record in self.store.catchup_day_records(config.category)
+            if record.status
+            in {CatchupDayStatus.COMPLETE, CatchupDayStatus.EMPTY}
+            and self._daily_list_date_is_finalized(record.daily_list_date)
         }
         return tuple(
             day
             for day in sorted(set(requested))
             if earliest <= day <= today and day not in successful
         )
-
-    @staticmethod
-    def _catchup_hash(day: CatchupDay) -> str | None:
-        if not day.pages:
-            return None
-        if len(day.pages) == 1:
-            return day.pages[0].raw_sha256
-        digest = hashlib.sha256()
-        for page in sorted(day.pages, key=lambda value: value.page):
-            digest.update(page.raw_sha256.encode("ascii"))
-        return digest.hexdigest()
 
     def _sync_catchup_day(
         self, config: CategoryConfig, mailing_date: date
@@ -799,95 +515,94 @@ class SyncService:
                 or result.mailing_date != mailing_date
             ):
                 raise ValueError("catch-up response does not match the request")
-            for page in sorted(result.pages, key=lambda value: value.page):
-                self._check_cancelled()
-                for entry in page.entries:
-                    self._check_cancelled()
-                    evidence = EventEvidence(
-                        source_key=(
-                            f"catchup:{config.category}:{mailing_date}:"
-                            f"{entry.metadata.arxiv_id}:{entry.section.value}"
-                        ),
-                        source=EvidenceSource.CATCHUP,
-                        confidence=Confidence.RECOVERED,
-                        category=config.category,
-                        announce_type=entry.section,
-                        mailing_date=mailing_date,
-                        announced_version=None,
-                        list_position=entry.position,
-                        oai_datestamp=None,
-                        raw_sha256=page.raw_sha256,
-                        observed_at=self._now(),
-                    )
-                    candidate = EventCandidate(
-                        arxiv_id=entry.metadata.arxiv_id,
-                        announced_version=None,
-                        effective_date=mailing_date,
-                        date_basis=DateBasis.CATCHUP_MAILING,
-                        evidence=evidence,
-                    )
-                    self.store.apply_event_batch(
-                        entry.metadata, (), (candidate,)
-                    )
-            self.store.record_enrichment_day(
-                EnrichmentDayRecord(
-                    category=config.category,
-                    mailing_date=mailing_date,
-                    source="catchup",
-                    status=result.status,
-                    fetched_at=self._now(),
-                    raw_sha256=self._catchup_hash(result),
-                    error_code=result.error_code,
-                    error_message=result.error_message,
-                )
+            if (
+                result.status == EnrichmentStatus.EMPTY
+                and not self._daily_list_date_is_finalized(mailing_date)
+            ):
+                return True
+            attempted_at = self._now()
+            self.store.apply_catchup_day(
+                result,
+                catchup_observations(result, attempted_at),
+                attempted_at,
             )
-            return result.status is not EnrichmentStatus.FAILED
+            return result.status != EnrichmentStatus.FAILED
         except Exception as error:
             self._raise_cancelled(error)
             code, message = self._error(error, "catch-up")
-            self.store.record_enrichment_day(
-                EnrichmentDayRecord(
-                    category=config.category,
-                    mailing_date=mailing_date,
-                    source="catchup",
-                    status=EnrichmentStatus.FAILED,
-                    fetched_at=self._now(),
-                    error_code=code,
-                    error_message=message,
-                )
+            result = CatchupDay(
+                category=config.category,
+                mailing_date=mailing_date,
+                status=EnrichmentStatus.FAILED,
+                pages=(),
+                error_code=code,
+                error_message=message,
             )
+            self.store.apply_catchup_day(result, (), self._now())
             return False
 
     def progress(
         self, configs: tuple[CategoryConfig, ...], *, offline: bool = False
     ) -> SyncReport:
         values: list[CategoryProgress] = []
-        exact_sets: list[set[date]] = []
+        today = self._today()
+        retry_earliest = today - timedelta(days=self.catchup_window_days - 1)
+        statuses_by_category: dict[
+            str, dict[date, CatchupDayStatus]
+        ] = {}
         for config in configs:
             state = self.store.category_sync_state(config.category)
             backfill = self.store.latest_sync_run(
                 config.category, "coverage_backfill"
             )
-            records = self.store.enrichment_records(config.category)
-            observed = {record.mailing_date for record in records}
-            exact = {
-                record.mailing_date
-                for record in records
-                if record.status
-                in {EnrichmentStatus.COMPLETE, EnrichmentStatus.EMPTY}
+            records = tuple(
+                record
+                for record in self.store.catchup_day_records(config.category)
+                if record.daily_list_date >= config.coverage_start
+            )
+            statuses = {
+                record.daily_list_date: record.status for record in records
             }
+            statuses_by_category[config.category] = statuses
+            targets = tuple(sorted(statuses))
+            with_papers = tuple(
+                record.daily_list_date
+                for record in records
+                if record.status is CatchupDayStatus.COMPLETE
+            )
+            empty = tuple(
+                record.daily_list_date
+                for record in records
+                if record.status is CatchupDayStatus.EMPTY
+            )
+            failed = tuple(
+                record.daily_list_date
+                for record in records
+                if record.status is CatchupDayStatus.FAILED
+            )
+            pending = tuple(
+                record.daily_list_date
+                for record in records
+                if record.status is CatchupDayStatus.PENDING
+            )
+            checked = tuple(sorted((*with_papers, *empty, *failed)))
+            unavailable = tuple(
+                day
+                for day in (*failed, *pending)
+                if day < retry_earliest
+            )
+            retryable_failed_exact = tuple(
+                day for day in failed
+                if retry_earliest <= day <= today
+            )
+            exact = set(with_papers) | set(empty)
             if exact:
                 exact_start = min(exact)
                 exact_end = max(exact)
-                failed = tuple(
-                    exact_start + timedelta(days=offset)
-                    for offset in range((exact_end - exact_start).days + 1)
-                    if exact_start + timedelta(days=offset) not in exact
-                )
             else:
                 exact_start = None
                 exact_end = None
-                failed = tuple(sorted(observed))
+            missing = tuple(sorted((*failed, *pending)))
             if state.pending_backfill_start is None:
                 backfill_status = "idle"
                 backfill_error_code = None
@@ -900,6 +615,14 @@ class SyncService:
                 backfill_status = backfill.status
                 backfill_error_code = backfill.error_code
                 backfill_error_message = backfill.error_message
+            if not targets:
+                daily_list_status = "idle"
+            elif pending:
+                daily_list_status = "pending"
+            elif failed:
+                daily_list_status = "failed"
+            else:
+                daily_list_status = "complete"
             values.append(
                 CategoryProgress(
                     category=config.category,
@@ -918,27 +641,76 @@ class SyncService:
                     ),
                     exact_start=exact_start,
                     exact_end=exact_end,
-                    missing_exact_dates=failed,
+                    missing_exact_dates=missing,
+                    failed_exact_dates=failed,
+                    retryable_failed_exact_dates=retryable_failed_exact,
+                    target_dates=targets,
+                    checked_dates=checked,
+                    dates_with_papers=with_papers,
+                    empty_dates=empty,
+                    failed_dates=failed,
+                    pending_dates=pending,
+                    unavailable_dates=unavailable,
+                    daily_list_status=daily_list_status,
+                    daily_list_errors=tuple(
+                        (record.daily_list_date, record.error_code)
+                        for record in records
+                        if record.error_code is not None
+                    ),
                 )
             )
-            exact_sets.append(exact)
 
-        global_exact = set.intersection(*exact_sets) if exact_sets else set()
-        if global_exact:
-            global_start = min(global_exact)
-            global_end = max(global_exact)
-            missing = tuple(
-                global_start + timedelta(days=offset)
-                for offset in range((global_end - global_start).days + 1)
-                if not all(
-                    global_start + timedelta(days=offset) in values
-                    for values in exact_sets
+        global_targets = sorted(
+            {
+                day
+                for statuses in statuses_by_category.values()
+                for day in statuses
+            }
+        )
+        global_with_papers: list[date] = []
+        global_empty: list[date] = []
+        global_failed: list[date] = []
+        global_pending: list[date] = []
+        global_unavailable: list[date] = []
+        config_by_category = {config.category: config for config in configs}
+        for day in global_targets:
+            applicable = tuple(
+                statuses_by_category[category].get(
+                    day, CatchupDayStatus.PENDING
                 )
+                for category, config in config_by_category.items()
+                if config.coverage_start <= day
             )
+            if not applicable or CatchupDayStatus.PENDING in applicable:
+                global_pending.append(day)
+            elif CatchupDayStatus.FAILED in applicable:
+                global_failed.append(day)
+            elif CatchupDayStatus.COMPLETE in applicable:
+                global_with_papers.append(day)
+            else:
+                global_empty.append(day)
+            if day < retry_earliest and any(
+                status
+                in {CatchupDayStatus.PENDING, CatchupDayStatus.FAILED}
+                for status in applicable
+            ):
+                global_unavailable.append(day)
+
+        global_checked = (
+            len(global_with_papers) + len(global_empty) + len(global_failed)
+        )
+        global_exact = set(global_with_papers) | set(global_empty)
+        global_start = min(global_exact) if global_exact else None
+        global_end = max(global_exact) if global_exact else None
+        global_missing = tuple(sorted((*global_failed, *global_pending)))
+        if not global_targets:
+            daily_list_status = "idle"
+        elif global_pending:
+            daily_list_status = "pending"
+        elif global_failed:
+            daily_list_status = "failed"
         else:
-            global_start = None
-            global_end = None
-            missing = ()
+            daily_list_status = "complete"
         return SyncReport(
             categories=tuple(values),
             offline=offline,
@@ -949,5 +721,13 @@ class SyncService:
             ),
             exact_start=global_start,
             exact_end=global_end,
-            missing_exact_dates=missing,
+            missing_exact_dates=global_missing,
+            target_dates=len(global_targets),
+            checked_dates=global_checked,
+            dates_with_papers=len(global_with_papers),
+            empty_dates=len(global_empty),
+            failed_dates=len(global_failed),
+            pending_dates=len(global_pending),
+            unavailable_dates=len(global_unavailable),
+            daily_list_status=daily_list_status,
         )

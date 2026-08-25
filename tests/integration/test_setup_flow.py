@@ -18,6 +18,7 @@ from arxiv_digest.maintenance import MaintenanceBarrier
 from arxiv_digest.profile import (
     PdfDestination,
     Profile,
+    ProfileCategory,
     ProfileRepository,
     ProfileRevisionError,
 )
@@ -147,6 +148,9 @@ def test_not_now_publishes_exact_profile_category_and_seed_metadata(
     profile = service.complete(draft.revision, launcher_choice="not_now")
     assert profile.revision == 1
     assert profile.categories == ("math.AG",)
+    assert profile.category_coverage == (
+        ProfileCategory("math.AG", date(2026, 7, 23)),
+    )
     assert profile.seed_papers == ("2608.01234",)
     assert profile.keywords == ("derived geometry",)
     assert launcher.install_calls == 0
@@ -212,12 +216,12 @@ def test_launcher_failure_is_redacted_retryable_and_never_reopens_setup(
 
 
 @pytest.mark.parametrize(
-    "crash_phase, expected_revision, expected_coverage",
+    "crash_phase, expected_revision, expected_coverage, expected_projection",
     (
-        ("pending_file_fsynced", 1, "2026-07-23"),
-        ("sqlite_pending_committed", 2, "2026-06-01"),
-        ("profile_replaced", 2, "2026-06-01"),
-        ("publication_marked", 2, "2026-06-01"),
+        ("pending_file_fsynced", 1, "2026-07-23", 1),
+        ("sqlite_pending_committed", 2, "2026-06-01", 2),
+        ("profile_replaced", 2, "2026-06-01", 2),
+        ("publication_marked", 2, "2026-06-01", 2),
     ),
 )
 def test_each_publication_phase_recovers_an_exact_old_or_new_revision(
@@ -225,6 +229,7 @@ def test_each_publication_phase_recovers_an_exact_old_or_new_revision(
     crash_phase: str,
     expected_revision: int,
     expected_coverage: str,
+    expected_projection: int,
 ) -> None:
     database_path = tmp_path / "state.sqlite3"
     open_database(database_path).close()
@@ -246,9 +251,11 @@ def test_each_publication_phase_recovers_an_exact_old_or_new_revision(
         crash_injector=crash_after,
     )
     new_profile = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=2,
-        categories=("math.AG",),
+        category_coverage=(
+            ProfileCategory("math.AG", date(2026, 6, 1)),
+        ),
         keywords=("new preference",),
         phrases=old_profile.phrases,
         authors=old_profile.authors,
@@ -280,10 +287,14 @@ def test_each_publication_phase_recovers_an_exact_old_or_new_revision(
             "SELECT pending_revision, status FROM profile_publication "
             "WHERE singleton = 1"
         ).fetchone()
+        projection_revision = connection.execute(
+            "SELECT projection_revision FROM state_meta WHERE singleton = 1"
+        ).fetchone()[0]
     finally:
         connection.close()
     assert coverage == expected_coverage
     assert marker == (expected_revision, "published")
+    assert projection_revision == expected_projection
     assert not (tmp_path / "profile.json.pending").exists()
 
 
@@ -329,9 +340,11 @@ def test_interests_publication_requires_revision_and_retains_removed_history(
     draft = _ready_draft(service, tmp_path / "pdfs")
     old = service.complete(draft.revision, launcher_choice="not_now")
     replacement = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=2,
-        categories=("math.NT",),
+        category_coverage=(
+            ProfileCategory("math.NT", date(2026, 8, 2)),
+        ),
         keywords=("automorphic forms",),
         phrases=(),
         authors=(),
@@ -366,6 +379,105 @@ def test_interests_publication_requires_revision_and_retains_removed_history(
             expected_revision=1,
         )
     assert repository.load() == replacement
+
+
+def test_readding_removed_category_replaces_retained_coverage_boundary(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    repository = ProfileRepository(
+        tmp_path / "profile.json", tmp_path / "profile.lock"
+    )
+    service = SetupService(database_path, repository, clock=lambda: NOW)
+    destination = PdfDestination("custom", (tmp_path / "pdfs").resolve())
+    initial = Profile(
+        schema_version=2,
+        revision=1,
+        category_coverage=(
+            ProfileCategory("math.AG", date(2026, 7, 1)),
+            ProfileCategory("math.NT", date(2026, 7, 2)),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=destination,
+    )
+    service.publish_profile(
+        initial,
+        (
+            CategoryConfig("math.AG", "arXiv:math.AG", date(2026, 7, 1)),
+            CategoryConfig("math.NT", "arXiv:math.NT", date(2026, 7, 2)),
+        ),
+        expected_revision=None,
+    )
+    removed = Profile(
+        schema_version=2,
+        revision=2,
+        category_coverage=(
+            ProfileCategory("math.NT", date(2026, 7, 2)),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=destination,
+    )
+    service.publish_profile(
+        removed,
+        (CategoryConfig("math.NT", "arXiv:math.NT", date(2026, 7, 2)),),
+        expected_revision=1,
+    )
+
+    connection = sqlite3.connect(database_path)
+    try:
+        retained = connection.execute(
+            "SELECT set_spec, coverage_start FROM category_sync_state "
+            "WHERE category = 'math.AG'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert retained == ("arXiv:math.AG", "2026-07-01")
+
+    readded = Profile(
+        schema_version=2,
+        revision=3,
+        category_coverage=(
+            ProfileCategory("math.NT", date(2026, 7, 2)),
+            ProfileCategory("math.AG", date(2026, 8, 1)),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=destination,
+    )
+    service.publish_profile(
+        readded,
+        (
+            CategoryConfig("math.NT", "arXiv:math.NT", date(2026, 7, 2)),
+            CategoryConfig("math.AG", "arXiv:math.AG", date(2026, 8, 1)),
+        ),
+        expected_revision=2,
+    )
+
+    connection = sqlite3.connect(database_path)
+    try:
+        rows = connection.execute(
+            "SELECT category, set_spec, coverage_start "
+            "FROM category_sync_state ORDER BY category"
+        ).fetchall()
+        projection_revision = connection.execute(
+            "SELECT projection_revision FROM state_meta WHERE singleton = 1"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert rows == [
+        ("math.AG", "arXiv:math.AG", "2026-08-01"),
+        ("math.NT", "arXiv:math.NT", "2026-07-02"),
+    ]
+    assert projection_revision == 3
 
 
 def test_recovery_stops_when_neither_profile_file_matches_marker(

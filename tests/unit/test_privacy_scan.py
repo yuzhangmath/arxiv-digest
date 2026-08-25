@@ -1,19 +1,84 @@
 from __future__ import annotations
 
-from pathlib import Path
-import json
 import hashlib
+import json
 import sqlite3
 import stat
 import subprocess
 import tarfile
-import zipfile
-from contextlib import contextmanager
-from io import StringIO
 import tomllib
+import zipfile
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
+from io import StringIO
+from pathlib import Path
 
 import pytest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+AUDITED_ICON = PROJECT_ROOT / "src/arxiv_digest/assets/arxiv-digest.icns"
+AUDITED_ICON_SHA256 = (
+    "bfd9510940f503cd41e96c7f5e082b282529b158f7e4cb92131df80f1851751f"
+)
+
+
+def _audited_icon_bytes() -> bytes:
+    data = AUDITED_ICON.read_bytes()
+    assert hashlib.sha256(data).hexdigest() == AUDITED_ICON_SHA256
+    return data
+
+
+def _altered_audited_icon_bytes() -> bytes:
+    data = bytearray(_audited_icon_bytes())
+    data[-1] ^= 1
+    altered = bytes(data)
+    assert hashlib.sha256(altered).hexdigest() != AUDITED_ICON_SHA256
+    return altered
+
+
+def _scan_binary_surface(
+    tmp_path: Path,
+    surface: str,
+    relative_path: str,
+    data: bytes,
+) -> None:
+    from scripts.privacy_scan import GitObject, scan_archive, scan_history, scan_tree
+
+    public = tmp_path / "arxiv-digest"
+    if surface == "tree":
+        artifact = public / relative_path
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(data)
+        scan_tree(public)
+        return
+    if surface == "archive":
+        archive = tmp_path / "package.whl"
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr(relative_path, data)
+        scan_archive(archive)
+        return
+
+    class FakeGitReader:
+        @staticmethod
+        def remotes() -> dict[str, tuple[str, ...]]:
+            return {}
+
+        @staticmethod
+        def effective_identities() -> tuple[str, ...]:
+            return ("Safe Person <safe@example.invalid> 1 +0000",)
+
+        @staticmethod
+        def reachable_objects() -> tuple[GitObject, ...]:
+            return (GitObject("a" * 40, "blob", data, relative_path),)
+
+    public.mkdir()
+    scan_history(
+        public,
+        expect_no_remote=True,
+        git_reader=FakeGitReader(),
+    )
 
 
 def _mac_home(*parts: str) -> str:
@@ -81,6 +146,77 @@ def test_tree_scan_rejects_disallowed_artifact_classes(
 
     with pytest.raises(PrivacyViolation, match=artifact_class):
         scan_tree(public)
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ["tree", "archive", "history"],
+)
+def test_scanners_allow_only_the_exact_audited_application_icon(
+    tmp_path: Path,
+    surface: str,
+) -> None:
+    _scan_binary_surface(
+        tmp_path,
+        surface,
+        "src/arxiv_digest/assets/arxiv-digest.icns",
+        _audited_icon_bytes(),
+    )
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "arxiv_digest/assets/arxiv-digest.icns",
+        # A prior-release sdist root proves archive normalization is version-agnostic.
+        "arxiv_digest-0.1.0/src/arxiv_digest/assets/arxiv-digest.icns",
+    ],
+)
+def test_archive_scan_maps_standard_package_icon_paths_to_the_audited_source(
+    tmp_path: Path,
+    member_name: str,
+) -> None:
+    _scan_binary_surface(
+        tmp_path,
+        "archive",
+        member_name,
+        _audited_icon_bytes(),
+    )
+
+
+@pytest.mark.parametrize("surface", ["tree", "archive", "history"])
+@pytest.mark.parametrize(
+    ("relative_path", "payload_factory"),
+    [
+        (
+            "src/arxiv_digest/assets/arxiv-digest.icns",
+            _altered_audited_icon_bytes,
+        ),
+        (
+            "src/arxiv_digest/other/arxiv-digest.icns",
+            _audited_icon_bytes,
+        ),
+        (
+            "src/arxiv_digest/assets/unrelated.bin",
+            lambda: b"\xffunrelated",
+        ),
+    ],
+)
+def test_scanners_reject_altered_moved_and_unrelated_binary_artifacts(
+    tmp_path: Path,
+    surface: str,
+    relative_path: str,
+    payload_factory: Callable[[], bytes],
+) -> None:
+    from scripts.privacy_scan import PrivacyViolation
+
+    with pytest.raises(PrivacyViolation, match="binary-artifact"):
+        _scan_binary_surface(
+            tmp_path,
+            surface,
+            relative_path,
+            payload_factory(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -409,6 +545,108 @@ def test_derivation_inspects_sqlite_read_only_by_schema(
     assert "data/state.sqlite3" not in denylist.values("relative-filename")
 
 
+def test_derivation_collects_generation_two_response_hashes(
+    tmp_path: Path,
+) -> None:
+    from scripts.privacy_scan import derive_denylist
+
+    private = tmp_path / "private"
+    database = private / "data/state.sqlite3"
+    database.parent.mkdir(parents=True)
+    response_hash = "3f" * 32
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TABLE source_observations(response_sha256 TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO source_observations VALUES (?)",
+        (response_hash,),
+    )
+    connection.commit()
+    connection.close()
+
+    denylist = derive_denylist(private)
+
+    assert response_hash in denylist.values("hash")
+
+
+def test_derivation_collects_other_durable_hash_columns(
+    tmp_path: Path,
+) -> None:
+    from scripts.privacy_scan import derive_denylist
+
+    private = tmp_path / "private"
+    database = private / "data/state.sqlite3"
+    database.parent.mkdir(parents=True)
+    category_hash = "ab" * 32
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TABLE category_article_state(category_set_hash TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO category_article_state VALUES (?)",
+        (category_hash,),
+    )
+    connection.commit()
+    connection.close()
+
+    denylist = derive_denylist(private)
+
+    assert category_hash in denylist.values("hash")
+
+
+def test_derivation_collects_free_form_errors_but_not_allowlisted_codes(
+    tmp_path: Path,
+) -> None:
+    from scripts.privacy_scan import derive_denylist
+
+    private = tmp_path / "private"
+    database = private / "data/state.sqlite3"
+    database.parent.mkdir(parents=True)
+    error_detail = "Synthetic upstream detail for a private recovery run"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TABLE category_sync_state("
+        "last_error_code TEXT, last_error_message TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO category_sync_state VALUES (?, ?)",
+        ("catchup_fetch_failed", error_detail),
+    )
+    connection.commit()
+    connection.close()
+
+    denylist = derive_denylist(private)
+
+    assert error_detail in denylist.values("free-form-error")
+    assert "catchup_fetch_failed" not in denylist.all_values()
+
+
+def test_derivation_collects_machine_specific_profile_paths(
+    tmp_path: Path,
+) -> None:
+    from scripts.privacy_scan import derive_denylist
+
+    private = tmp_path / "private"
+    private.mkdir()
+    destination = "/Volumes/Synthetic Private/Papers"
+    (private / "profile.json").write_text(
+        json.dumps(
+            {
+                "pdf_destination": {
+                    "kind": "custom",
+                    "path": destination,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    denylist = derive_denylist(private)
+
+    assert destination in denylist.values("path")
+
+
 def test_derivation_collects_injected_git_identities_metadata_and_paths(
     tmp_path: Path,
 ) -> None:
@@ -520,6 +758,53 @@ def test_derivation_collects_every_non_generic_distinctive_relative_path(
         "2026-08-22-public-arxiv-digest" in value
         for value in denylist.values("relative-filename")
     )
+
+
+def test_derivation_allows_only_the_audited_generation_two_artifact_paths(
+    tmp_path: Path,
+) -> None:
+    from scripts.privacy_scan import GitObject, derive_denylist
+
+    audited = {
+        "docs/superpowers/specs/2026-08-25-confirmed-daily-list-review-design.md",
+        "docs/superpowers/plans/2026-08-25-confirmed-daily-list-review.md",
+        "src/arxiv_digest/reconciliation.py",
+        "src/arxiv_digest/storage/migrations/0004_confirmed_daily_list.sql",
+    }
+    nearby_private = {
+        "src/arxiv_digest/reconciliation-notes.py",
+        "src/arxiv_digest/storage/migrations/0005-personal-data.sql",
+    }
+
+    @dataclass
+    class GenerationTwoHistory:
+        def local_identities(self) -> tuple[str, ...]:
+            return ()
+
+        def effective_identities(self) -> tuple[str, ...]:
+            return ()
+
+        def reachable_objects(self) -> tuple[GitObject, ...]:
+            return tuple(
+                GitObject(str(index) * 40, "blob", b"public", path)
+                for index, path in enumerate(sorted(audited | nearby_private), start=1)
+            )
+
+    private = tmp_path / "private"
+    private.mkdir()
+    audited_module = private / "src/arxiv_digest/reconciliation.py"
+    audited_module.parent.mkdir(parents=True)
+    audited_module.write_text(
+        "PAPER_IDS = ['2608.31415']\n",
+        encoding="utf-8",
+    )
+
+    denylist = derive_denylist(private, git_reader=GenerationTwoHistory())
+    relative_filenames = denylist.values("relative-filename")
+
+    assert audited.isdisjoint(relative_filenames)
+    assert nearby_private <= relative_filenames
+    assert "2608.31415" in denylist.values("paper-id")
 
 
 def test_denylist_publication_is_atomic_mode_0600_and_round_trips(
@@ -1015,7 +1300,7 @@ def test_public_documentation_uses_confirmed_install_identity_and_no_email_impor
     )
     expected_commands = (
         "pipx install "
-        "git+https://github.com/yuzhangmath/arxiv-digest.git@v0.1.0\n"
+        "git+https://github.com/yuzhangmath/arxiv-digest.git@v0.2.0\n"
         "arxiv-digest init"
     )
 
@@ -1033,6 +1318,81 @@ def test_public_documentation_uses_confirmed_install_identity_and_no_email_impor
     )
     assert "There is no `.eml` import." in readme
     assert "import-eml" not in readme
+
+
+def test_public_documentation_uses_only_the_confirmed_generation_two_model() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    paths = (
+        project_root / "README.md",
+        project_root / "docs/installation.md",
+        project_root / "docs/data-and-backup.md",
+        project_root / "docs/troubleshooting.md",
+    )
+    documents = {path.name: path.read_text(encoding="utf-8") for path in paths}
+    combined = "\n".join(documents.values())
+
+    for obsolete_claim in (
+        "current feed date",
+        "inferred version-history date",
+        "inferred announcement",
+        "fallback date",
+        "bundled database migrations",
+    ):
+        assert obsolete_claim not in combined.casefold()
+
+    for required_claim in (
+        "recovered daily-list membership",
+        "hidden support",
+        "coverage gaps",
+        "candidate corpus does not populate Review, Calendar, or Library",
+        "Library is independent",
+        "application-data generation 2",
+        "portable backup format 2",
+        "rollback-only",
+        "not imported",
+    ):
+        assert required_claim in combined
+
+    reset_steps = (
+        "Quit arXiv Digest",
+        "Move the old durable data and regenerable cache",
+        "Remove the managed desktop launcher and installed application",
+        "Install and start application-data generation 2",
+        "Leave separately downloaded PDFs",
+    )
+    for name in ("installation.md", "troubleshooting.md"):
+        document = documents[name]
+        positions = [document.index(step) for step in reset_steps]
+        assert positions == sorted(positions)
+        assert "private timestamped recovery location" in document
+        assert "rollback-only" in document
+        assert "not imported" in document
+
+
+def test_long_public_documentation_contents_match_second_level_headings() -> None:
+    import re
+
+    project_root = Path(__file__).resolve().parents[2]
+    paths = (
+        project_root / "README.md",
+        project_root / "docs/installation.md",
+        project_root / "docs/data-and-backup.md",
+        project_root / "docs/troubleshooting.md",
+    )
+
+    def anchor(heading: str) -> str:
+        normalized = re.sub(r"[^a-z0-9 -]", "", heading.casefold())
+        return re.sub(r" +", "-", normalized.strip())
+
+    for path in paths:
+        document = path.read_text(encoding="utf-8")
+        headings = re.findall(r"^## (.+)$", document, flags=re.MULTILINE)
+        assert len(headings) >= 5
+        contents_start = headings.index("Contents")
+        expected = [anchor(heading) for heading in headings[contents_start + 1 :]]
+        contents_block = document.split("## Contents\n", 1)[1].split("\n## ", 1)[0]
+        actual = re.findall(r"^- \[[^]]+\]\(#([^)]+)\)$", contents_block, re.MULTILINE)
+        assert actual == expected
 
 
 def test_ci_privacy_scan_uses_checkout_origin_exactly() -> None:

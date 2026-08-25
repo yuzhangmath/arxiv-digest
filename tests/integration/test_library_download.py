@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 
@@ -13,6 +13,7 @@ from arxiv_digest.models import PaperMetadata, PaperVersion
 from arxiv_digest.profile import (
     PdfDestination,
     Profile,
+    ProfileCategory,
     ProfileRepository,
 )
 from arxiv_digest.rate_limit import HttpResponse, Interface
@@ -44,7 +45,7 @@ def configured_services(
     database_path = root / "state.sqlite3"
     open_database(database_path).close()
     store = Store(database_path)
-    store.apply_event_batch(
+    store.apply_article_snapshot(
         PaperMetadata(
             arxiv_id="2608.33001",
             title="Persistent Synthetic Save",
@@ -59,16 +60,17 @@ def configured_services(
                 datetime(2026, 8, 1, tzinfo=timezone.utc),
             ),
         ),
-        (),
     )
     destination = root / "PDFs"
     destination.mkdir()
     profiles = ProfileRepository(root / "profile.json", root / "profile.lock")
     profiles.save_atomic(
         Profile(
-            schema_version=1,
+            schema_version=2,
             revision=1,
-            categories=("cs.SE",),
+            category_coverage=(
+                ProfileCategory("cs.SE", date(2026, 8, 1)),
+            ),
             keywords=(),
             phrases=(),
             authors=(),
@@ -101,6 +103,27 @@ def test_save_plus_pdf_keeps_the_library_save_when_download_fails(
     assert [entry.metadata.arxiv_id for entry in page.entries] == [
         "2608.33001"
     ]
+    assert page.entries[0].saved_version == 1
+
+
+def test_unconfirmed_save_plus_pdf_saves_unpinned_before_download_fails(
+    tmp_path: Path,
+) -> None:
+    _, library, downloads = configured_services(tmp_path)
+
+    with pytest.raises(DownloadError):
+        downloads.download(
+            "2608.33001",
+            1,
+            save_first=True,
+            save_version=None,
+        )
+
+    page = library.search("Persistent", limit=20, offset=0)
+    assert [entry.metadata.arxiv_id for entry in page.entries] == [
+        "2608.33001"
+    ]
+    assert page.entries[0].saved_version is None
 
 
 def test_download_state_rejects_a_version_missing_from_the_stored_article(

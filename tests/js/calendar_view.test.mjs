@@ -20,10 +20,22 @@ test("calendar renders accessible server-date buttons with count and status", ()
   assert.equal(buttons.length, 2);
   assert.equal(
     buttons[0].getAttribute("aria-label"),
-    "2026-08-01: 3 papers, unreviewed",
+    "2026-08-01: 3 paper announcements, unreviewed",
   );
   buttons[0].click();
   assert.deepEqual(selected, ["2026-08-01"]);
+});
+
+test("calendar visibly labels singular and plural paper-announcement counts", () => {
+  const root = new FakeNode("div");
+  renderCalendar(new FakeDocument(), root, [
+    { date: "2026-08-01", count: 1, status: "unreviewed" },
+    { date: "2026-08-02", count: 3, status: "unreviewed" },
+  ]);
+
+  const buttons = descendants(root, "button");
+  assert.equal(buttons[0].textContent, "2026-08-01\n1 paper announcement");
+  assert.equal(buttons[1].textContent, "2026-08-02\n3 paper announcements");
 });
 
 test("calendar dispatches only the stored date even after caller mutation", () => {

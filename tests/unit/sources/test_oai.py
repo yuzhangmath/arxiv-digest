@@ -6,10 +6,12 @@ from hashlib import sha256
 from pathlib import Path
 from threading import Event
 from urllib.request import Request
+from xml.sax.saxutils import escape
 
 import pytest
 
 from arxiv_digest.models import (
+    EvidenceSource,
     OaiArticle,
     OaiTombstone,
     PaperMetadata,
@@ -26,6 +28,7 @@ from arxiv_digest.sources.oai import (
     OaiProtocolError,
     OaiSet,
     OaiSource,
+    oai_observations,
     parse_identify,
     parse_list_records,
     parse_list_sets,
@@ -82,7 +85,7 @@ class FixtureOpener:
 def source_with_responses(*responses: bytes) -> tuple[OaiSource, FixtureOpener]:
     opener = FixtureOpener(*responses)
     client = ArxivHttpClient(
-        user_agent="arxiv-digest/0.1",
+        user_agent="arxiv-digest/0.2",
         contact_url="https://example.invalid/contact",
         opener=opener,
         monotonic=lambda: 0.0,
@@ -203,6 +206,69 @@ def test_parse_list_records_normalizes_current_state_and_keeps_oai_state_separat
     )
 
 
+def test_oai_page_normalizes_global_version_observations() -> None:
+    page = parse_list_records(fixture("page-1.xml"))
+
+    observations = oai_observations(page)
+
+    assert tuple(item.source_key for item in observations) == (
+        "oai:2608.90001:v1",
+        "oai:2608.90001:v2",
+    )
+    assert all(item.source is EvidenceSource.OAI for item in observations)
+    assert all(item.category is None for item in observations)
+    assert all(item.announce_type is None for item in observations)
+    assert all(item.daily_list_date is None for item in observations)
+    assert tuple(item.announced_version for item in observations) == (1, 2)
+    assert all(item.list_position is None for item in observations)
+    assert all(
+        item.oai_datestamp == date(2026, 8, 21)
+        for item in observations
+    )
+    assert all(
+        item.response_sha256 == page.raw_sha256 for item in observations
+    )
+    assert all(item.observed_at == page.response_date for item in observations)
+    assert oai_observations(page) == observations
+
+
+@pytest.mark.parametrize(
+    ("raw_authors", "expected"),
+    [
+        (
+            "Nova Lantern and Sol Ember",
+            ("Nova Lantern", "Sol Ember"),
+        ),
+        (
+            "Nova Lantern & Sol Ember",
+            ("Nova Lantern", "Sol Ember"),
+        ),
+        (
+            "The Example Collaboration: Nova Lantern, Sol Ember, et al.",
+            ("The Example Collaboration", "Nova Lantern", "Sol Ember"),
+        ),
+        (
+            "Nova Lantern (Synthetic Lab, Lunar Unit), Sol Ember, Jr.",
+            ("Nova Lantern", "Sol Ember, Jr."),
+        ),
+    ],
+)
+def test_raw_author_text_uses_arxiv_author_boundaries(
+    raw_authors: str,
+    expected: tuple[str, ...],
+) -> None:
+    payload = fixture("page-1.xml").replace(
+        b"Iona Quasar, Sol Ember III",
+        escape(raw_authors).encode(),
+    )
+
+    page = parse_list_records(payload)
+
+    record = page.records[0]
+    assert isinstance(record, OaiArticle)
+    assert record.metadata.authors == expected
+
+
 def test_deleted_record_becomes_a_tombstone_without_article_metadata() -> None:
     page = parse_list_records(fixture("deleted.xml"))
 
@@ -319,20 +385,18 @@ def test_list_records_missing_container_is_a_typed_parse_failure() -> None:
 
 def test_missing_author_list_is_a_typed_parse_failure() -> None:
     payload = fixture("page-1.xml").replace(
-        b"""\
-          <raw:authors>
-            <raw:author>
-              <raw:keyname>Quasar</raw:keyname>
-              <raw:forenames>Iona</raw:forenames>
-            </raw:author>
-            <raw:author>
-              <raw:keyname>Ember</raw:keyname>
-              <raw:forenames>Sol</raw:forenames>
-              <raw:suffix>III</raw:suffix>
-            </raw:author>
-          </raw:authors>
-""",
+        b"          <raw:authors>Iona Quasar, Sol Ember III</raw:authors>\n",
         b"",
+    )
+
+    with pytest.raises(OaiParseError, match="authors"):
+        parse_list_records(payload)
+
+
+def test_blank_author_text_is_a_typed_parse_failure() -> None:
+    payload = fixture("page-1.xml").replace(
+        b"Iona Quasar, Sol Ember III",
+        b"   ",
     )
 
     with pytest.raises(OaiParseError, match="authors"):
@@ -536,6 +600,7 @@ def test_get_record_uses_the_oai_identifier_and_parses_the_record() -> None:
     assert isinstance(record, OaiArticle)
     assert record.metadata.arxiv_id == "2608.90004"
     assert record.metadata.title == "Clockwork Petals in an Invented Vacuum"
+    assert record.metadata.authors == ("Rowan Fable",)
     assert [request.full_url for request in opener.requests] == [
         (
             "https://oaipmh.arxiv.org/oai?verb=GetRecord&"

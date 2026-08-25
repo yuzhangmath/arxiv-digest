@@ -59,15 +59,30 @@ export class SettingsController {
     );
   }
 
-  extendCoverage(category, newStart) {
+  extendCoverage(category, newStart, expectedRevision) {
     if (typeof category !== "string" || !category.trim()) {
       throw new TypeError("Invalid category");
     }
     assertIsoDate(newStart);
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+      throw new TypeError("Invalid settings revision");
+    }
     return this.api.json(
       "settings-coverage",
       "/api/v1/settings/coverage",
-      jsonPut({ category: category.trim(), new_start: newStart }),
+      jsonPut({
+        category: category.trim(),
+        new_start: newStart,
+        expected_revision: expectedRevision,
+      }),
+    );
+  }
+
+  retrySynchronization() {
+    return this.api.json(
+      "settings-sync-start",
+      "/api/v1/sync/start",
+      jsonPost({ retry_failed_dates: true }),
     );
   }
 
@@ -290,103 +305,189 @@ function actionButton(document, label, action) {
   return node;
 }
 
-function renderDestinationChoice(document, value, label, checked) {
-  const row = element(document, "label", undefined, "destination-choice");
-  const input = element(document, "input");
-  input.setAttribute("type", "radio");
-  input.setAttribute("name", "pdf-destination");
-  input.setAttribute("value", value);
-  input.checked = checked;
-  row.append(input, document.createTextNode(` ${label}`));
-  return row;
-}
-
 function renderSyncSettings(document, model, actions) {
-  const section = element(document, "section", undefined, "settings-section");
-  section.append(element(document, "h2", "Synchronization and history"));
+  const wrapper = element(document, "div", undefined, "settings-sync-sections");
   const online = model.online !== false;
-  section.append(
+  const synchronizing = model.synchronizing === true;
+  const number = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  const safeCodes = (values) => Array.isArray(values)
+    ? values.filter((value) =>
+      typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value))
+    : [];
+
+  const metadata = element(document, "section", undefined, "settings-section");
+  metadata.append(
+    element(document, "h2", "Metadata synchronization"),
     element(
       document,
       "p",
-      online
-        ? "Synchronization is online."
+      synchronizing
+        ? "Metadata synchronization is running."
+        : online
+        ? "Metadata synchronization is online."
         : "Synchronization offline. Cached Review and Library remain available.",
       online ? "sync-online" : "sync-offline",
     ),
+    element(
+      document,
+      "p",
+      `Metadata checkpoints: ${number(model.metadata_sync?.checkpoint_count)}.`,
+    ),
   );
-  for (const category of Array.isArray(model.categories) ? model.categories : []) {
+  for (const category of Array.isArray(model.metadata_sync?.categories)
+    ? model.metadata_sync.categories
+    : []) {
     if (typeof category?.category !== "string") continue;
     const card = element(document, "article", undefined, "category-sync-state");
     card.append(element(document, "h3", category.category));
-    if (typeof category.metadata_synchronized_through === "string") {
-      card.append(
-        element(
-          document,
-          "p",
-          `Metadata synchronized through ${category.metadata_synchronized_through}`,
-        ),
-      );
-    }
-    const backfillStatus = category.historical_backfill?.status ?? "not started";
     card.append(
       element(
         document,
         "p",
-        `Historical coverage backfill: ${backfillStatus}` +
-          (backfillStatus === "interrupted"
-            ? "; current metadata remains synchronized."
-            : "."),
+        typeof category.synchronized_through === "string"
+          ? `Metadata synchronized through ${category.synchronized_through}.`
+          : "No metadata checkpoint has been recorded.",
       ),
     );
-    const enrichment = category.exact_enrichment ?? {};
-    if (typeof enrichment.start === "string" && typeof enrichment.end === "string") {
-      card.append(
-        element(
-          document,
-          "p",
-          `Exact announcement enrichment ${enrichment.start} through ${enrichment.end}`,
-        ),
-      );
-    } else {
-      card.append(element(document, "p", "Exact announcement enrichment: not available"));
+    const codes = safeCodes(category.error_codes);
+    if (codes.length) {
+      card.append(element(document, "p", `Error codes: ${codes.join(", ")}.`, "error-banner"));
     }
-    const holes = Array.isArray(enrichment.holes)
-      ? enrichment.holes.filter((value) => typeof value === "string")
+    metadata.append(card);
+  }
+  wrapper.append(metadata);
+
+  const coverage = element(document, "section", undefined, "settings-section");
+  const coverageState = model.daily_list_coverage ?? {};
+  coverage.append(
+    element(document, "h2", "Historical daily-list coverage"),
+    element(
+      document,
+      "p",
+      `Target dates: ${number(coverageState.target)} · ` +
+        `${number(coverageState.checked)} checked · ` +
+        `${number(coverageState.with_papers)} with papers · ` +
+        `${number(coverageState.empty)} empty · ` +
+        `${number(coverageState.failed)} failed · ` +
+        `${number(coverageState.pending)} pending · ` +
+        `${number(coverageState.unavailable)} unavailable.`,
+    ),
+  );
+  let retryableCount = 0;
+  const coverageMin = typeof model.coverage_min === "string" ? model.coverage_min : null;
+  const coverageMax = typeof model.coverage_max === "string" ? model.coverage_max : null;
+  for (const category of Array.isArray(coverageState.categories)
+    ? coverageState.categories
+    : []) {
+    if (typeof category?.category !== "string") continue;
+    const card = element(document, "article", undefined, "category-sync-state");
+    card.append(
+      element(document, "h3", category.category),
+      element(
+        document,
+        "p",
+        `Coverage starts ${category.coverage_start}. ` +
+          `${number(category.checked)} of ${number(category.target)} checked · ` +
+          `${number(category.with_papers)} with papers · ` +
+          `${number(category.empty)} empty · ` +
+          `${number(category.failed)} failed · ` +
+          `${number(category.pending)} pending · ` +
+          `${number(category.unavailable)} unavailable.`,
+      ),
+    );
+    const codes = safeCodes(category.error_codes);
+    if (codes.length) card.append(element(document, "p", `Error codes: ${codes.join(", ")}.`));
+    const retryable = Array.isArray(category.retryable_failed_dates)
+      ? category.retryable_failed_dates.filter((value) =>
+        typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value))
       : [];
-    card.append(
-      element(
-        document,
-        "p",
-        holes.length ? `Missing exact dates: ${holes.join(", ")}` : "Missing exact dates: none",
-      ),
-    );
-    if (category.current_sync?.status === "failed") {
-      const code = typeof category.current_sync.error_code === "string"
-        ? ` (${category.current_sync.error_code})`
-        : "";
-      card.append(
-        element(
-          document,
-          "p",
-          `${category.category} synchronization failed${code}.`,
-          "error-banner",
-        ),
-      );
-    }
-    const coverageLabel = element(document, "label", `Extend ${category.category} history to`);
+    retryableCount += retryable.length;
+
+    const coverageLabel = element(document, "label", `Extend ${category.category} coverage to`);
     const coverageInput = element(document, "input");
     coverageInput.setAttribute("type", "date");
     coverageInput.setAttribute("aria-label", `New coverage start for ${category.category}`);
-    card.append(
-      coverageLabel,
-      coverageInput,
-      actionButton(document, `Extend ${category.category} history`, () =>
-        actions.extendCoverage?.(category.category, coverageInput.value)),
-    );
-    section.append(card);
+    if (coverageMin) coverageInput.setAttribute("min", coverageMin);
+    if (coverageMax) coverageInput.setAttribute("max", coverageMax);
+    const extend = actionButton(document, `Extend ${category.category} coverage`, () =>
+      actions.extendCoverage?.(category.category, coverageInput.value));
+    const updateExtension = () => {
+      const value = coverageInput.value;
+      extend.disabled = !/^\d{4}-\d{2}-\d{2}$/.test(value) ||
+        (coverageMin && value < coverageMin) ||
+        (coverageMax && value > coverageMax) ||
+        (typeof category.coverage_start === "string" && value >= category.coverage_start);
+    };
+    coverageInput.addEventListener("input", updateExtension);
+    coverageInput.addEventListener("change", updateExtension);
+    updateExtension();
+    card.append(coverageLabel, coverageInput, extend);
+    coverage.append(card);
   }
-  return section;
+
+  const retryProgress = model.daily_list_retry;
+  const retryTotal = Number.isSafeInteger(retryProgress?.total) && retryProgress.total > 0
+    ? retryProgress.total
+    : 0;
+  const retryCompleted = Number.isSafeInteger(retryProgress?.completed) &&
+      retryProgress.completed > 0
+    ? Math.min(retryProgress.completed, retryTotal)
+    : 0;
+  const retryRunning = retryProgress?.status === "running" && retryTotal > 0;
+  if (retryableCount || retryRunning) {
+    const count = retryRunning ? retryTotal : retryableCount;
+    if (retryRunning) {
+      const progress = element(
+        document,
+        "progress",
+        undefined,
+        "daily-list-retry-progress",
+      );
+      progress.setAttribute("value", retryCompleted);
+      progress.setAttribute("max", retryTotal);
+      progress.setAttribute(
+        "aria-label",
+        `Retrying failed daily-list dates: ${retryCompleted} of ${retryTotal} completed`,
+      );
+      coverage.append(progress);
+    }
+    const retry = actionButton(
+      document,
+      retryRunning
+        ? `Retrying failed daily-list dates… ${retryCompleted} of ${count} completed`
+        : synchronizing
+        ? `Retrying ${count} failed daily-list ${count === 1 ? "date" : "dates"}…`
+        : `Retry ${count} failed daily-list ${count === 1 ? "date" : "dates"}`,
+      () => actions.retrySynchronization?.(count),
+    );
+    retry.disabled = synchronizing || retryRunning;
+    coverage.append(retry);
+  }
+  wrapper.append(coverage);
+
+  const resolution = model.version_resolution ?? {};
+  const versionSection = element(document, "section", undefined, "settings-section");
+  versionSection.append(
+    element(document, "h2", "Canonical-event version resolution"),
+    element(document, "p", `Canonical events: ${number(resolution.canonical_event_count)}.`),
+    element(
+      document,
+      "p",
+      `Atom-confirmed: ${number(resolution.atom_confirmed)} · ` +
+        `Chronology-matched: ${number(resolution.chronology_matched)} · ` +
+        `Unconfirmed: ${number(resolution.unconfirmed)}.`,
+    ),
+  );
+  wrapper.append(versionSection);
+
+  const durable = element(document, "section", undefined, "settings-section");
+  durable.append(
+    element(document, "h2", "Library and PDF presence"),
+    element(document, "p", `Saved Library papers: ${number(model.library?.saved_paper_count)}.`),
+    element(document, "p", `Downloaded PDFs present: ${number(model.pdf_presence?.downloaded_pdf_count)}.`),
+  );
+  wrapper.append(durable);
+  return wrapper;
 }
 
 function renderDoctor(document, report) {
@@ -395,9 +496,22 @@ function renderDoctor(document, report) {
   const allowlist = [
     ["Version", report?.application_version],
     ["Database", report?.database_status],
-    ["Categories", report?.category_count],
+    ["Application generation", report?.application_generation],
+    ["Schema", report?.schema_version],
+    ["Profile revision", report?.profile_revision],
+    ["Projection revision", report?.projection_revision],
+    ["Active categories", report?.active_category_count],
+    ["Metadata checkpoints", report?.metadata_checkpoint_count],
+    ["Daily-list targets", report?.daily_list_target_count],
+    ["Daily-list gaps", report?.daily_list_gap_count],
+    ["Canonical events", report?.canonical_event_count],
+    ["Atom-confirmed", report?.atom_confirmed_count],
+    ["Chronology-matched", report?.chronology_matched_count],
+    ["Unconfirmed", report?.unconfirmed_count],
     ["Saved papers", report?.saved_paper_count],
-    ["Destination kind", report?.destination_kind],
+    ["Downloaded PDFs", report?.downloaded_pdf_count],
+    ["Candidate cache", report?.candidate_cache_status],
+    ["Maintenance", report?.maintenance_state],
   ];
   const list = element(document, "dl");
   for (const [label, value] of allowlist) {
@@ -455,49 +569,60 @@ export function renderSettingsView(document, container, model = {}, actions = {}
   container.append(progress);
 
   const folder = element(document, "section", undefined, "settings-section");
-  folder.append(element(document, "h2", "PDF destination"));
-  const destinationKind = model.pdf_destination?.kind;
+  const currentDisplayPath =
+    typeof model.pdf_destination?.display_path === "string" &&
+    model.pdf_destination.display_path.trim()
+      ? model.pdf_destination.display_path.trim()
+      : null;
+  folder.append(
+    element(document, "h2", "PDF destination"),
+    element(
+      document,
+      "p",
+      currentDisplayPath
+        ? `Current PDF folder: ${currentDisplayPath}`
+        : "Current PDF folder is configured.",
+    ),
+  );
   const pickerChoice =
     typeof model.picker_choice === "string" && PICKER_ID.test(model.picker_choice)
       ? model.picker_choice
       : null;
-  let selectedDestinationChoice =
-    destinationKind === "downloads" || destinationKind === "documents"
-      ? destinationKind
-      : destinationKind === "custom"
-        ? pickerChoice
-        : null;
-  let testButton;
-  const choices = [
-    ["downloads", "Downloads / Arxiv Digest"],
-    ["documents", "Documents / Arxiv Digest"],
-  ];
-  if (pickerChoice) choices.push([pickerChoice, "Chosen folder"]);
-  for (const [value, label] of choices) {
-    const row = renderDestinationChoice(
-      document,
-      value,
-      label,
-      selectedDestinationChoice === value,
+  if (pickerChoice) {
+    const displayName =
+      typeof model.picker_display_name === "string" && model.picker_display_name.trim()
+        ? model.picker_display_name.trim()
+        : "Chosen folder";
+    folder.append(
+      element(document, "p", `Selected folder: ${displayName}`, "selected-destination"),
     );
-    const input = row.querySelector("input");
-    input.addEventListener("change", () => {
-      if (!input.checked) return;
-      selectedDestinationChoice = value;
-      if (testButton) testButton.disabled = false;
-    });
-    folder.append(row);
   }
   const folderControls = element(document, "div", undefined, "settings-actions");
-  testButton = actionButton(document, "Test download", () => {
-    if (selectedDestinationChoice) actions.testFolder?.(selectedDestinationChoice);
-  });
-  testButton.disabled = !selectedDestinationChoice;
+  if (pickerChoice) {
+    folderControls.append(
+      actionButton(document, "Test and use folder", () => actions.testFolder?.(pickerChoice)),
+    );
+  }
   folderControls.append(
-    testButton,
     actionButton(document, "Open folder", () => actions.openFolder?.()),
-    actionButton(document, "Choose another folder", () => actions.pickFolder?.()),
+    actionButton(document, "Choose PDF folder", () => actions.pickFolder?.()),
   );
+  if (model.picker_unavailable === true) {
+    folder.append(
+      element(
+        document,
+        "p",
+        "The native folder picker is unavailable. You can use an app-managed fallback folder instead.",
+        "picker-status",
+      ),
+    );
+    folderControls.append(
+      actionButton(document, "Test and use Downloads fallback", () =>
+        actions.testFolder?.("downloads")),
+      actionButton(document, "Test and use Documents fallback", () =>
+        actions.testFolder?.("documents")),
+    );
+  }
   folder.append(folderControls);
   container.append(folder, renderSyncSettings(document, model, actions));
 
@@ -507,7 +632,16 @@ export function renderSettingsView(document, container, model = {}, actions = {}
     element(
       document,
       "p",
-      "Inspecting a backup makes no changes. Restore asks you to reconfirm the PDF destination and creates a pre-restore backup.",
+      "Export downloads a portable ZIP containing your interests, paper metadata, " +
+        "synchronization history, review progress, and saved Library papers. It does not " +
+        "include downloaded PDFs, suggestion cache data, or your machine-specific PDF folder.",
+    ),
+    element(
+      document,
+      "p",
+      "Inspect validates and previews a backup without changing anything. Restore replaces " +
+        "your current local data with the backup after you choose a PDF folder. Before " +
+        "replacing anything, arXiv Digest creates a recovery backup of your current data.",
     ),
     actionButton(document, "Export backup", () => actions.exportBackup?.()),
   );
@@ -522,20 +656,36 @@ export function renderSettingsView(document, container, model = {}, actions = {}
   container.append(backup, renderDoctor(document, model.doctor));
 
   const cache = element(document, "section", undefined, "settings-section");
+  const cacheStatus = ["missing", "empty", "ready"].includes(model.candidate_cache?.status)
+    ? model.candidate_cache.status
+    : "unknown";
+  const cacheFileCount = Number.isSafeInteger(model.candidate_cache?.file_count) &&
+      model.candidate_cache.file_count >= 0
+    ? model.candidate_cache.file_count
+    : 0;
   cache.append(
-    element(document, "h2", "Disposable cache"),
+    element(document, "h2", "Candidate cache"),
+    element(document, "p", `Candidate cache: ${cacheStatus} · ${cacheFileCount} files.`),
     element(
       document,
       "p",
-      "Deleting the cache keeps your interests, synchronization checkpoints, review progress, and saved-paper library.",
+      "Stores a temporary recent-paper sample used to build setup and Interests suggestions. " +
+        "Delete it to free space or clear a stale sample; arXiv Digest will download and " +
+        "rebuild it when you refresh suggestions. Interests, synchronization checkpoints, " +
+        "review progress, Library papers, and downloaded PDFs are not removed.",
     ),
   );
-  const confirmClear = actionButton(document, "Confirm delete cache", () => actions.clearCache?.());
+  const confirmClear = actionButton(
+    document,
+    "Confirm delete suggestion cache",
+    () => actions.clearCache?.(),
+  );
   confirmClear.hidden = true;
   cache.append(
-    actionButton(document, "Delete cache", () => {
+    actionButton(document, "Delete suggestion cache", () => {
       confirmClear.hidden = false;
-      progress.textContent = "Confirm cache deletion. Durable data will be kept.";
+      progress.textContent =
+        "Confirm suggestion cache deletion. Durable data and downloaded PDFs will be kept.";
     }),
     confirmClear,
   );
@@ -588,37 +738,48 @@ export function renderRestoreInspection(document, container, inspection, actions
   const refresh = () => {
     if (restoreButton) restoreButton.disabled = !destinationChoice || !preBackup.checked;
   };
-  for (const [value, label] of [
-    ["downloads", "Downloads / Arxiv Digest"],
-    ["documents", "Documents / Arxiv Digest"],
-  ]) {
-    const row = renderDestinationChoice(document, value, label, false);
-    const input = row.querySelector("input");
-    input.addEventListener("change", () => {
-      if (!input.checked) return;
-      destinationChoice = value;
-      actions.confirmDestination?.(pendingId, value);
-      refresh();
-    });
-    destination.append(row);
-  }
   if (
     typeof inspection.picker_choice === "string" &&
     PICKER_ID.test(inspection.picker_choice)
   ) {
     const value = inspection.picker_choice;
-    const row = renderDestinationChoice(document, value, "Chosen folder", false);
-    const input = row.querySelector("input");
-    input.addEventListener("change", () => {
-      if (!input.checked) return;
-      destinationChoice = value;
-      actions.confirmDestination?.(pendingId, value);
-      refresh();
-    });
-    destination.append(row);
+    const displayName =
+      typeof inspection.picker_display_name === "string" &&
+      inspection.picker_display_name.trim()
+        ? inspection.picker_display_name.trim()
+        : "Chosen folder";
+    destination.append(
+      element(document, "p", `Selected folder: ${displayName}`, "selected-destination"),
+      actionButton(document, "Use this folder", () => {
+        destinationChoice = value;
+        actions.confirmDestination?.(pendingId, value);
+        refresh();
+      }),
+      actionButton(document, "Choose another folder", () => actions.pickFolder?.(pendingId)),
+    );
+  } else if (inspection.picker_unavailable === true) {
+    destination.append(
+      element(
+        document,
+        "p",
+        "The native folder picker is unavailable. Choose an app-managed fallback folder for restored PDFs.",
+        "picker-status",
+      ),
+      actionButton(document, "Use Downloads fallback", () => {
+        destinationChoice = "downloads";
+        actions.confirmDestination?.(pendingId, destinationChoice);
+        refresh();
+      }),
+      actionButton(document, "Use Documents fallback", () => {
+        destinationChoice = "documents";
+        actions.confirmDestination?.(pendingId, destinationChoice);
+        refresh();
+      }),
+      actionButton(document, "Try folder picker again", () => actions.pickFolder?.(pendingId)),
+    );
   } else {
     destination.append(
-      actionButton(document, "Choose another folder", () => actions.pickFolder?.(pendingId)),
+      actionButton(document, "Choose PDF folder", () => actions.pickFolder?.(pendingId)),
     );
   }
   container.append(destination);

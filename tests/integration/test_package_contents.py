@@ -9,8 +9,67 @@ from pathlib import Path, PurePosixPath
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DIST = PROJECT_ROOT / "dist"
-SDIST = DIST / "arxiv_digest-0.1.0.tar.gz"
-WHEEL = DIST / "arxiv_digest-0.1.0-py3-none-any.whl"
+SDIST = DIST / "arxiv_digest-0.2.0.tar.gz"
+WHEEL = DIST / "arxiv_digest-0.2.0-py3-none-any.whl"
+
+APPLICATION_ASSET_SHA256 = {
+    "arxiv-digest.icns": (
+        "bfd9510940f503cd41e96c7f5e082b282529b158f7e4cb92131df80f1851751f"
+    ),
+    "arxiv-digest.svg": (
+        "060ef8ab662ad71edb6a60682a8aab3d06dbcc445e41a536143a82035118bb46"
+    ),
+}
+
+EXPECTED_PYTHON_MODULES = frozenset(
+    {
+        "__init__.py",
+        "__main__.py",
+        "application.py",
+        "atomic.py",
+        "backup.py",
+        "candidates.py",
+        "cli.py",
+        "desktop_launcher.py",
+        "doctor.py",
+        "downloads.py",
+        "folders.py",
+        "library.py",
+        "maintenance.py",
+        "models.py",
+        "paths.py",
+        "profile.py",
+        "ranking.py",
+        "rate_limit.py",
+        "reconciliation.py",
+        "review.py",
+        "setup.py",
+        "sources/__init__.py",
+        "sources/atom.py",
+        "sources/catchup.py",
+        "sources/oai.py",
+        "sources/xml.py",
+        "storage/__init__.py",
+        "storage/migrations/__init__.py",
+        "storage/store.py",
+        "storage/database.py",
+        "sync.py",
+        "text.py",
+        "web/__init__.py",
+        "web/api.py",
+        "web/lifecycle.py",
+        "web/server.py",
+    }
+)
+
+EXPECTED_MIGRATIONS = frozenset(
+    {
+        "0001_initial.sql",
+        "0002_download_state.sql",
+        "0003_setup_draft.sql",
+        "0004_confirmed_daily_list.sql",
+    }
+)
 
 
 def _sha256(data: bytes) -> str:
@@ -28,6 +87,8 @@ def _is_binary(data: bytes) -> bool:
 def _source_resources() -> dict[str, bytes]:
     package = PROJECT_ROOT / "src/arxiv_digest"
     paths = [
+        *sorted(package.rglob("*.py")),
+        *sorted(path for path in (package / "assets").glob("*") if path.is_file()),
         *sorted((package / "storage/migrations").glob("*.sql")),
         *sorted(path for path in (package / "web/static").rglob("*") if path.is_file()),
     ]
@@ -57,6 +118,12 @@ def _sdist_resources() -> dict[str, bytes]:
                 "src/arxiv_digest/storage/migrations/"
             ) and relative.endswith(".sql"):
                 key = "package/" + relative.removeprefix("src/arxiv_digest/")
+            elif relative.startswith("src/arxiv_digest/") and relative.endswith(
+                ".py"
+            ):
+                key = "package/" + relative.removeprefix("src/arxiv_digest/")
+            elif relative.startswith("src/arxiv_digest/assets/"):
+                key = "package/" + relative.removeprefix("src/arxiv_digest/")
             elif relative.startswith("src/arxiv_digest/web/static/"):
                 key = "package/" + relative.removeprefix("src/arxiv_digest/")
             elif relative == "LICENSE":
@@ -85,6 +152,10 @@ def _wheel_resources() -> tuple[dict[str, bytes], list[str]]:
             if name.startswith(
                 "arxiv_digest/storage/migrations/"
             ) and name.endswith(".sql"):
+                key = "package/" + name.removeprefix("arxiv_digest/")
+            elif name.startswith("arxiv_digest/") and name.endswith(".py"):
+                key = "package/" + name.removeprefix("arxiv_digest/")
+            elif name.startswith("arxiv_digest/assets/"):
                 key = "package/" + name.removeprefix("arxiv_digest/")
             elif name.startswith("arxiv_digest/web/static/"):
                 key = "package/" + name.removeprefix("arxiv_digest/")
@@ -120,13 +191,13 @@ def _assert_katex_manifest(resources: dict[str, bytes]) -> None:
     assert actual == declared
 
     binary_resources = {
-        key.removeprefix(prefix)
+        key
         for key, data in resources.items()
         if key.startswith("package/") and _is_binary(data)
     }
     assert binary_resources == {
-        path for path in declared if path.startswith("fonts/")
-    }
+        prefix + path for path in declared if path.startswith("fonts/")
+    } | {"package/assets/arxiv-digest.icns"}
 
 
 def test_sdist_and_wheel_contain_exact_release_resources() -> None:
@@ -143,6 +214,16 @@ def test_sdist_and_wheel_contain_exact_release_resources() -> None:
         key: _sha256(value) for key, value in source.items()
     }
     assert unexpected_binary == []
+    expected_assets = {
+        f"package/assets/{name}": digest
+        for name, digest in APPLICATION_ASSET_SHA256.items()
+    }
+    for resources in (source, sdist, wheel):
+        assert {
+            key: _sha256(data)
+            for key, data in resources.items()
+            if key.startswith("package/assets/")
+        } == expected_assets
     _assert_katex_manifest(source)
     _assert_katex_manifest(sdist)
     _assert_katex_manifest(wheel)
@@ -153,7 +234,34 @@ def test_migration_and_application_asset_inventories_are_exact() -> None:
     sdist = _sdist_resources()
     wheel, _ = _wheel_resources()
 
-    for prefix in ("package/storage/migrations/", "package/web/static/"):
+    for prefix in (
+        "package/assets/",
+        "package/storage/migrations/",
+        "package/web/static/",
+    ):
         expected = {key for key in source if key.startswith(prefix)}
         assert {key for key in sdist if key.startswith(prefix)} == expected
         assert {key for key in wheel if key.startswith(prefix)} == expected
+
+
+def test_python_module_and_migration_allowlists_are_exact() -> None:
+    source = _source_resources()
+    sdist = _sdist_resources()
+    wheel, _ = _wheel_resources()
+
+    expected_modules = {f"package/{path}" for path in EXPECTED_PYTHON_MODULES}
+    expected_migrations = {
+        f"package/storage/migrations/{path}" for path in EXPECTED_MIGRATIONS
+    }
+    for resources in (source, sdist, wheel):
+        assert {
+            key
+            for key in resources
+            if key.startswith("package/") and key.endswith(".py")
+        } == expected_modules
+        assert {
+            key
+            for key in resources
+            if key.startswith("package/storage/migrations/")
+            and key.endswith(".sql")
+        } == expected_migrations

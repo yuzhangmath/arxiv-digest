@@ -36,13 +36,13 @@ jobs:
       - run: python -m pytest tests/browser -q
       - run: python -m pytest tests/integration/test_package_contents.py -q
       - run: python scripts/privacy_scan.py tree . --expected-remote "${{ github.server_url }}/${{ github.repository }}"
-      - run: python scripts/privacy_scan.py archive dist/arxiv_digest-0.1.0.tar.gz
-      - run: python scripts/privacy_scan.py archive dist/arxiv_digest-0.1.0-py3-none-any.whl
+      - run: python scripts/privacy_scan.py archive dist/arxiv_digest-0.2.0.tar.gz
+      - run: python scripts/privacy_scan.py archive dist/arxiv_digest-0.2.0-py3-none-any.whl
       - name: Smoke-test the wheel through pipx
         shell: bash
         run: |
           mkdir -p "${{ runner.temp }}/pipx-bin" "${{ runner.temp }}/unrelated"
           cd "${{ runner.temp }}/unrelated"
-          PIPX_HOME="${{ runner.temp }}/pipx-home" PIPX_BIN_DIR="${{ runner.temp }}/pipx-bin" python -m pipx install "${{ github.workspace }}/dist/arxiv_digest-0.1.0-py3-none-any.whl"
+          PIPX_HOME="${{ runner.temp }}/pipx-home" PIPX_BIN_DIR="${{ runner.temp }}/pipx-bin" python -m pipx install "${{ github.workspace }}/dist/arxiv_digest-0.2.0-py3-none-any.whl"
           ARXIV_DIGEST_TESTING=1 ARXIV_DIGEST_TEST_ROOT="${{ runner.temp }}/doctor-state" "${{ runner.temp }}/pipx-bin/arxiv-digest" doctor
           test ! -e "${{ runner.temp }}/doctor-state"

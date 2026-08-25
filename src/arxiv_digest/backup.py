@@ -20,13 +20,13 @@ from typing import Literal
 from urllib.parse import quote
 
 from arxiv_digest.atomic import atomic_write, exclusive_flock
-from arxiv_digest.downloads import safe_pdf_filename
 from arxiv_digest.folders import DestinationKind, FolderChoice, FolderService
 from arxiv_digest.maintenance import MaintenanceBarrier
 from arxiv_digest.paths import AppPaths
 from arxiv_digest.profile import (
     PdfDestination,
     Profile,
+    ProfileCategory,
     decode_profile,
     encode_profile,
 )
@@ -34,8 +34,8 @@ from arxiv_digest.storage.database import open_database
 
 
 FORMAT_NAME = "arxiv-digest-backup"
-FORMAT_VERSION = 1
-RECORD_SCHEMA_VERSION = 1
+FORMAT_VERSION = 2
+RECORD_SCHEMA_VERSION = 2
 
 PORTABLE_FIELDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
@@ -86,48 +86,59 @@ PORTABLE_FIELDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "last_raw_sha256",
             "last_seen_at",
         ),
-        "review_event": (
-            "event_id",
-            "arxiv_id",
-            "announced_version",
-            "effective_date",
-            "date_basis",
-            "confidence",
-            "queue_revision",
-            "reviewed_at",
-        ),
-        "event_evidence": (
-            "evidence_id",
-            "event_id",
+        "source_observation": (
+            "observation_id",
             "source_key",
+            "arxiv_id",
             "source",
-            "confidence",
             "category",
             "announce_type",
-            "mailing_date",
+            "daily_list_date",
             "announced_version",
             "list_position",
             "oai_datestamp",
-            "raw_sha256",
+            "response_sha256",
             "observed_at",
         ),
+        "catchup_day": (
+            "category",
+            "daily_list_date",
+            "status",
+            "attempted_at",
+            "response_sha256",
+            "error_code",
+        ),
+        "canonical_event": (
+            "event_id",
+            "arxiv_id",
+            "announced_version",
+            "daily_list_date",
+            "version_resolution",
+            "queue_revision",
+            "reviewed_at",
+            "recovered_after_finish",
+            "conflict_code",
+        ),
+        "canonical_event_observation": (
+            "event_id",
+            "observation_id",
+        ),
         "review_date_state": (
-            "effective_date",
+            "daily_list_date",
             "anchor_event_id",
             "profile_revision",
             "last_finished_at",
             "last_finished_revision",
         ),
-        "enrichment_day": (
-            "category",
-            "mailing_date",
-            "source",
-            "status",
-            "fetched_at",
-            "raw_sha256",
-            "error_code",
-        ),
         "saved_paper": ("arxiv_id", "saved_version"),
+        "download_file": (
+            "arxiv_id",
+            "version",
+            "filename",
+            "byte_count",
+            "sha256",
+            "last_verified_at",
+        ),
     }
 )
 
@@ -143,14 +154,25 @@ _PORTABLE_TABLES: Mapping[str, tuple[str, tuple[str, ...]]] = MappingProxyType(
             "category_article_state",
             ("category", "arxiv_id"),
         ),
-        "review_event": ("review_events", ("event_id",)),
-        "event_evidence": ("event_evidence", ("evidence_id",)),
-        "review_date_state": ("review_date_state", ("effective_date",)),
-        "enrichment_day": (
-            "enrichment_days",
-            ("category", "mailing_date", "source"),
+        "source_observation": (
+            "source_observations",
+            ("observation_id",),
+        ),
+        "catchup_day": (
+            "catchup_days",
+            ("category", "daily_list_date"),
+        ),
+        "canonical_event": ("canonical_events", ("event_id",)),
+        "canonical_event_observation": (
+            "canonical_event_observations",
+            ("event_id", "observation_id"),
+        ),
+        "review_date_state": (
+            "review_date_state",
+            ("daily_list_date",),
         ),
         "saved_paper": ("saved_papers", ("arxiv_id",)),
+        "download_file": ("download_files", ("arxiv_id", "version")),
     }
 )
 
@@ -172,6 +194,7 @@ class BackupMember:
 class BackupManifest:
     format_name: Literal["arxiv-digest-backup"]
     format_version: int
+    application_generation: int
     application_version: str
     created_at: datetime
     members: tuple[BackupMember, ...]
@@ -181,11 +204,15 @@ class BackupManifest:
 class PortableProfile:
     schema_version: int
     revision: int
-    categories: tuple[str, ...]
+    category_coverage: tuple[ProfileCategory, ...]
     keywords: tuple[str, ...]
     phrases: tuple[str, ...]
     authors: tuple[str, ...]
     seed_papers: tuple[str, ...]
+
+    @property
+    def categories(self) -> tuple[str, ...]:
+        return tuple(item.category for item in self.category_coverage)
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,19 +335,34 @@ def _require_sha256(value: object, label: str) -> str:
     return value
 
 
+def _is_portable_filename(value: object) -> bool:
+    return (
+        type(value) is str
+        and value not in {"", ".", ".."}
+        and Path(value).name == value
+        and "/" not in value
+        and "\\" not in value
+    )
+
+
 def _parse_manifest(payload: bytes) -> BackupManifest:
     value = _require_object(
         _decode_json(payload, "manifest"),
         {
             "format_name",
             "format_version",
+            "application_generation",
             "application_version",
             "created_at",
             "members",
         },
         "manifest",
     )
-    if value["format_name"] != FORMAT_NAME or value["format_version"] != 1:
+    if (
+        value["format_name"] != FORMAT_NAME
+        or value["format_version"] != FORMAT_VERSION
+        or value["application_generation"] != 2
+    ):
         raise BackupError("unsupported_schema", "backup format is unsupported")
     application_version = value["application_version"]
     if not isinstance(application_version, str) or not application_version.strip():
@@ -356,6 +398,7 @@ def _parse_manifest(payload: bytes) -> BackupManifest:
     return BackupManifest(
         FORMAT_NAME,
         FORMAT_VERSION,
+        2,
         application_version,
         _parse_utc(value["created_at"]),
         tuple(members),
@@ -379,7 +422,7 @@ def _parse_portable_profile(payload: bytes) -> PortableProfile:
         {
             "schema_version",
             "revision",
-            "categories",
+            "category_coverage",
             "keywords",
             "phrases",
             "authors",
@@ -387,18 +430,51 @@ def _parse_portable_profile(payload: bytes) -> PortableProfile:
         },
         "portable profile",
     )
-    if value["schema_version"] != 1:
+    if value["schema_version"] != 2:
         raise BackupError("unsupported_schema", "portable profile is unsupported")
     revision = value["revision"]
     if type(revision) is not int or revision < 1:
         raise BackupError("unsupported_schema", "portable profile revision is invalid")
-    categories = _portable_text_values(value["categories"], "categories")
-    if not categories:
-        raise BackupError("unsupported_schema", "portable categories are required")
+    raw_coverage = value["category_coverage"]
+    if not isinstance(raw_coverage, list) or not raw_coverage:
+        raise BackupError(
+            "unsupported_schema", "portable category coverage is required"
+        )
+    category_coverage: list[ProfileCategory] = []
+    for raw in raw_coverage:
+        item = _require_object(
+            raw,
+            {"category", "coverage_start"},
+            "portable category coverage",
+        )
+        category = item["category"]
+        coverage_start = item["coverage_start"]
+        if type(category) is not str or type(coverage_start) is not str:
+            raise BackupError(
+                "unsupported_schema", "portable category coverage is invalid"
+            )
+        try:
+            parsed_start = datetime.strptime(coverage_start, "%Y-%m-%d").date()
+            parsed = ProfileCategory(category, parsed_start)
+        except ValueError as error:
+            raise BackupError(
+                "unsupported_schema", "portable category coverage is invalid"
+            ) from error
+        if parsed.category != category or parsed_start.isoformat() != coverage_start:
+            raise BackupError(
+                "unsupported_schema", "portable category coverage is invalid"
+            )
+        category_coverage.append(parsed)
+    if len({item.category.casefold() for item in category_coverage}) != len(
+        category_coverage
+    ):
+        raise BackupError(
+            "unsupported_schema", "portable category coverage is invalid"
+        )
     return PortableProfile(
-        1,
+        2,
         revision,
-        categories,
+        tuple(category_coverage),
         _portable_text_values(value["keywords"], "keywords"),
         _portable_text_values(value["phrases"], "phrases"),
         _portable_text_values(value["authors"], "authors"),
@@ -444,14 +520,18 @@ def _validate_cross_records(
     records: tuple[PortableRecord, ...],
 ) -> None:
     synchronized = {
-        dict(record.payload)["category"]
+        dict(record.payload)["category"]: dict(record.payload)["coverage_start"]
         for record in records
         if record.record_type == "category_sync"
     }
-    if any(category not in synchronized for category in profile.categories):
+    if any(
+        item.category not in synchronized
+        or synchronized[item.category] != item.coverage_start.isoformat()
+        for item in profile.category_coverage
+    ):
         raise BackupError(
             "cross_record_invalid",
-            "an active category has no portable synchronization state",
+            "active category coverage does not match synchronization state",
         )
     articles = {
         dict(record.payload)["arxiv_id"]
@@ -463,7 +543,56 @@ def _validate_cross_records(
             "cross_record_invalid",
             "a selected seed has no portable article metadata",
         )
+    observations = {
+        dict(record.payload)["observation_id"]: dict(record.payload)
+        for record in records
+        if record.record_type == "source_observation"
+    }
+    event_observations: dict[int, set[int]] = {}
     for record in records:
+        if record.record_type != "canonical_event_observation":
+            continue
+        payload = dict(record.payload)
+        event_observations.setdefault(int(payload["event_id"]), set()).add(
+            int(payload["observation_id"])
+        )
+    for record in records:
+        if record.record_type != "canonical_event":
+            continue
+        payload = dict(record.payload)
+        linked = event_observations.get(int(payload["event_id"]), set())
+        if not any(
+            observation_id in observations
+            and observations[observation_id]["source"] == "catchup"
+            and observations[observation_id]["daily_list_date"]
+            == payload["daily_list_date"]
+            for observation_id in linked
+        ):
+            raise BackupError(
+                "cross_record_invalid",
+                "a canonical event has no linked exact-date catch-up observation",
+            )
+    for record in records:
+        if record.record_type == "download_file":
+            payload = dict(record.payload)
+            filename = payload["filename"]
+            if not _is_portable_filename(filename):
+                raise BackupError(
+                    "unsupported_schema",
+                    "portable download filename is invalid",
+                )
+            if (
+                type(payload["version"]) is not int
+                or payload["version"] < 1
+                or type(payload["byte_count"]) is not int
+                or payload["byte_count"] < 1
+            ):
+                raise BackupError(
+                    "unsupported_schema",
+                    "portable download metadata is invalid",
+                )
+            _require_sha256(payload["sha256"], "portable download")
+            _parse_utc(payload["last_verified_at"])
         if record.record_type != "category_sync":
             continue
         payload = dict(record.payload)
@@ -601,6 +730,8 @@ def _insert_portable_records(
         for record_type in PORTABLE_FIELDS
     }
     for record_type, fields in PORTABLE_FIELDS.items():
+        if record_type == "download_file":
+            continue
         table = _PORTABLE_TABLES[record_type][0]
         placeholders = ", ".join("?" for _ in fields)
         columns = ", ".join(fields)
@@ -616,16 +747,16 @@ def _recompute_local_downloads(
     connection: sqlite3.Connection,
     destination: Path,
     now: datetime,
+    records: tuple[PortableRecord, ...],
 ) -> None:
     timestamp = _utc_text(now)
-    rows = connection.execute(
-        """SELECT a.arxiv_id, a.title, v.version
-           FROM articles AS a
-           JOIN article_versions AS v ON v.arxiv_id = a.arxiv_id
-           ORDER BY a.arxiv_id, v.version"""
-    ).fetchall()
-    for arxiv_id, title, version in rows:
-        filename = safe_pdf_filename(arxiv_id, int(version), title)
+    for record in records:
+        if record.record_type != "download_file":
+            continue
+        payload = _record_payload(record)
+        filename = payload["filename"]
+        if not _is_portable_filename(filename):
+            continue
         candidate = destination / filename
         if candidate.is_symlink() or not candidate.is_file():
             continue
@@ -641,7 +772,12 @@ def _recompute_local_downloads(
                     prefix += chunk[: 5 - len(prefix)]
                 byte_count += len(chunk)
                 digest.update(chunk)
-        if byte_count < 1 or not prefix.startswith(b"%PDF-"):
+        if (
+            byte_count < 1
+            or not prefix.startswith(b"%PDF-")
+            or byte_count != payload["byte_count"]
+            or digest.hexdigest() != payload["sha256"]
+        ):
             continue
         connection.execute(
             """INSERT INTO download_files(
@@ -649,8 +785,8 @@ def _recompute_local_downloads(
                    last_verified_at
                ) VALUES (?, ?, ?, ?, ?, ?)""",
             (
-                arxiv_id,
-                version,
+                payload["arxiv_id"],
+                payload["version"],
                 filename,
                 byte_count,
                 digest.hexdigest(),
@@ -672,7 +808,7 @@ def _build_restored_state(
     profile = Profile(
         schema_version=inspection.profile.schema_version,
         revision=profile_revision,
-        categories=inspection.profile.categories,
+        category_coverage=inspection.profile.category_coverage,
         keywords=inspection.profile.keywords,
         phrases=inspection.profile.phrases,
         authors=inspection.profile.authors,
@@ -691,7 +827,7 @@ def _build_restored_state(
                 *(
                     int(_record_payload(record)["queue_revision"])
                     for record in inspection.records
-                    if record.record_type == "review_event"
+                    if record.record_type == "canonical_event"
                 ),
                 *(
                     int(value)
@@ -716,7 +852,12 @@ def _build_restored_state(
                 hashlib.sha256(profile_payload).hexdigest(),
             ),
         )
-        _recompute_local_downloads(connection, destination.path, now)
+        _recompute_local_downloads(
+            connection,
+            destination.path,
+            now,
+            inspection.records,
+        )
         connection.commit()
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         connection.execute("PRAGMA journal_mode = DELETE")
@@ -1222,6 +1363,9 @@ def restore_backup(
 ) -> RestoreResult:
     """Revalidate and restore a portable snapshot into confirmed local state."""
 
+    fresh = inspect_backup(inspection.path)
+    if fresh.archive_sha256 != inspection.archive_sha256:
+        raise BackupError("archive_changed", "backup changed after inspection")
     inject_crash = crash_injector or (lambda _: None)
     validated_destination = FolderService().validate(
         FolderChoice(
@@ -1242,8 +1386,7 @@ def restore_backup(
     )
     with lease:
         with exclusive_flock(paths.profile_lock_path):
-            fresh = inspect_backup(inspection.path)
-            if fresh.archive_sha256 != inspection.archive_sha256:
+            if _sha256_file(inspection.path) != fresh.archive_sha256:
                 raise BackupError(
                     "archive_changed", "backup changed after inspection"
                 )
@@ -1278,7 +1421,7 @@ def restore_backup(
                         _snapshot_payloads(
                             paths,
                             candidate,
-                            application_version="0.1.0",
+                            application_version="0.2.0",
                             created_at=now,
                         )
                     except BackupError as error:
@@ -1326,7 +1469,13 @@ def _portable_profile_bytes(profile_payload: bytes) -> bytes:
         {
             "schema_version": profile.schema_version,
             "revision": profile.revision,
-            "categories": list(profile.categories),
+            "category_coverage": [
+                {
+                    "category": item.category,
+                    "coverage_start": item.coverage_start.isoformat(),
+                }
+                for item in profile.category_coverage
+            ],
             "keywords": list(profile.keywords),
             "phrases": list(profile.phrases),
             "authors": list(profile.authors),
@@ -1364,6 +1513,7 @@ def _manifest_value(manifest: BackupManifest) -> dict[str, object]:
     return {
         "format_name": manifest.format_name,
         "format_version": manifest.format_version,
+        "application_generation": manifest.application_generation,
         "application_version": manifest.application_version,
         "created_at": _utc_text(manifest.created_at),
         "members": [
@@ -1463,6 +1613,20 @@ def _snapshot_payloads(
     connection.execute("PRAGMA query_only = ON")
     try:
         connection.execute("BEGIN")
+        try:
+            generation = connection.execute(
+                "SELECT singleton, generation FROM application_generation"
+            ).fetchone()
+        except sqlite3.DatabaseError as error:
+            raise BackupError(
+                "unsupported_schema",
+                "application data generation is unsupported",
+            ) from error
+        if generation is None or tuple(generation) != (1, 2):
+            raise BackupError(
+                "unsupported_schema",
+                "application data generation is unsupported",
+            )
         marker = connection.execute(
             "SELECT pending_revision, pending_sha256, status "
             "FROM profile_publication WHERE singleton = 1"
@@ -1497,6 +1661,7 @@ def _snapshot_payloads(
         manifest = BackupManifest(
             FORMAT_NAME,
             FORMAT_VERSION,
+            generation["generation"],
             application_version,
             created_at,
             members,
@@ -1545,7 +1710,7 @@ def export_backup(
     *,
     maintenance: MaintenanceBarrier | None = None,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-    application_version: str = "0.1.0",
+    application_version: str = "0.2.0",
 ) -> BackupManifest:
     """Export a verified portable snapshot without overwriting a target."""
 

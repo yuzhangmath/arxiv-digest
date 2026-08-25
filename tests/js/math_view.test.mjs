@@ -59,6 +59,22 @@ test("adjacent inline expressions are parsed independently", () => {
   ]);
 });
 
+test("parenthesized TeX delimiters become inline math", () => {
+  assert.deepEqual(
+    splitMathSegments(String.raw`Value \(x^2 + y^2\) here.`),
+    [
+      { kind: "text", value: "Value " },
+      {
+        kind: "math",
+        value: "x^2 + y^2",
+        raw: String.raw`\(x^2 + y^2\)`,
+        display: false,
+      },
+      { kind: "text", value: " here." },
+    ],
+  );
+});
+
 test("the KaTeX manifest has the exact version and sorted hashes for every vendored byte", async () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const vendor = join(

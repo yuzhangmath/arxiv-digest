@@ -64,6 +64,12 @@ export class ApiClient {
     this.controllers = new Map();
   }
 
+  abortAll() {
+    const controllers = [...this.controllers.values()];
+    this.controllers.clear();
+    for (const controller of controllers) controller.abort();
+  }
+
   json(key, path, options = {}) {
     const url = new URL(path, this.origin);
     if (url.origin !== this.origin || !url.pathname.startsWith("/api/v1/")) {
@@ -91,6 +97,9 @@ export class ApiClient {
         }
         if (!response.ok) {
           const error = await ApiError.fromResponse(response);
+          if (this.controllers.get(key) !== controller) {
+            throw new StaleResponseError();
+          }
           if (response.status === 401) this.onAuthenticationRejected();
           throw error;
         }

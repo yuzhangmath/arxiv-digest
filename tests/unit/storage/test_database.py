@@ -1,10 +1,16 @@
+import hashlib
 import sqlite3
 from importlib.resources import files
 from pathlib import Path
 
 import pytest
 
-from arxiv_digest.storage.database import CorruptDatabaseError, open_database
+import arxiv_digest.storage.database as database_module
+from arxiv_digest.storage.database import (
+    CorruptDatabaseError,
+    LegacyDataGenerationError,
+    open_database,
+)
 
 
 def _current_migration_versions() -> tuple[int, ...]:
@@ -42,6 +48,24 @@ def _create_version_one_database(path: Path) -> None:
     connection.close()
 
 
+def _create_version_three_database(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    migrations = files("arxiv_digest.storage.migrations")
+    for version, name in enumerate(
+        ("0001_initial.sql", "0002_download_state.sql", "0003_setup_draft.sql"),
+        start=1,
+    ):
+        connection.executescript(
+            migrations.joinpath(name).read_text(encoding="utf-8")
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (version, f"2026-08-0{version}T00:00:00Z"),
+        )
+    connection.commit()
+    connection.close()
+
+
 def test_open_database_creates_required_tables(tmp_path: Path) -> None:
     connection = open_database(tmp_path / "state.sqlite3")
     names = {
@@ -61,14 +85,131 @@ def test_open_database_creates_required_tables(tmp_path: Path) -> None:
         "article_categories",
         "category_sync_state",
         "sync_runs",
-        "review_events",
-        "event_evidence",
+        "application_generation",
+        "source_observations",
+        "catchup_days",
+        "canonical_events",
+        "canonical_event_observations",
         "review_date_state",
-        "enrichment_days",
+        "reconciliation_diagnostics",
         "saved_papers",
         "papers_fts",
         "category_article_state",
     } <= names
+
+
+def test_new_database_uses_application_generation_two(tmp_path: Path) -> None:
+    connection = open_database(tmp_path / "state.sqlite3")
+
+    generation = connection.execute(
+        "SELECT generation FROM application_generation WHERE singleton = 1"
+    ).fetchone()
+    connection.close()
+
+    assert generation == (2,)
+
+
+def test_new_database_uses_confirmed_daily_list_schema(tmp_path: Path) -> None:
+    connection = open_database(tmp_path / "state.sqlite3")
+    names = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    state_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(state_meta)")
+    }
+    connection.close()
+
+    assert {
+        "source_observations",
+        "catchup_days",
+        "canonical_events",
+        "canonical_event_observations",
+        "review_date_state",
+        "reconciliation_diagnostics",
+    } <= names
+    assert {"review_events", "event_evidence", "enrichment_days"}.isdisjoint(names)
+    assert "projection_revision" in state_columns
+
+
+def test_canonical_event_identity_is_unique_per_paper_and_daily_list_date(
+    tmp_path: Path,
+) -> None:
+    connection = open_database(tmp_path / "state.sqlite3")
+    _insert_article(connection, "2608.00001")
+    connection.execute(
+        """INSERT INTO canonical_events(
+               arxiv_id, daily_list_date, version_resolution, queue_revision
+           ) VALUES (?, ?, ?, ?)""",
+        ("2608.00001", "2026-08-25", "unconfirmed", 1),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """INSERT INTO canonical_events(
+                   arxiv_id, daily_list_date, version_resolution, queue_revision
+               ) VALUES (?, ?, ?, ?)""",
+            ("2608.00001", "2026-08-25", "unconfirmed", 2),
+        )
+    connection.close()
+
+
+def test_legacy_database_is_rejected_without_modifying_its_bytes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    _create_version_three_database(path)
+    before = hashlib.sha256(path.read_bytes()).digest()
+
+    with pytest.raises(
+        LegacyDataGenerationError, match="Clean reset with recovery copy"
+    ):
+        open_database(path)
+
+    assert hashlib.sha256(path.read_bytes()).digest() == before
+
+
+def test_wrong_application_generation_is_rejected_without_modification(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = open_database(path)
+    connection.execute("UPDATE application_generation SET generation = 1")
+    connection.commit()
+    connection.close()
+    before = hashlib.sha256(path.read_bytes()).digest()
+
+    with pytest.raises(
+        LegacyDataGenerationError, match="Clean reset with recovery copy"
+    ):
+        open_database(path)
+
+    assert hashlib.sha256(path.read_bytes()).digest() == before
+
+
+def test_newer_schema_is_rejected_during_read_only_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = open_database(path)
+    connection.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        (max(_current_migration_versions()) + 1, "2026-08-25T00:00:00Z"),
+    )
+    connection.commit()
+    connection.close()
+    before = hashlib.sha256(path.read_bytes()).digest()
+
+    def reject_normal_connection(_path: Path) -> sqlite3.Connection:
+        raise AssertionError("normal database connection was attempted")
+
+    monkeypatch.setattr(database_module, "_connect", reject_normal_connection)
+    with pytest.raises(CorruptDatabaseError, match="schema version is unsupported"):
+        open_database(path)
+
+    assert hashlib.sha256(path.read_bytes()).digest() == before
 
 
 def test_new_database_applies_download_state_migration(tmp_path: Path) -> None:
@@ -87,56 +228,17 @@ def test_new_database_applies_download_state_migration(tmp_path: Path) -> None:
     assert table == ("download_files",)
 
 
-def test_existing_version_one_database_is_upgraded_transactionally(
+def test_existing_version_one_database_is_rejected_without_migration(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "state.sqlite3"
     _create_version_one_database(path)
+    before = hashlib.sha256(path.read_bytes()).digest()
 
-    connection = open_database(path)
-
-    assert connection.execute(
-        "SELECT version FROM schema_migrations ORDER BY version"
-    ).fetchall() == [
-        (version,) for version in _current_migration_versions()
-    ]
-    assert connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        ("download_files",),
-    ).fetchone() == ("download_files",)
-    connection.close()
-
-
-def test_failed_upgrade_rolls_back_to_an_untouched_version_one_database(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "state.sqlite3"
-    _create_version_one_database(path)
-    connection = sqlite3.connect(path)
-    connection.executescript(
-        """
-        CREATE TRIGGER reject_version_two
-        BEFORE INSERT ON schema_migrations
-        WHEN new.version = 2
-        BEGIN
-            SELECT RAISE(ABORT, 'synthetic migration interruption');
-        END;
-        """
-    )
-    connection.close()
-
-    with pytest.raises(CorruptDatabaseError):
+    with pytest.raises(LegacyDataGenerationError):
         open_database(path)
 
-    unchanged = sqlite3.connect(path)
-    assert unchanged.execute(
-        "SELECT version FROM schema_migrations ORDER BY version"
-    ).fetchall() == [(1,)]
-    assert unchanged.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        ("download_files",),
-    ).fetchone() is None
-    unchanged.close()
+    assert hashlib.sha256(path.read_bytes()).digest() == before
 
 
 def test_corrupt_database_is_not_replaced(tmp_path: Path) -> None:
@@ -176,16 +278,15 @@ def test_new_database_is_single_file_and_survives_reopen(tmp_path: Path) -> None
             ("2608.00001", 0),
         ),
         (
-            """INSERT INTO review_events(
-                   arxiv_id, announced_version, effective_date,
-                   date_basis, confidence, queue_revision
-               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO canonical_events(
+                   arxiv_id, announced_version, daily_list_date,
+                   version_resolution, queue_revision
+               ) VALUES (?, ?, ?, ?, ?)""",
             (
                 "2608.00001",
                 0,
                 "2026-08-01",
-                "feed_mailing",
-                "current",
+                "unconfirmed",
                 1,
             ),
         ),
@@ -214,7 +315,7 @@ def test_saved_version_must_reference_an_actual_article_version(
     connection.close()
 
 
-def test_review_version_must_reference_the_same_papers_actual_version(
+def test_canonical_version_must_reference_the_same_papers_actual_version(
     tmp_path: Path,
 ) -> None:
     connection = open_database(tmp_path / "state.sqlite3")
@@ -227,16 +328,15 @@ def test_review_version_must_reference_the_same_papers_actual_version(
     )
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
-            """INSERT INTO review_events(
-                   arxiv_id, announced_version, effective_date,
-                   date_basis, confidence, queue_revision
-               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO canonical_events(
+                   arxiv_id, announced_version, daily_list_date,
+                   version_resolution, queue_revision
+               ) VALUES (?, ?, ?, ?, ?)""",
             (
                 "2608.00004",
                 1,
                 "2026-08-01",
-                "feed_mailing",
-                "current",
+                "chronology_matched",
                 1,
             ),
         )
@@ -367,7 +467,7 @@ def test_missing_required_schema_object_is_reported_as_corruption(
     path = tmp_path / "state.sqlite3"
     open_database(path).close()
     connection = sqlite3.connect(path)
-    connection.execute("DROP TABLE enrichment_days")
+    connection.execute("DROP TABLE catchup_days")
     connection.commit()
     connection.close()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.resources
 import json
 import os
 import shutil
@@ -14,13 +15,16 @@ from pathlib import Path
 from arxiv_digest.atomic import atomic_write
 
 
-_SCHEMA_VERSION = 1
+_MAC_SCHEMA_VERSION = 2
+_LINUX_SCHEMA_VERSION = 1
 _BUNDLE_ID = "org.arxiv.digest"
+_MAC_ICON_FILENAME = "arxiv-digest.icns"
 
 
 class LauncherState(StrEnum):
     ABSENT = "absent"
     INSTALLED = "installed"
+    OUTDATED = "outdated"
     COLLISION = "collision"
 
 
@@ -80,23 +84,87 @@ class DesktopLauncherManager:
             "<key>CFBundleIdentifier</key><string>org.arxiv.digest</string>\n"
             "<key>CFBundleName</key><string>arXiv Digest</string>\n"
             "<key>CFBundleExecutable</key><string>arxiv-digest</string>\n"
+            f"<key>CFBundleIconFile</key><string>{_MAC_ICON_FILENAME}</string>\n"
+            f"<key>CFBundleVersion</key><string>{_MAC_SCHEMA_VERSION}</string>\n"
             "<key>CFBundlePackageType</key><string>APPL</string>\n"
             "</dict></plist>\n"
         ).encode("utf-8")
 
-    def _mac_manifest(self, launcher: bytes) -> bytes:
+    @staticmethod
+    def _legacy_mac_plist() -> bytes:
+        return (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+            "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            "<plist version=\"1.0\"><dict>\n"
+            "<key>CFBundleIdentifier</key><string>org.arxiv.digest</string>\n"
+            "<key>CFBundleName</key><string>arXiv Digest</string>\n"
+            "<key>CFBundleExecutable</key><string>arxiv-digest</string>\n"
+            "<key>CFBundlePackageType</key><string>APPL</string>\n"
+            "</dict></plist>\n"
+        ).encode("utf-8")
+
+    @staticmethod
+    def _mac_icon() -> bytes:
+        return (
+            importlib.resources.files("arxiv_digest")
+            .joinpath("assets", _MAC_ICON_FILENAME)
+            .read_bytes()
+        )
+
+    def _mac_manifest(self, launcher: bytes, icon: bytes) -> bytes:
         return (
             json.dumps(
                 {
                     "executable_sha256": hashlib.sha256(launcher).hexdigest(),
+                    "icon_sha256": hashlib.sha256(icon).hexdigest(),
                     "product": _BUNDLE_ID,
-                    "schema_version": _SCHEMA_VERSION,
+                    "schema_version": _MAC_SCHEMA_VERSION,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             )
             + "\n"
         ).encode("utf-8")
+
+    def _legacy_mac_manifest(self, launcher: bytes) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "executable_sha256": hashlib.sha256(launcher).hexdigest(),
+                    "product": _BUNDLE_ID,
+                    "schema_version": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    @staticmethod
+    def _mac_inventory_matches(target: Path, *, includes_icon: bool) -> bool:
+        expected = {
+            ("Contents", "directory"),
+            ("Contents/Info.plist", "file"),
+            ("Contents/MacOS", "directory"),
+            ("Contents/MacOS/arxiv-digest", "file"),
+            ("Contents/Resources", "directory"),
+            ("Contents/Resources/ownership.json", "file"),
+        }
+        if includes_icon:
+            expected.add((f"Contents/Resources/{_MAC_ICON_FILENAME}", "file"))
+        actual: set[tuple[str, str]] = set()
+        for path in target.rglob("*"):
+            if path.is_symlink():
+                return False
+            if path.is_dir():
+                kind = "directory"
+            elif path.is_file():
+                kind = "file"
+            else:
+                return False
+            actual.add((path.relative_to(target).as_posix(), kind))
+        return actual == expected
 
     def _linux_payload(self) -> bytes:
         escaped = (
@@ -113,7 +181,7 @@ class DesktopLauncherManager:
             f'Exec="{escaped}"\n'
             "Terminal=false\n"
             "X-arXiv-Digest-Managed=true\n"
-            f"X-arXiv-Digest-Launcher-Schema={_SCHEMA_VERSION}\n"
+            f"X-arXiv-Digest-Launcher-Schema={_LINUX_SCHEMA_VERSION}\n"
         ).encode("utf-8")
 
     def status(self) -> LauncherStatus:
@@ -123,20 +191,45 @@ class DesktopLauncherManager:
         if self.platform == "darwin":
             launcher = target / "Contents/MacOS/arxiv-digest"
             plist = target / "Contents/Info.plist"
+            icon = target / "Contents/Resources" / _MAC_ICON_FILENAME
             manifest = target / "Contents/Resources/ownership.json"
             try:
-                valid = (
+                launcher_bytes = self._mac_launcher()
+                icon_bytes = self._mac_icon()
+                current = (
                     target.is_dir()
                     and not target.is_symlink()
+                    and self._mac_inventory_matches(target, includes_icon=True)
                     and launcher.is_file()
                     and not launcher.is_symlink()
                     and plist.read_bytes() == self._mac_plist()
-                    and launcher.read_bytes() == self._mac_launcher()
+                    and launcher.read_bytes() == launcher_bytes
+                    and icon.is_file()
+                    and not icon.is_symlink()
+                    and icon.read_bytes() == icon_bytes
                     and manifest.read_bytes()
-                    == self._mac_manifest(self._mac_launcher())
+                    == self._mac_manifest(launcher_bytes, icon_bytes)
+                )
+                legacy = (
+                    not current
+                    and target.is_dir()
+                    and not target.is_symlink()
+                    and self._mac_inventory_matches(target, includes_icon=False)
+                    and launcher.is_file()
+                    and not launcher.is_symlink()
+                    and plist.read_bytes() == self._legacy_mac_plist()
+                    and launcher.read_bytes() == launcher_bytes
+                    and manifest.read_bytes()
+                    == self._legacy_mac_manifest(launcher_bytes)
                 )
             except OSError:
-                valid = False
+                current = False
+                legacy = False
+            if current:
+                return LauncherStatus(LauncherState.INSTALLED, target)
+            if legacy:
+                return LauncherStatus(LauncherState.OUTDATED, target)
+            return LauncherStatus(LauncherState.COLLISION, target)
         else:
             try:
                 valid = (
@@ -172,30 +265,56 @@ class DesktopLauncherManager:
         temporary = Path(
             tempfile.mkdtemp(prefix=".arxiv-digest-launcher.", dir=target.parent)
         )
+        backup: Path | None = None
         try:
             macos = temporary / "Contents/MacOS"
             resources = temporary / "Contents/Resources"
             macos.mkdir(mode=0o700, parents=True)
             resources.mkdir(mode=0o700, parents=True)
             launcher = self._mac_launcher()
+            icon = self._mac_icon()
             atomic_write(
                 temporary / "Contents/Info.plist", self._mac_plist(), mode=0o600
             )
             atomic_write(macos / "arxiv-digest", launcher, mode=0o700)
             atomic_write(
-                resources / "ownership.json",
-                self._mac_manifest(launcher),
+                resources / _MAC_ICON_FILENAME,
+                icon,
                 mode=0o600,
             )
-            os.replace(temporary, target)
+            atomic_write(
+                resources / "ownership.json",
+                self._mac_manifest(launcher, icon),
+                mode=0o600,
+            )
+            if target.exists():
+                backup = Path(
+                    tempfile.mkdtemp(
+                        prefix=".arxiv-digest-launcher-backup.",
+                        dir=target.parent,
+                    )
+                )
+                backup.rmdir()
+                os.replace(target, backup)
+            try:
+                os.replace(temporary, target)
+            except BaseException:
+                if backup is not None:
+                    os.replace(backup, target)
+                    backup = None
+                raise
             _fsync_directory(target.parent)
+            installed = self.status()
+            if installed.state is not LauncherState.INSTALLED:
+                raise RuntimeError("desktop launcher verification failed")
+            if backup is not None:
+                shutil.rmtree(backup)
+                backup = None
+                _fsync_directory(target.parent)
+            return installed
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary)
-        installed = self.status()
-        if installed.state is not LauncherState.INSTALLED:
-            raise RuntimeError("desktop launcher verification failed")
-        return installed
 
     def remove(self) -> LauncherStatus:
         current = self.status()

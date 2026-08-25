@@ -450,6 +450,99 @@ def test_suggestions_are_explainable_diverse_and_rerank_after_acceptance() -> No
     assert "Nova Recurring" not in {item.name for item in reranked.authors}
 
 
+def test_term_suggestions_exclude_formula_fragments_but_keep_descriptive_topics() -> None:
+    from arxiv_digest.candidates import build_suggestions
+
+    documents = tuple(
+        _rich_document(
+            f"2608.0010{index}",
+            "synthetic.alpha",
+            title="Homotopy theory and persistent homology",
+            abstract=(
+                r"For $2$, $1$, $s$, $k$, and $n$, compare $\mathbb{R}$ "
+                r"with $\mathbb{F}$ when $n > 1$. Homotopy theory studies "
+                "persistent homology and topological groups."
+            ),
+            authors=(f"Author {index}",),
+            day=date(2026, 7, index),
+        )
+        for index in (1, 2)
+    )
+
+    suggestions = build_suggestions(_corpus(*documents), (), (), ())
+    values = {item.value for item in suggestions.terms}
+
+    assert values.isdisjoint(
+        {"2", "1", "s", "k", "n", "n 1", "mathbb r", "mathbb f"}
+    )
+    assert {"homotopy", "homotopy theory"} <= values
+
+
+def test_term_suggestions_exclude_single_word_academic_boilerplate() -> None:
+    from arxiv_digest.candidates import build_suggestions
+
+    documents = tuple(
+        _rich_document(
+            f"2608.0011{index}",
+            "synthetic.alpha",
+            title="Homotopy over finite complexes",
+            abstract=(
+                "We also prove, prove, prove, and prove comparison results "
+                "over topological spaces."
+            ),
+            authors=(f"Author {index}",),
+            day=date(2026, 7, index),
+        )
+        for index in (1, 2)
+    )
+
+    values = {
+        item.value
+        for item in build_suggestions(_corpus(*documents), (), (), ()).terms
+    }
+
+    assert values.isdisjoint({"also", "prove", "over"})
+    assert "homotopy" in values
+
+
+def test_latex_command_filter_does_not_hide_the_same_word_in_prose() -> None:
+    from arxiv_digest.candidates import build_suggestions
+
+    documents = (
+        _rich_document(
+            "2608.00121",
+            "synthetic.alpha",
+            title="Sphere bundles",
+            abstract="Sphere bundles connect stable homotopy topics.",
+            authors=("Author One",),
+            day=date(2026, 7, 1),
+        ),
+        _rich_document(
+            "2608.00122",
+            "synthetic.alpha",
+            title="Sphere spectra",
+            abstract="Sphere spectra connect stable homotopy topics.",
+            authors=("Author Two",),
+            day=date(2026, 7, 2),
+        ),
+        _rich_document(
+            "2608.00123",
+            "synthetic.alpha",
+            title="A notation convention",
+            abstract=r"Write $\sphere$ for the distinguished object.",
+            authors=("Author Three",),
+            day=date(2026, 7, 3),
+        ),
+    )
+
+    values = {
+        item.value
+        for item in build_suggestions(_corpus(*documents), (), (), ()).terms
+    }
+
+    assert "sphere" in values
+
+
 def test_paper_reason_does_not_claim_relation_for_disjoint_seed_text() -> None:
     from arxiv_digest.candidates import build_suggestions
 

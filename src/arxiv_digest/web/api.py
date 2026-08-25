@@ -61,7 +61,7 @@ class ReviewPagePayload:
 
     page: Any
     last_finished_revision: int | None
-    download_versions: Mapping[str, int] = field(default_factory=dict)
+    latest_known_versions: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +70,9 @@ class SetupDraftPayload:
 
     draft: Any
     corpus_can_resume: bool = False
+    corpus_job: Mapping[str, Any] | None = None
+    coverage_min: date | None = None
+    coverage_max: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,22 +255,29 @@ _ROUTES = (
     _R("POST", "/api/v1/tabs/connect", "tabs_connect", body_kind="json", required=("tab_id",), validators={"tab_id": _is_id}),
     _R("POST", "/api/v1/tabs/heartbeat", "tabs_heartbeat", body_kind="json", required=("tab_id",), validators={"tab_id": _is_id}),
     _R("POST", "/api/v1/tabs/disconnect", "tabs_disconnect", body_kind="json", required=("tab_id",), validators={"tab_id": _is_id}),
-    _R("POST", "/api/v1/sync/start", "sync_start"),
+    _R(
+        "POST",
+        "/api/v1/sync/start",
+        "sync_start",
+        optional=("retry_failed_dates",),
+        validators={"retry_failed_dates": lambda value: type(value) is bool},
+    ),
     _R("POST", "/api/v1/sync/cancel", "sync_cancel", body_kind="json", required=("job_id",), validators={"job_id": _is_id}),
     _R("GET", "/api/v1/review/summary", "review_summary"),
+    _R("POST", "/api/v1/review/finish", "review_finish_all", body_kind="json", required=("snapshot_revision", "profile_revision", "projection_revision"), validators={"snapshot_revision": _is_int, "profile_revision": _is_positive_int, "projection_revision": _is_int}),
     _R("GET", "/api/v1/review/calendar", "review_calendar", query_required=("start", "end"), query_validators={"start": _is_iso_date, "end": _is_iso_date}),
     _R("GET", "/api/v1/review/date", "review_date", query_required=("date",), query_optional=("anchor_event_id",), query_validators={"date": _is_iso_date, "anchor_event_id": _is_offset_text}),
-    _R("PUT", "/api/v1/review/date/position", "review_position", body_kind="json", required=("date", "snapshot_revision", "anchor_event_id"), validators={"date": _is_iso_date, "snapshot_revision": _is_int, "anchor_event_id": _is_positive_int}),
-    _R("POST", "/api/v1/review/date/finish", "review_finish", body_kind="json", required=("date", "snapshot_revision"), validators={"date": _is_iso_date, "snapshot_revision": _is_int}),
+    _R("PUT", "/api/v1/review/date/position", "review_position", body_kind="json", required=("date", "snapshot_revision", "profile_revision", "projection_revision", "anchor_event_id"), validators={"date": _is_iso_date, "snapshot_revision": _is_int, "profile_revision": _is_positive_int, "projection_revision": _is_int, "anchor_event_id": _is_positive_int}),
+    _R("POST", "/api/v1/review/date/finish", "review_finish", body_kind="json", required=("date", "snapshot_revision", "profile_revision", "projection_revision"), validators={"date": _is_iso_date, "snapshot_revision": _is_int, "profile_revision": _is_positive_int, "projection_revision": _is_int}),
     _R("GET", "/api/v1/library", "library", query_optional=("q", "offset"), query_validators={"q": _is_optional_text, "offset": _is_offset_text}),
     _R("POST", "/api/v1/library/save", "library_save", body_kind="json", required=("arxiv_id",), optional=("version",), validators={"arxiv_id": _is_arxiv_id, "version": _is_optional_version}, known_paper_field="arxiv_id"),
     _R("POST", "/api/v1/library/remove", "library_remove", body_kind="json", required=("arxiv_id",), validators={"arxiv_id": _is_arxiv_id}, known_paper_field="arxiv_id"),
-    _R("POST", "/api/v1/library/pdf", "library_pdf", body_kind="json", required=("arxiv_id", "version", "save_first"), validators={"arxiv_id": _is_arxiv_id, "version": _is_positive_int, "save_first": lambda value: type(value) is bool}, known_paper_field="arxiv_id"),
+    _R("POST", "/api/v1/library/pdf", "library_pdf", body_kind="json", required=("arxiv_id", "version", "save_first", "save_version"), validators={"arxiv_id": _is_arxiv_id, "version": _is_positive_int, "save_first": lambda value: type(value) is bool, "save_version": _is_optional_version}, known_paper_field="arxiv_id"),
     _R("GET", "/api/v1/downloads/{job_id}", "download_status"),
     _R("GET", "/api/v1/interests", "interests_get", query_optional=("refresh",), query_validators={"refresh": lambda value: value == "1"}),
     _R("PUT", "/api/v1/interests", "interests_put", body_kind="json", required=("expected_revision",), optional=("categories", "keywords", "phrases", "authors", "seed_papers", "category_configs"), validators={"expected_revision": _is_positive_int, "categories": _is_category_selections, "keywords": _is_string_list, "phrases": _is_string_list, "authors": _is_string_list, "seed_papers": _is_string_list, "category_configs": _is_category_configs}),
     _R("GET", "/api/v1/settings", "settings_get"),
-    _R("PUT", "/api/v1/settings/coverage", "settings_coverage", body_kind="json", required=("category", "new_start"), validators={"category": _is_text, "new_start": _is_iso_date}),
+    _R("PUT", "/api/v1/settings/coverage", "settings_coverage", body_kind="json", required=("category", "new_start", "expected_revision"), validators={"category": _is_text, "new_start": _is_iso_date, "expected_revision": _is_positive_int}),
     _R("POST", "/api/v1/settings/cache/clear", "settings_cache_clear"),
     _R("POST", "/api/v1/settings/folder/pick", "settings_folder_pick"),
     _R("POST", "/api/v1/settings/folder/test", "settings_folder_test", body_kind="json", required=("destination_choice",), validators={"destination_choice": _is_destination_choice}),
@@ -312,79 +322,95 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
     )
 
 
+def _review_event_label(event: Any) -> str | None:
+    from arxiv_digest.models import AnnounceType, EvidenceSource
+
+    announce_types = {
+        item.announce_type
+        for item in event.observations
+        if item.source is EvidenceSource.CATCHUP
+        and item.announce_type is not None
+    }
+    for announce_type, label in (
+        (AnnounceType.REPLACE, "Replacement"),
+        (AnnounceType.REPLACE_CROSS, "Replacement cross-list"),
+        (AnnounceType.NEW, "New submission"),
+        (AnnounceType.CROSS, "Cross-list"),
+    ):
+        if announce_type in announce_types:
+            return label
+    return None
+
+
+def _review_version_label(event: Any) -> str:
+    from arxiv_digest.models import VersionResolution
+
+    if event.version_resolution is VersionResolution.ATOM_CONFIRMED:
+        return f"Announced v{event.announced_version} — Atom-confirmed"
+    if event.version_resolution is VersionResolution.CHRONOLOGY_MATCHED:
+        return f"Version v{event.announced_version} — matched by chronology"
+    return "Version not confirmed"
+
+
 def project_review_page(payload: ReviewPagePayload) -> dict[str, JsonValue]:
     """Expose the intentionally public, browser-safe review card schema."""
-
-    from arxiv_digest.review import confidence_label, review_date_label
 
     page = payload.page
     cards: list[JsonValue] = []
     for ranked in page.cards:
         event = ranked.event
         paper = ranked.paper
-        cards.append(
-            {
-                "event_id": event.event_id,
-                "arxiv_id": paper.arxiv_id,
-                "announced_version": event.announced_version,
-                "download_version": payload.download_versions.get(
-                    paper.arxiv_id,
-                    event.announced_version,
-                ),
-                "title": paper.title,
-                "authors": list(paper.authors),
-                "abstract": paper.abstract,
-                "comments": paper.comments,
-                "journal_ref": paper.journal_ref,
-                "doi": paper.doi,
-                "primary_category": paper.primary_category,
-                "categories": list(paper.categories),
-                "category_observations": sorted(
-                    {item.category for item in event.evidence},
-                    key=str.casefold,
-                ),
-                "effective_date": event.effective_date.isoformat(),
-                "date_label": review_date_label(event.date_basis),
-                "confidence": event.confidence.value,
-                "confidence_label": confidence_label(event.confidence),
-                "newly_discovered": (
-                    event.reviewed_at is None
-                    and payload.last_finished_revision is not None
-                    and event.queue_revision > payload.last_finished_revision
-                ),
-                "reviewed": event.reviewed_at is not None,
-                "tier": ranked.tier.value,
-                "score": ranked.score,
-                "reasons": [
-                    {
-                        "kind": reason.kind,
-                        "label": reason.label,
-                        "location": reason.location,
-                    }
-                    for reason in ranked.reasons
-                ],
-                "evidence": [
-                    {
-                        "source": item.source.value,
-                        "confidence": item.confidence.value,
-                        "confidence_label": confidence_label(item.confidence),
-                        "category": item.category,
-                        "announce_type": item.announce_type.value,
-                        "mailing_date": (
-                            None
-                            if item.mailing_date is None
-                            else item.mailing_date.isoformat()
-                        ),
-                        "announced_version": item.announced_version,
-                        "list_position": item.list_position,
-                    }
-                    for item in event.evidence
-                ],
-            }
-        )
+        card: dict[str, JsonValue] = {
+            "event_id": event.event_id,
+            "arxiv_id": paper.arxiv_id,
+            "daily_list_date": event.daily_list_date.isoformat(),
+            "version_resolution": event.version_resolution.value,
+            "version_label": _review_version_label(event),
+            "support_categories": sorted(
+                {
+                    item.category
+                    for item in event.observations
+                    if item.category is not None
+                },
+                key=str.casefold,
+            ),
+            "resolved_announcement_version": event.announced_version,
+            "latest_known_version": payload.latest_known_versions.get(
+                paper.arxiv_id,
+                event.announced_version,
+            ),
+            "title": paper.title,
+            "authors": list(paper.authors),
+            "abstract": paper.abstract,
+            "comments": paper.comments,
+            "journal_ref": paper.journal_ref,
+            "doi": paper.doi,
+            "newly_discovered": (
+                event.reviewed_at is None
+                and payload.last_finished_revision is not None
+                and event.queue_revision > payload.last_finished_revision
+            ),
+            "reviewed": event.reviewed_at is not None,
+            "tier": ranked.tier.value,
+            "score": ranked.score,
+            "reasons": [
+                {
+                    "kind": reason.kind,
+                    "label": reason.label,
+                    "location": reason.location,
+                }
+                for reason in ranked.reasons
+            ],
+        }
+        event_label = _review_event_label(event)
+        if event_label is not None:
+            card["event_label"] = event_label
+        cards.append(card)
     return {
         "day": page.day.isoformat(),
         "snapshot_revision": page.snapshot_revision,
+        "profile_revision": page.profile_revision,
+        "projection_revision": page.projection_revision,
         "anchor_event_id": page.anchor_event_id,
         "previous_anchor_event_id": page.previous_anchor_event_id,
         "next_anchor_event_id": page.next_anchor_event_id,
@@ -404,10 +430,28 @@ def project_review_page(payload: ReviewPagePayload) -> dict[str, JsonValue]:
     }
 
 
+def _destination_display_path(path: Path, *, home: Path | None = None) -> str:
+    """Return a read-only display path, abbreviating the current home as ~."""
+
+    destination = path.resolve(strict=False)
+    resolved_home = (Path.home() if home is None else home).resolve(strict=False)
+    try:
+        relative = destination.relative_to(resolved_home)
+    except ValueError:
+        return str(destination)
+    return "~" if not relative.parts else f"~/{relative.as_posix()}"
+
+
 def project_setup_draft(payload: SetupDraftPayload) -> dict[str, JsonValue]:
-    """Project setup state without exposing local filesystem paths."""
+    """Project setup state without making browser-provided paths authoritative."""
 
     draft = payload.draft
+    from arxiv_digest.setup import SUPPORTED_CATCHUP_WINDOW_DAYS
+
+    coverage_max = payload.coverage_max or draft.updated_at.date()
+    coverage_min = payload.coverage_min or (
+        coverage_max - timedelta(days=SUPPORTED_CATCHUP_WINDOW_DAYS - 1)
+    )
     destination = draft.pdf_destination
     summary: dict[str, JsonValue] | None = None
     summary_sha256: str | None = None
@@ -418,10 +462,20 @@ def project_setup_draft(payload: SetupDraftPayload) -> dict[str, JsonValue]:
             "seed_papers": [
                 item.paper.arxiv_id for item in draft.seed_papers
             ],
+            "seed_paper_details": [
+                {
+                    "arxiv_id": item.paper.arxiv_id,
+                    "title": item.paper.title,
+                }
+                for item in draft.seed_papers
+            ],
             "keywords": list(draft.keywords),
             "phrases": list(draft.phrases),
             "authors": list(draft.authors),
             "pdf_destination_kind": destination.kind,
+            "pdf_destination_display_path": _destination_display_path(
+                destination.path
+            ),
         }
         summary_sha256 = hashlib.sha256(
             json.dumps(
@@ -447,12 +501,17 @@ def project_setup_draft(payload: SetupDraftPayload) -> dict[str, JsonValue]:
         "recommended_coverage_start": (
             draft.updated_at.date() - timedelta(days=30)
         ).isoformat(),
+        "coverage_min": coverage_min.isoformat(),
+        "coverage_max": coverage_max.isoformat(),
         "coverage_warning": draft.coverage_warning,
         "corpus_hash": draft.corpus_hash,
         "corpus_categories": list(draft.corpus_categories),
         "corpus_complete": draft.corpus_complete,
         "corpus_reduced_breadth": draft.corpus_reduced_breadth,
         "corpus_can_resume": payload.corpus_can_resume,
+        "corpus_job": (
+            None if payload.corpus_job is None else _jsonable(payload.corpus_job)
+        ),
         "seed_papers": [item.paper.arxiv_id for item in draft.seed_papers],
         "keywords": list(draft.keywords),
         "phrases": list(draft.phrases),
@@ -922,6 +981,12 @@ class ApiRouter:
             )
         except Exception as error:
             code = getattr(error, "code", None)
+            if code == "review_snapshot_stale":
+                return _error(
+                    409,
+                    "review_snapshot_stale",
+                    "The active Review projection changed; reload and try again.",
+                )
             if isinstance(code, str) and re.fullmatch(
                 r"[a-z][a-z0-9_]{1,63}", code
             ):

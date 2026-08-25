@@ -26,12 +26,17 @@ from arxiv_digest.models import CategoryConfig
 from arxiv_digest.profile import (
     PdfDestination,
     Profile,
+    ProfileCategory,
     ProfileRepository,
     ProfileRevisionError,
     decode_profile,
     encode_profile,
 )
 from arxiv_digest.storage.store import Store
+from arxiv_digest.sync import (
+    SUPPORTED_CATCHUP_WINDOW_DAYS,
+    daily_list_coverage_bounds,
+)
 
 
 _SCHEMA_VERSION = 1
@@ -41,10 +46,6 @@ DESKTOP_LAUNCHER_PROMPT = (
 )
 CREATE_DESKTOP_LAUNCHER_LABEL = "Create desktop launcher"
 NOT_NOW_LABEL = "Not now"
-INFERENCE_COVERAGE_WARNING = (
-    "Older results will be inferred metadata/version events rather than exact "
-    "announcements and may include large arXiv bulk-update dates."
-)
 
 
 class SetupStep(StrEnum):
@@ -455,6 +456,7 @@ class SetupService:
         coverage_start: date,
         *,
         earliest_datestamp: date,
+        coverage_bounds: tuple[date, date] | None = None,
     ) -> SetupDraft:
         if (
             type(coverage_start) is not date
@@ -463,26 +465,31 @@ class SetupService:
             raise TypeError("coverage values must be calendar dates")
         current = self._require_revision(expected_revision)
         self._require_step(current, SetupStep.INITIAL_COVERAGE)
-        today = self.clock().date()
-        if coverage_start < earliest_datestamp:
-            raise SetupStateError(
-                "coverage_before_earliest",
-                "initial coverage cannot precede OAI earliestDatestamp",
+        if coverage_bounds is None:
+            earliest_supported, latest_finalized = daily_list_coverage_bounds(
+                self.clock(),
+                window_days=SUPPORTED_CATCHUP_WINDOW_DAYS,
             )
-        if coverage_start > today:
+        else:
+            earliest_supported, latest_finalized = coverage_bounds
+            if (
+                type(earliest_supported) is not date
+                or type(latest_finalized) is not date
+                or earliest_supported > latest_finalized
+            ):
+                raise ValueError("coverage bounds must be ordered calendar dates")
+        if not earliest_supported <= coverage_start <= latest_finalized:
             raise SetupStateError(
-                "coverage_in_future", "initial coverage cannot begin in the future"
+                "coverage_outside_recovery_window",
+                "initial coverage must be within the supported daily-list "
+                "recovery window",
             )
         revised = replace(
             current,
             revision=current.revision + 1,
             current_step=SetupStep.CANDIDATE_CORPUS,
             coverage_start=coverage_start,
-            coverage_warning=(
-                INFERENCE_COVERAGE_WARNING
-                if (today - coverage_start).days > 90
-                else None
-            ),
+            coverage_warning=None,
             updated_at=self.clock(),
         )
         self._save_draft(revised, expected_revision=expected_revision)
@@ -688,10 +695,17 @@ class SetupService:
         )
         assert chosen.coverage_start is not None
         assert chosen.pdf_destination is not None
+        configs = tuple(
+            CategoryConfig(value.category, value.set_spec, chosen.coverage_start)
+            for value in chosen.categories
+        )
         profile = Profile(
-            schema_version=1,
+            schema_version=2,
             revision=1,
-            categories=tuple(value.category for value in chosen.categories),
+            category_coverage=tuple(
+                ProfileCategory(config.category, config.coverage_start)
+                for config in configs
+            ),
             keywords=chosen.keywords,
             phrases=chosen.phrases,
             authors=chosen.authors,
@@ -699,10 +713,6 @@ class SetupService:
                 value.paper.arxiv_id for value in chosen.seed_papers
             ),
             pdf_destination=chosen.pdf_destination,
-        )
-        configs = tuple(
-            CategoryConfig(value.category, value.set_spec, chosen.coverage_start)
-            for value in chosen.categories
         )
         self._publish_profile(
             profile,
@@ -728,10 +738,22 @@ class SetupService:
 
         configs = tuple(category_configs)
         seeds = tuple(seed_papers)
-        if tuple(value.category for value in configs) != profile.categories:
-            raise ValueError("profile categories must match category configurations")
-        if profile.revision != (1 if expected_revision is None else expected_revision + 1):
-            raise ValueError("profile revision must immediately follow expected revision")
+        profile_pairs = tuple(
+            (value.category, value.coverage_start)
+            for value in profile.category_coverage
+        )
+        config_pairs = tuple(
+            (value.category, value.coverage_start) for value in configs
+        )
+        if config_pairs != profile_pairs:
+            raise ValueError(
+                "profile category coverage must match category configurations"
+            )
+        next_revision = 1 if expected_revision is None else expected_revision + 1
+        if profile.revision != next_revision:
+            raise ValueError(
+                "profile revision must immediately follow expected revision"
+            )
         self._publish_profile(
             profile,
             configs,
@@ -845,6 +867,17 @@ class SetupService:
                 actual = None if active is None else active.revision
                 if actual != expected_revision:
                     raise ProfileRevisionError(expected_revision, actual)
+                active_pairs = (
+                    ()
+                    if active is None
+                    else tuple(
+                        (value.category, value.coverage_start)
+                        for value in active.category_coverage
+                    )
+                )
+                published_pairs = tuple(
+                    (value.category, value.coverage_start) for value in configs
+                )
 
                 # Phase 1: a complete same-directory pending profile is durable.
                 atomic_write(pending_path, payload, mode=0o600)
@@ -855,6 +888,12 @@ class SetupService:
                 connection = self._connect()
                 try:
                     connection.execute("BEGIN IMMEDIATE")
+                    if active_pairs != published_pairs:
+                        connection.execute(
+                            """UPDATE state_meta
+                               SET projection_revision = projection_revision + 1
+                               WHERE singleton = 1"""
+                        )
                     for config in configs:
                         connection.execute(
                             """INSERT INTO category_sync_state(

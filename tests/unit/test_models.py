@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -25,26 +25,38 @@ def _version(number: int = 1) -> models.PaperVersion:
     )
 
 
-def _evidence() -> models.EventEvidence:
-    return models.EventEvidence(
-        source_key="oai:cs.SE:2608.00001:v1",
-        source=models.EvidenceSource.OAI,
-        confidence=models.Confidence.INFERRED,
+def _observation() -> models.SourceObservation:
+    return models.SourceObservation(
+        source_key="catchup:cs.SE:2026-08-01:2608.00001:0",
+        arxiv_id="2608.00001",
+        source=models.EvidenceSource.CATCHUP,
         category="cs.SE",
-        announce_type=None,
-        mailing_date=None,
+        announce_type=models.AnnounceType.NEW,
+        daily_list_date=date(2026, 8, 1),
+        announced_version=None,
+        list_position=0,
+        oai_datestamp=None,
+        response_sha256="3" * 64,
+        observed_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+    )
+
+
+def _reconciled_event() -> models.ReconciledEvent:
+    observation = _observation()
+    return models.ReconciledEvent(
+        arxiv_id=observation.arxiv_id,
+        daily_list_date=date(2026, 8, 1),
         announced_version=1,
-        list_position=None,
-        oai_datestamp=date(2026, 8, 3),
-        raw_sha256="0" * 64,
-        observed_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
+        version_resolution=models.VersionResolution.CHRONOLOGY_MATCHED,
+        observation_keys=(observation.source_key,),
     )
 
 
 def _atom_entry() -> models.AtomEntry:
     return models.AtomEntry(
         _paper(),
-        _version(),
+        1,
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
         models.AnnounceType.NEW,
         date(2026, 8, 1),
         0,
@@ -82,15 +94,13 @@ def _catchup_page() -> models.CatchupPage:
 
 
 def _review_event() -> models.ReviewEvent:
-    evidence = _evidence()
     return models.ReviewEvent(
         7,
         "2608.00001",
-        1,
         date(2026, 8, 1),
-        models.DateBasis.VERSION_HISTORY_UTC,
-        models.Confidence.INFERRED,
-        (evidence,),
+        1,
+        models.VersionResolution.CHRONOLOGY_MATCHED,
+        (_observation(),),
         9,
         None,
     )
@@ -114,15 +124,16 @@ def test_domain_enums_have_exact_wire_values() -> None:
         "catchup",
         "oai",
     ]
-    assert [value.value for value in models.Confidence] == [
-        "current",
-        "recovered",
-        "inferred",
+    assert [value.value for value in models.VersionResolution] == [
+        "atom_confirmed",
+        "chronology_matched",
+        "unconfirmed",
     ]
-    assert [value.value for value in models.DateBasis] == [
-        "feed_mailing",
-        "catchup_mailing",
-        "version_history_utc",
+    assert [value.value for value in models.CatchupDayStatus] == [
+        "pending",
+        "complete",
+        "empty",
+        "failed",
     ]
     assert [value.value for value in models.EnrichmentStatus] == [
         "complete",
@@ -236,31 +247,208 @@ def test_paper_version_requires_a_positive_number_and_utc_time() -> None:
     assert version.number == 1
 
 
-def test_event_records_keep_oai_metadata_dates_separate_from_review_dates() -> None:
-    evidence = _evidence()
-    candidate = models.EventCandidate(
-        arxiv_id="2608.00001",
-        announced_version=1,
-        effective_date=date(2026, 8, 1),
-        date_basis=models.DateBasis.VERSION_HISTORY_UTC,
-        evidence=evidence,
-    )
+def test_source_observation_requires_an_unversioned_arxiv_id() -> None:
+    with pytest.raises(ValueError, match="arXiv"):
+        replace(_observation(), arxiv_id="2608.00001v2")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("source_key", "  "), ("category", "  ")),
+)
+def test_source_observation_rejects_blank_provenance_values(
+    field: str,
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match="blank"):
+        replace(_observation(), **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("announced_version", 0),
+        ("list_position", -1),
+        ("response_sha256", "3" * 63),
+        ("observed_at", datetime(2026, 8, 2)),
+        (
+            "observed_at",
+            datetime(
+                2026,
+                8,
+                2,
+                tzinfo=timezone(timedelta(hours=1)),
+            ),
+        ),
+    ),
+)
+def test_source_observation_validates_versions_positions_hashes_and_times(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError):
+        replace(_observation(), **{field: value})
+
+
+def test_reconciled_event_requires_an_unversioned_arxiv_id() -> None:
+    with pytest.raises(ValueError, match="arXiv"):
+        replace(_reconciled_event(), arxiv_id="2608.00001v1")
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        pytest.param(
+            lambda: replace(_reconciled_event(), announced_version=0),
+            id="version",
+        ),
+        pytest.param(
+            lambda: replace(
+                _reconciled_event(),
+                observation_keys=[_observation().source_key],
+            ),
+            id="observation-keys",
+        ),
+    ),
+)
+def test_reconciled_event_validates_version_and_immutable_keys(
+    factory: Callable[[], object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        pytest.param(
+            lambda: replace(_reconciled_event(), announced_version=None),
+            id="reconciled-confirmed-without-version",
+        ),
+        pytest.param(
+            lambda: replace(
+                _reconciled_event(),
+                version_resolution=models.VersionResolution.UNCONFIRMED,
+            ),
+            id="reconciled-unconfirmed-with-version",
+        ),
+        pytest.param(
+            lambda: replace(_review_event(), announced_version=None),
+            id="review-confirmed-without-version",
+        ),
+        pytest.param(
+            lambda: replace(
+                _review_event(),
+                version_resolution=models.VersionResolution.UNCONFIRMED,
+            ),
+            id="review-unconfirmed-with-version",
+        ),
+    ),
+)
+def test_event_version_resolution_matches_announced_version(
+    factory: Callable[[], object],
+) -> None:
+    with pytest.raises(ValueError, match="announced_version"):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        pytest.param(
+            lambda: models.ReconciliationResult(
+                "2608.00001v1",
+                (_reconciled_event(),),
+                (),
+            ),
+            id="arxiv-id",
+        ),
+        pytest.param(
+            lambda: models.ReconciliationResult(
+                "2608.00001",
+                [_reconciled_event()],  # type: ignore[arg-type]
+                (),
+            ),
+            id="events",
+        ),
+        pytest.param(
+            lambda: models.ReconciliationResult(
+                "2608.00001",
+                (_reconciled_event(),),
+                [],  # type: ignore[arg-type]
+            ),
+            id="diagnostics",
+        ),
+    ),
+)
+def test_reconciliation_result_validates_id_and_immutable_collections(
+    factory: Callable[[], object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        factory()
+
+
+def test_atom_entry_requires_a_positive_version_and_utc_feed_time() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        models.AtomEntry(
+            _paper(),
+            0,
+            datetime(2026, 8, 1, tzinfo=timezone.utc),
+            models.AnnounceType.NEW,
+            date(2026, 8, 1),
+            0,
+        )
+    with pytest.raises(ValueError, match="UTC"):
+        models.AtomEntry(
+            _paper(),
+            1,
+            datetime(2026, 8, 1),
+            models.AnnounceType.NEW,
+            date(2026, 8, 1),
+            0,
+        )
+
+
+def test_review_event_exposes_confirmed_daily_list_values() -> None:
+    source_observation = _observation()
+
     event = models.ReviewEvent(
         event_id=7,
         arxiv_id="2608.00001",
+        daily_list_date=date(2026, 8, 1),
         announced_version=1,
-        effective_date=candidate.effective_date,
-        date_basis=candidate.date_basis,
-        confidence=evidence.confidence,
-        evidence=(evidence,),
+        version_resolution=models.VersionResolution.ATOM_CONFIRMED,
+        observations=(source_observation,),
         queue_revision=9,
         reviewed_at=None,
+        recovered_after_finish=True,
     )
 
-    assert evidence.oai_datestamp == date(2026, 8, 3)
-    assert event.effective_date == date(2026, 8, 1)
-    assert event.date_basis is models.DateBasis.VERSION_HISTORY_UTC
-    assert event.evidence == (evidence,)
+    assert event.daily_list_date == date(2026, 8, 1)
+    assert event.version_resolution is models.VersionResolution.ATOM_CONFIRMED
+    assert event.observations == (source_observation,)
+    assert event.recovered_after_finish is True
+    assert tuple(field.name for field in fields(event)) == (
+        "event_id",
+        "arxiv_id",
+        "daily_list_date",
+        "announced_version",
+        "version_resolution",
+        "observations",
+        "queue_revision",
+        "reviewed_at",
+        "recovered_after_finish",
+        "conflict_code",
+    )
+
+
+def test_retired_inferred_event_interface_is_not_exported() -> None:
+    for name in ("Confidence", "DateBasis", "EventEvidence", "EventCandidate"):
+        assert not hasattr(models, name)
+
+    event = _review_event()
+    for name in ("effective_date", "date_basis", "confidence", "evidence"):
+        assert not hasattr(event, name)
 
 
 def test_source_records_expose_normalized_immutable_values() -> None:
@@ -281,7 +469,8 @@ def test_source_records_expose_normalized_immutable_values() -> None:
     )
     atom_entry = models.AtomEntry(
         paper,
-        version,
+        1,
+        version.submitted_at,
         models.AnnounceType.NEW,
         date(2026, 8, 1),
         0,
@@ -320,6 +509,8 @@ def test_source_records_expose_normalized_immutable_values() -> None:
     assert article.versions == (version,)
     assert tombstone.set_specs == ("cs:SE",)
     assert atom_entry.announced_version == 1
+    assert atom_entry.published_at == version.submitted_at
+    assert atom_entry.version == version
     assert atom_batch.entries == (atom_entry,)
     assert catchup_entry.announced_version is None
     assert catchup_day.pages == (catchup_page,)
@@ -328,24 +519,6 @@ def test_source_records_expose_normalized_immutable_values() -> None:
 @pytest.mark.parametrize(
     "factory",
     [
-        pytest.param(
-            lambda: replace(_evidence(), announced_version=0),
-            id="evidence-version",
-        ),
-        pytest.param(
-            lambda: replace(_evidence(), list_position=-1),
-            id="evidence-position",
-        ),
-        pytest.param(
-            lambda: replace(_evidence(), raw_sha256="not-a-hash"),
-            id="evidence-hash",
-        ),
-        pytest.param(
-            lambda: replace(
-                _evidence(), observed_at=datetime(2026, 8, 3)
-            ),
-            id="evidence-time",
-        ),
         pytest.param(
             lambda: replace(_atom_entry(), position=-1),
             id="atom-position",
@@ -464,8 +637,8 @@ def test_oai_version_histories_must_be_strictly_increasing(
             id="catchup-pages",
         ),
         pytest.param(
-            lambda: replace(_review_event(), evidence=[_evidence()]),
-            id="review-evidence",
+            lambda: replace(_review_event(), observations=[_observation()]),
+            id="review-observations",
         ),
     ],
 )
@@ -480,22 +653,8 @@ def test_collection_fields_require_immutable_tuples(
     "factory",
     [
         pytest.param(
-            lambda: models.EventCandidate(
-                "2608.00001v1",
-                1,
-                date(2026, 8, 1),
-                models.DateBasis.VERSION_HISTORY_UTC,
-                _evidence(),
-            ),
-            id="candidate-id",
-        ),
-        pytest.param(
             lambda: replace(_review_event(), arxiv_id="bad-id"),
             id="review-id",
-        ),
-        pytest.param(
-            lambda: replace(_evidence(), category="  "),
-            id="evidence-category",
         ),
         pytest.param(
             lambda: models.CategoryConfig("  ", "cs:SE", date(2026, 8, 1)),

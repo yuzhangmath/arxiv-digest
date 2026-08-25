@@ -74,16 +74,30 @@ class EvidenceSource(StrEnum):
     OAI = "oai"
 
 
-class Confidence(StrEnum):
-    CURRENT = "current"
-    RECOVERED = "recovered"
-    INFERRED = "inferred"
+class VersionResolution(StrEnum):
+    ATOM_CONFIRMED = "atom_confirmed"
+    CHRONOLOGY_MATCHED = "chronology_matched"
+    UNCONFIRMED = "unconfirmed"
 
 
-class DateBasis(StrEnum):
-    FEED_MAILING = "feed_mailing"
-    CATCHUP_MAILING = "catchup_mailing"
-    VERSION_HISTORY_UTC = "version_history_utc"
+def _require_version_resolution(
+    announced_version: int | None,
+    version_resolution: VersionResolution,
+) -> None:
+    if (announced_version is None) != (
+        version_resolution is VersionResolution.UNCONFIRMED
+    ):
+        raise ValueError(
+            "announced_version must be absent exactly when "
+            "version_resolution is unconfirmed"
+        )
+
+
+class CatchupDayStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETE = "complete"
+    EMPTY = "empty"
+    FAILED = "failed"
 
 
 class EnrichmentStatus(StrEnum):
@@ -131,38 +145,58 @@ class PaperVersion:
 
 
 @dataclass(frozen=True, slots=True)
-class EventEvidence:
+class SourceObservation:
     source_key: str
+    arxiv_id: str
     source: EvidenceSource
-    confidence: Confidence
-    category: str
+    category: str | None
     announce_type: AnnounceType | None
-    mailing_date: date | None
+    daily_list_date: date | None
     announced_version: int | None
     list_position: int | None
     oai_datestamp: date | None
-    raw_sha256: str
+    response_sha256: str
     observed_at: datetime
 
     def __post_init__(self) -> None:
-        _require_nonblank(self.category, "category")
+        _require_base_arxiv_id(self.arxiv_id)
+        _require_nonblank(self.source_key, "source_key")
+        if self.category is not None:
+            _require_nonblank(self.category, "category")
         _require_optional_positive(self.announced_version, "announced_version")
         _require_nonnegative(self.list_position, "list_position")
-        _require_sha256(self.raw_sha256)
+        _require_sha256(self.response_sha256, "response_sha256")
         _require_utc(self.observed_at, "observed_at")
 
 
 @dataclass(frozen=True, slots=True)
-class EventCandidate:
+class ReconciledEvent:
     arxiv_id: str
+    daily_list_date: date
     announced_version: int | None
-    effective_date: date
-    date_basis: DateBasis
-    evidence: EventEvidence
+    version_resolution: VersionResolution
+    observation_keys: tuple[str, ...]
+    conflict_code: str | None = None
 
     def __post_init__(self) -> None:
         _require_base_arxiv_id(self.arxiv_id)
         _require_optional_positive(self.announced_version, "announced_version")
+        _require_version_resolution(
+            self.announced_version, self.version_resolution
+        )
+        _require_nonempty_nonblank(self.observation_keys, "observation_keys")
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationResult:
+    arxiv_id: str
+    events: tuple[ReconciledEvent, ...]
+    diagnostic_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _require_base_arxiv_id(self.arxiv_id)
+        _require_tuple(self.events, "events")
+        _require_tuple(self.diagnostic_codes, "diagnostic_codes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,17 +241,22 @@ class OaiTombstone:
 @dataclass(frozen=True, slots=True)
 class AtomEntry:
     metadata: PaperMetadata
-    version: PaperVersion
+    announced_version: int
+    published_at: datetime
     announce_type: AnnounceType
     mailing_date: date
     position: int
 
     def __post_init__(self) -> None:
+        _require_optional_positive(self.announced_version, "announced_version")
+        _require_utc(self.published_at, "published_at")
         _require_nonnegative(self.position, "position")
 
     @property
-    def announced_version(self) -> int:
-        return self.version.number
+    def version(self) -> PaperVersion:
+        """Compatibility view; ``published_at`` is not a submission timestamp."""
+
+        return PaperVersion(self.announced_version, self.published_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,7 +308,7 @@ class CatchupPage:
 class CatchupDay:
     category: str
     mailing_date: date
-    status: EnrichmentStatus
+    status: CatchupDayStatus | EnrichmentStatus
     pages: tuple[CatchupPage, ...]
     error_code: str | None
     error_message: str | None
@@ -283,17 +322,21 @@ class CatchupDay:
 class ReviewEvent:
     event_id: int
     arxiv_id: str
+    daily_list_date: date
     announced_version: int | None
-    effective_date: date
-    date_basis: DateBasis
-    confidence: Confidence
-    evidence: tuple[EventEvidence, ...]
+    version_resolution: VersionResolution
+    observations: tuple[SourceObservation, ...]
     queue_revision: int
     reviewed_at: datetime | None
+    recovered_after_finish: bool = False
+    conflict_code: str | None = None
 
     def __post_init__(self) -> None:
         _require_base_arxiv_id(self.arxiv_id)
-        _require_tuple(self.evidence, "evidence")
+        _require_tuple(self.observations, "observations")
         _require_optional_positive(self.announced_version, "announced_version")
+        _require_version_resolution(
+            self.announced_version, self.version_resolution
+        )
         if self.reviewed_at is not None:
             _require_utc(self.reviewed_at, "reviewed_at")

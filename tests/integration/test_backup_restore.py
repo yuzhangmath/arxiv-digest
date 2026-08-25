@@ -1,28 +1,29 @@
 from __future__ import annotations
 
-from pathlib import Path
-from datetime import date, datetime, timezone
-import threading
 import json
+import threading
+from dataclasses import replace
+from datetime import date, datetime, timezone
+from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
 from arxiv_digest.models import (
-    AnnounceType,
-    Confidence,
-    DateBasis,
-    EventCandidate,
-    EventEvidence,
-    EvidenceSource,
+    CategoryConfig,
     PaperMetadata,
     PaperVersion,
-    CategoryConfig,
 )
 from arxiv_digest.paths import resolve_paths
 from arxiv_digest.profile import PdfDestination, Profile, ProfileRepository
 from arxiv_digest.setup import SetupService
 from arxiv_digest.storage.store import Store
-from tests.unit.test_backup import NOW, initialized_paths
+from tests.unit.test_backup import (
+    NOW,
+    archive_payloads,
+    initialized_paths,
+    rewrite_archive_member,
+)
 
 
 def empty_paths(tmp_path: Path):
@@ -56,7 +57,7 @@ def test_portable_profile_library_and_local_presence_round_trip(
     expected_pdf = confirmed_destination / (
         "2608.41001v1 - Portable Fictional Lattices.pdf"
     )
-    expected_pdf.write_bytes(b"%PDF-1.7\nrestored local file\n")
+    expected_pdf.write_bytes(b"%PDF-1.7\nsynthetic private local file\n")
     unrelated_pdf = confirmed_destination / "unrelated-private-file.pdf"
     unrelated_pdf.write_bytes(b"%PDF-1.7\nmust not be scanned\n")
     (target.cache_dir / "irrelevant-cache.json").write_text(
@@ -96,6 +97,314 @@ def test_portable_profile_library_and_local_presence_round_trip(
     assert unrelated_pdf.read_bytes() == b"%PDF-1.7\nmust not be scanned\n"
     assert result.pre_restore_path is None
     assert result.profile_revision == 1
+
+
+def test_generation_two_ledger_and_download_record_round_trip(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    from arxiv_digest.backup import export_backup, inspect_backup, restore_backup
+    from arxiv_digest.profile import ProfileCategory
+
+    source = initialized_paths(tmp_path / "source")
+    archive = tmp_path / "portable.zip"
+    export_backup(source, archive, clock=lambda: NOW)
+    target = empty_paths(tmp_path / "target")
+    target.ensure()
+    destination = tmp_path / "target" / "Confirmed PDFs"
+    destination.mkdir()
+    filename = "2608.41001v1 - Portable Fictional Lattices.pdf"
+    pdf_payload = b"%PDF-1.7\nsynthetic private local file\n"
+    (destination / filename).write_bytes(pdf_payload)
+
+    restore_backup(
+        target,
+        inspect_backup(archive),
+        PdfDestination("custom", destination),
+        clock=lambda: NOW,
+    )
+
+    profile = ProfileRepository(
+        target.profile_path, target.profile_lock_path
+    ).load()
+    assert profile is not None
+    assert profile.category_coverage == (
+        ProfileCategory("cs.SE", date(2026, 8, 1)),
+    )
+    connection = sqlite3.connect(target.database_path)
+    try:
+        assert connection.execute(
+            "SELECT generation FROM application_generation WHERE singleton = 1"
+        ).fetchone() == (2,)
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        assert connection.execute(
+            """SELECT observation_id, source, category, daily_list_date,
+                      announced_version FROM source_observations
+               ORDER BY observation_id"""
+        ).fetchall() == [
+            (51, "catchup", "cs.SE", "2026-08-20", None),
+            (52, "atom", "cs.SE", None, 1),
+        ]
+        assert connection.execute(
+            """SELECT category, daily_list_date, status
+               FROM catchup_days"""
+        ).fetchall() == [("cs.SE", "2026-08-20", "complete")]
+        assert connection.execute(
+            """SELECT event_id, arxiv_id, daily_list_date, announced_version,
+                      version_resolution, queue_revision
+               FROM canonical_events"""
+        ).fetchall() == [
+            (41, "2608.41001", "2026-08-20", 1, "atom_confirmed", 7)
+        ]
+        assert connection.execute(
+            """SELECT event_id, observation_id
+               FROM canonical_event_observations ORDER BY observation_id"""
+        ).fetchall() == [(41, 51), (41, 52)]
+        assert connection.execute(
+            """SELECT daily_list_date, anchor_event_id, profile_revision
+               FROM review_date_state"""
+        ).fetchall() == [("2026-08-20", 41, 1)]
+        assert connection.execute(
+            "SELECT arxiv_id, saved_version FROM saved_papers"
+        ).fetchall() == [("2608.41001", 1)]
+        assert connection.execute(
+            """SELECT arxiv_id, version, filename, byte_count, sha256
+               FROM download_files"""
+        ).fetchall() == [
+            (
+                "2608.41001",
+                1,
+                filename,
+                len(pdf_payload),
+                sha256(pdf_payload).hexdigest(),
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def test_restore_rejects_v1_before_modifying_current_state(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import (
+        BackupError,
+        export_backup,
+        inspect_backup,
+        restore_backup,
+    )
+
+    source = initialized_paths(tmp_path / "source")
+    current_archive = tmp_path / "current.zip"
+    legacy_archive = tmp_path / "legacy-v1.zip"
+    export_backup(source, current_archive, clock=lambda: NOW)
+    manifest = json.loads(archive_payloads(current_archive)["manifest.json"])
+    manifest["format_version"] = 1
+    rewrite_archive_member(
+        current_archive,
+        legacy_archive,
+        "manifest.json",
+        (
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode(),
+    )
+    current_inspection = inspect_backup(current_archive)
+    legacy_inspection = replace(
+        current_inspection,
+        path=legacy_archive,
+        archive_sha256=sha256(legacy_archive.read_bytes()).hexdigest(),
+    )
+    target = initialized_paths(tmp_path / "target")
+    destination = target.database_path
+    before = {
+        "archive": sha256(legacy_archive.read_bytes()).digest(),
+        "database": sha256(target.database_path.read_bytes()).digest(),
+        "profile": sha256(target.profile_path.read_bytes()).digest(),
+    }
+
+    with pytest.raises(BackupError) as raised:
+        restore_backup(
+            target,
+            legacy_inspection,
+            PdfDestination("custom", destination),
+            clock=lambda: NOW,
+        )
+
+    assert raised.value.code == "unsupported_schema"
+    assert sha256(legacy_archive.read_bytes()).digest() == before["archive"]
+    assert sha256(target.database_path.read_bytes()).digest() == before["database"]
+    assert sha256(target.profile_path.read_bytes()).digest() == before["profile"]
+    assert not tuple(target.backup_dir.iterdir())
+
+
+def test_restore_rejects_an_atom_only_canonical_event_before_modifying_current_state(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import (
+        BackupError,
+        export_backup,
+        inspect_backup,
+        restore_backup,
+    )
+
+    source = initialized_paths(tmp_path / "source")
+    valid_archive = tmp_path / "valid.zip"
+    hostile_archive = tmp_path / "atom-only-event.zip"
+    export_backup(source, valid_archive, clock=lambda: NOW)
+    records = [
+        json.loads(line)
+        for line in archive_payloads(valid_archive)["state.jsonl"].splitlines()
+    ]
+    records = [
+        record
+        for record in records
+        if not (
+            record["record_type"] == "canonical_event_observation"
+            and record["payload"]["observation_id"] == 51
+        )
+    ]
+    state_payload = b"".join(
+        (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        for record in records
+    )
+    rewrite_archive_member(
+        valid_archive,
+        hostile_archive,
+        "state.jsonl",
+        state_payload,
+    )
+    accepted_before_revalidation = replace(
+        inspect_backup(valid_archive),
+        path=hostile_archive,
+        archive_sha256=sha256(hostile_archive.read_bytes()).hexdigest(),
+    )
+    target = initialized_paths(tmp_path / "target")
+    confirmed = tmp_path / "target" / "Confirmed PDFs"
+    confirmed.mkdir()
+    before = {
+        "database": sha256(target.database_path.read_bytes()).digest(),
+        "profile": sha256(target.profile_path.read_bytes()).digest(),
+    }
+
+    with pytest.raises(BackupError) as raised:
+        restore_backup(
+            target,
+            accepted_before_revalidation,
+            PdfDestination("custom", confirmed),
+            clock=lambda: NOW,
+        )
+
+    assert raised.value.code == "cross_record_invalid"
+    assert sha256(target.database_path.read_bytes()).digest() == before["database"]
+    assert sha256(target.profile_path.read_bytes()).digest() == before["profile"]
+    assert not tuple(target.backup_dir.iterdir())
+
+
+def test_restore_rejects_a_wrong_date_catchup_link_before_modifying_current_state(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import (
+        BackupError,
+        export_backup,
+        inspect_backup,
+        restore_backup,
+    )
+
+    source = initialized_paths(tmp_path / "source")
+    valid_archive = tmp_path / "valid.zip"
+    hostile_archive = tmp_path / "wrong-date-catchup.zip"
+    export_backup(source, valid_archive, clock=lambda: NOW)
+    records = [
+        json.loads(line)
+        for line in archive_payloads(valid_archive)["state.jsonl"].splitlines()
+    ]
+    catchup = next(
+        record
+        for record in records
+        if record["record_type"] == "source_observation"
+        and record["payload"]["observation_id"] == 51
+    )
+    catchup["payload"]["daily_list_date"] = "2026-08-19"
+    state_payload = b"".join(
+        (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        for record in records
+    )
+    rewrite_archive_member(
+        valid_archive,
+        hostile_archive,
+        "state.jsonl",
+        state_payload,
+    )
+    accepted_before_revalidation = replace(
+        inspect_backup(valid_archive),
+        path=hostile_archive,
+        archive_sha256=sha256(hostile_archive.read_bytes()).hexdigest(),
+    )
+    target = initialized_paths(tmp_path / "target")
+    confirmed = tmp_path / "target" / "Confirmed PDFs"
+    confirmed.mkdir()
+    before = {
+        "database": sha256(target.database_path.read_bytes()).digest(),
+        "profile": sha256(target.profile_path.read_bytes()).digest(),
+    }
+
+    with pytest.raises(BackupError) as raised:
+        restore_backup(
+            target,
+            accepted_before_revalidation,
+            PdfDestination("custom", confirmed),
+            clock=lambda: NOW,
+        )
+
+    assert raised.value.code == "cross_record_invalid"
+    assert sha256(target.database_path.read_bytes()).digest() == before["database"]
+    assert sha256(target.profile_path.read_bytes()).digest() == before["profile"]
+    assert not tuple(target.backup_dir.iterdir())
+
+
+def test_restore_skips_mismatched_download_and_does_not_scan_unrelated_pdfs(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    from arxiv_digest.backup import export_backup, inspect_backup, restore_backup
+
+    source = initialized_paths(tmp_path / "source")
+    archive = tmp_path / "portable.zip"
+    export_backup(source, archive, clock=lambda: NOW)
+    target = empty_paths(tmp_path / "target")
+    target.ensure()
+    destination = tmp_path / "target" / "Confirmed PDFs"
+    destination.mkdir()
+    expected_name = "2608.41001v1 - Portable Fictional Lattices.pdf"
+    mismatched = b"%PDF-1.7\ndifferent local bytes\n"
+    unrelated = b"%PDF-1.7\nsynthetic private local file\n"
+    (destination / expected_name).write_bytes(mismatched)
+    unrelated_path = destination / "unrelated.pdf"
+    unrelated_path.write_bytes(unrelated)
+
+    restore_backup(
+        target,
+        inspect_backup(archive),
+        PdfDestination("custom", destination),
+        clock=lambda: NOW,
+    )
+
+    connection = sqlite3.connect(target.database_path)
+    try:
+        assert connection.execute(
+            "SELECT count(*) FROM download_files"
+        ).fetchone() == (0,)
+    finally:
+        connection.close()
+    assert (destination / expected_name).read_bytes() == mismatched
+    assert unrelated_path.read_bytes() == unrelated
 
 
 def test_nonempty_restore_creates_and_verifies_a_private_recovery_backup(
@@ -159,7 +468,7 @@ def test_failed_publication_rolls_back_to_usable_old_profile_and_database(
     export_backup(source, archive, clock=lambda: NOW)
     target = initialized_paths(tmp_path / "target")
     old_store = Store(target.database_path)
-    old_store.apply_event_batch(
+    old_store.apply_article_snapshot(
         PaperMetadata(
             arxiv_id="2608.41999",
             title="Old State Survivor",
@@ -169,7 +478,6 @@ def test_failed_publication_rolls_back_to_usable_old_profile_and_database(
             categories=("cs.SE",),
         ),
         (PaperVersion(1, datetime(2026, 8, 2, tzinfo=timezone.utc)),),
-        (),
     )
     old_store.save_paper("2608.41999", 1)
     old_profile = ProfileRepository(
@@ -272,7 +580,7 @@ def test_startup_recovery_resolves_a_hash_verified_interrupted_restore(
     assert not tuple(target.data_dir.glob("*.restore-*"))
 
 
-def test_restore_reconstructs_queue_revision_before_new_events_arrive(
+def test_restore_reconstructs_queue_revision_and_finished_state(
     tmp_path: Path,
 ) -> None:
     import sqlite3
@@ -303,55 +611,18 @@ def test_restore_reconstructs_queue_revision_before_new_events_arrive(
         PdfDestination("custom", confirmed),
         clock=lambda: NOW,
     )
-    store = Store(target.database_path)
-    metadata = PaperMetadata(
-        arxiv_id="2608.41002",
-        title="Newly Relocated Synthetic Event",
-        authors=("Noor Example",),
-        abstract="A fictional post-restore queue event.",
-        primary_category="cs.SE",
-        categories=("cs.SE",),
-    )
-    version = PaperVersion(
-        1, datetime(2026, 8, 20, 8, tzinfo=timezone.utc)
-    )
-    event_day = date(2026, 8, 20)
-    evidence = EventEvidence(
-        source_key="atom:cs.SE:2026-08-20:1:2608.41002v1",
-        source=EvidenceSource.ATOM,
-        confidence=Confidence.CURRENT,
-        category="cs.SE",
-        announce_type=AnnounceType.NEW,
-        mailing_date=event_day,
-        announced_version=1,
-        list_position=1,
-        oai_datestamp=None,
-        raw_sha256="4" * 64,
-        observed_at=NOW,
-    )
-    candidate = EventCandidate(
-        arxiv_id=metadata.arxiv_id,
-        announced_version=1,
-        effective_date=event_day,
-        date_basis=DateBasis.FEED_MAILING,
-        evidence=evidence,
-    )
-
-    inserted = store.apply_event_batch(metadata, (version,), (candidate,))[0]
-    finished = store.finish_date(
-        event_day,
-        through_revision=100,
-        finished_at=NOW,
-    )
-
-    assert inserted.queue_revision == 101
-    assert finished.reviewed_count == 1
-    new_event = next(
-        event
-        for event in store.events_for_date(event_day)
-        if event.arxiv_id == "2608.41002"
-    )
-    assert new_event.reviewed_at is None
+    restored = sqlite3.connect(target.database_path)
+    try:
+        assert restored.execute(
+            "SELECT queue_revision FROM state_meta WHERE singleton = 1"
+        ).fetchone() == (100,)
+        assert restored.execute(
+            """SELECT last_finished_at, last_finished_revision
+               FROM review_date_state WHERE daily_list_date = ?""",
+            ("2026-08-20",),
+        ).fetchone() == ("2026-08-21T12:00:00Z", 100)
+    finally:
+        restored.close()
 
 
 def test_restore_refuses_active_work_then_explicitly_cancels_and_waits(
@@ -428,9 +699,9 @@ def test_export_racing_profile_publication_captures_one_logical_snapshot(
     current = repository.load()
     assert current is not None
     revised = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=2,
-        categories=current.categories,
+        category_coverage=current.category_coverage,
         keywords=("new atomic preference",),
         phrases=current.phrases,
         authors=current.authors,

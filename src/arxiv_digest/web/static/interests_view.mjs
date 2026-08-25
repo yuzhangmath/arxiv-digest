@@ -26,6 +26,14 @@ function uniqueText(values) {
   return result;
 }
 
+function customTermWordCount(value) {
+  const normalized = value
+    .normalize("NFKC")
+    .replace(/[^\p{Letter}\p{Number}\p{Mark}]+/gu, " ")
+    .trim();
+  return normalized === "" ? 0 : normalized.split(/\s+/u).length;
+}
+
 function categorySelection(value) {
   if (
     !value ||
@@ -82,6 +90,13 @@ export class InterestsDraft {
     const before = this.values[field].length;
     this.values[field] = uniqueText([...this.values[field], value]);
     if (this.values[field].length !== before) this.dirty = true;
+  }
+
+  addTerm(value) {
+    const text = normalizedText(value);
+    const wordCount = customTermWordCount(text);
+    if (wordCount < 1) throw new TypeError("Invalid term value");
+    this.addCustom(wordCount === 1 ? "keywords" : "phrases", text);
   }
 
   addCategory(serverSelection, coverageStart) {
@@ -194,7 +209,7 @@ export class InterestsController {
     }
     draft.categoryConfigs = [];
     draft.dirty = false;
-    return result;
+    return this.load();
   }
 }
 
@@ -210,6 +225,17 @@ function actionButton(document, label, action) {
   node.setAttribute("type", "button");
   node.addEventListener("click", action);
   return node;
+}
+
+function formattedUtcDate(value) {
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.valueOf())) return null;
+  return new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  }).format(parsed);
 }
 
 const SECTION_LABELS = Object.freeze({
@@ -231,11 +257,49 @@ function suggestionValue(field, suggestion) {
   throw new TypeError("Suggestion is missing its stored value");
 }
 
-function renderPreferenceSection(document, field, draft, suggestions, enableSave) {
-  const section = element(document, "section", undefined, "interest-section");
-  section.append(element(document, "h2", SECTION_LABELS[field]));
+function currentValuesList(
+  document,
+  field,
+  draft,
+  enableSave,
+  seedPaperDetails = [],
+) {
+  const snapshot = draft.snapshot();
+  const seedDetails = new Map(
+    (Array.isArray(seedPaperDetails) ? seedPaperDetails : [])
+      .filter((item) => typeof item?.arxiv_id === "string")
+      .map((item) => [item.arxiv_id, item]),
+  );
+  const currentList = element(document, "ul", undefined, "interest-current-values");
+  for (const value of snapshot[field]) {
+    const item = element(document, "li");
+    const detail = field === "seed_papers" ? seedDetails.get(value) : null;
+    const title = typeof detail?.title === "string" ? detail.title.trim() : "";
+    item.append(
+      document.createTextNode(title ? `${title} (${value}) ` : `${value} `),
+      actionButton(document, `Remove ${value}`, () => {
+        draft.setSuggested(field, value, false);
+        item.hidden = true;
+        enableSave();
+      }),
+    );
+    currentList.append(item);
+  }
+  return currentList;
+}
+
+function preferenceAdditions(
+  document,
+  field,
+  draft,
+  suggestions,
+  enableSave,
+  includeCustom = true,
+) {
+  const additions = element(document, "div", undefined, "interest-preference-additions");
+  const snapshot = draft.snapshot();
   const selected = new Set(
-    draft.snapshot()[field].map((value) => value.toLocaleLowerCase("en-US")),
+    snapshot[field].map((value) => value.toLocaleLowerCase("en-US")),
   );
   for (const [index, suggestion] of suggestions.entries()) {
     const value = suggestionValue(field, suggestion);
@@ -249,10 +313,17 @@ function renderPreferenceSection(document, field, draft, suggestions, enableSave
       draft.setSuggested(field, value, checkbox.checked);
       enableSave();
     });
-    row.append(checkbox, document.createTextNode(` ${value}`));
-    section.append(row);
+    const title = field === "seed_papers" && typeof suggestion?.title === "string"
+      ? suggestion.title.trim()
+      : "";
+    row.append(
+      checkbox,
+      document.createTextNode(` ${title ? `${title} (${value})` : value}`),
+    );
+    additions.append(row);
   }
 
+  if (!includeCustom) return additions;
   const customLabel = element(document, "label", `Add custom ${SECTION_LABELS[field].toLocaleLowerCase("en-US")}`);
   const customInput = element(document, "input");
   const inputId = `${field}-custom`;
@@ -264,7 +335,88 @@ function renderPreferenceSection(document, field, draft, suggestions, enableSave
     customInput.value = "";
     enableSave();
   });
-  section.append(customLabel, customInput, add);
+  additions.append(customLabel, customInput, add);
+  return additions;
+}
+
+function appendAdditionPanel(document, section, label, key, panel) {
+  panel.classList.add("interest-addition-panel");
+  panel.dataset.interestAdd = key;
+  panel.hidden = true;
+  let control;
+  control = actionButton(document, label, () => {
+    panel.hidden = !panel.hidden;
+    control.setAttribute("aria-expanded", String(!panel.hidden));
+  });
+  control.setAttribute("aria-expanded", "false");
+  section.append(control, panel);
+}
+
+function renderPreferenceSection(
+  document,
+  field,
+  draft,
+  suggestions,
+  enableSave,
+  addLabel,
+  seedPaperDetails = [],
+) {
+  const section = element(document, "section", undefined, "interest-section");
+  section.append(
+    element(document, "h2", SECTION_LABELS[field]),
+    currentValuesList(document, field, draft, enableSave, seedPaperDetails),
+  );
+  appendAdditionPanel(
+    document,
+    section,
+    addLabel,
+    field,
+    preferenceAdditions(document, field, draft, suggestions, enableSave),
+  );
+  return section;
+}
+
+function renderTermsSection(document, draft, suggestions, enableSave) {
+  const section = element(document, "section", undefined, "interest-section");
+  section.append(
+    element(document, "h2", "Terms"),
+    currentValuesList(document, "keywords", draft, enableSave),
+    currentValuesList(document, "phrases", draft, enableSave),
+  );
+  const additions = element(document, "div");
+  additions.append(
+    preferenceAdditions(
+      document,
+      "keywords",
+      draft,
+      Array.isArray(suggestions.keywords) ? suggestions.keywords : [],
+      enableSave,
+      false,
+    ),
+    preferenceAdditions(
+      document,
+      "phrases",
+      draft,
+      Array.isArray(suggestions.phrases) ? suggestions.phrases : [],
+      enableSave,
+      false,
+    ),
+  );
+  const customLabel = element(document, "label", "Add custom term");
+  const customInput = element(document, "input");
+  customLabel.setAttribute("for", "terms-custom");
+  customInput.setAttribute("id", "terms-custom");
+  customInput.setAttribute("type", "text");
+  additions.append(
+    customLabel,
+    customInput,
+    actionButton(document, "Add custom term", () => {
+      draft.addTerm(customInput.value);
+      customInput.value = "";
+      enableSave();
+    }),
+  );
+  appendAdditionPanel(document, section, "Add terms", "terms", additions);
   return section;
 }
 
@@ -272,18 +424,21 @@ export function renderInterestsView(document, container, model, actions = {}) {
   const draft = model?.draft;
   if (!(draft instanceof InterestsDraft)) throw new TypeError("Interests view requires a draft");
   const suggestions = model?.suggestions ?? {};
+  const coverageMin = String(model?.coverage_min ?? model?.coverageMin ?? "");
+  const coverageMax = String(model?.coverage_max ?? model?.coverageMax ?? "");
   container.replaceChildren();
   container.append(
     element(document, "h1", "Interests"),
     element(
       document,
       "p",
-      "Only checked or typed values become preferences. Browsing and searching suggestions does not change your profile.",
+      "Selections, additions, and removals change your profile only after you choose Update interests. Browsing suggestions does not change it. Candidate papers do not populate Review, Calendar, or Library, and selecting a seed paper does not save it.",
     ),
   );
-  if (typeof model?.suggestions_generated_at === "string") {
+  const suggestionDate = formattedUtcDate(model?.suggestions_generated_at);
+  if (suggestionDate) {
     container.append(
-      element(document, "p", `Suggestions generated ${model.suggestions_generated_at}`),
+      element(document, "p", `Suggestion pool created ${suggestionDate}`),
     );
   }
 
@@ -295,18 +450,51 @@ export function renderInterestsView(document, container, model, actions = {}) {
   const categorySection = element(document, "section", undefined, "interest-section");
   categorySection.append(element(document, "h2", "Categories"));
   const categoryList = element(document, "ul");
-  for (const selection of draft.snapshot().categories) {
+  const categoryItems = new Map();
+  const categorySuggestionRows = new Map();
+  const refreshCategoryControls = () => {
+    const selected = new Set(
+      draft.snapshot().categories.map((selection) => selection.category),
+    );
+    for (const [category, { item, remove }] of categoryItems) {
+      const active = selected.has(category);
+      item.hidden = !active;
+      remove.disabled = !active || selected.size <= 1;
+      remove.setAttribute(
+        "title",
+        active && selected.size <= 1 ? "At least one category must remain selected" : "",
+      );
+    }
+    for (const [category, row] of categorySuggestionRows) {
+      row.hidden = selected.has(category);
+    }
+  };
+  const appendCurrentCategory = (selection) => {
+    const existing = categoryItems.get(selection.category);
+    if (existing) {
+      existing.item.hidden = false;
+      return;
+    }
     const item = element(document, "li");
+    let remove;
+    remove = actionButton(document, `Remove ${selection.category}`, () => {
+      if (remove.disabled) return;
+      draft.removeCategory(selection.category);
+      refreshCategoryControls();
+      enableSave();
+    });
     item.append(
       document.createTextNode(`${selection.category} (${selection.set_spec}) `),
-      actionButton(document, `Remove ${selection.category}`, () => {
-        draft.removeCategory(selection.category);
-        enableSave();
-      }),
+      remove,
     );
     categoryList.append(item);
+    categoryItems.set(selection.category, { item, remove });
+  };
+  for (const selection of draft.snapshot().categories) {
+    appendCurrentCategory(selection);
   }
   categorySection.append(categoryList);
+  const categoryAdditions = element(document, "div");
   for (const [index, suggestion] of (suggestions.categories ?? []).entries()) {
     const selection = categorySelection(suggestion);
     const row = element(document, "div", undefined, "category-suggestion");
@@ -316,35 +504,79 @@ export function renderInterestsView(document, container, model, actions = {}) {
     label.setAttribute("for", id);
     dateInput.setAttribute("id", id);
     dateInput.setAttribute("type", "date");
+    dateInput.setAttribute("required", "");
+    if (coverageMin) dateInput.setAttribute("min", coverageMin);
+    if (coverageMax) dateInput.setAttribute("max", coverageMax);
+    let add;
+    const validCoverageStart = () => {
+      try {
+        assertIsoDate(dateInput.value);
+        return (
+          (!coverageMin || dateInput.value >= coverageMin) &&
+          (!coverageMax || dateInput.value <= coverageMax)
+        );
+      } catch {
+        return false;
+      }
+    };
+    add = actionButton(document, `Add ${selection.category}`, () => {
+      if (row.hidden || add.disabled) return;
+      draft.addCategory(selection, dateInput.value);
+      appendCurrentCategory(selection);
+      refreshCategoryControls();
+      enableSave();
+    });
+    add.disabled = true;
+    dateInput.addEventListener("input", () => {
+      add.disabled = !validCoverageStart();
+    });
     row.append(
       label,
       dateInput,
-      actionButton(document, `Add ${selection.category}`, () => {
-        draft.addCategory(selection, dateInput.value);
-        enableSave();
-      }),
+      add,
     );
-    categorySection.append(row);
+    categoryAdditions.append(row);
+    categorySuggestionRows.set(selection.category, row);
   }
+  refreshCategoryControls();
+  appendAdditionPanel(
+    document,
+    categorySection,
+    "Add category",
+    "categories",
+    categoryAdditions,
+  );
   container.append(categorySection);
 
-  for (const field of Object.keys(SECTION_LABELS)) {
-    container.append(
-      renderPreferenceSection(
-        document,
-        field,
-        draft,
-        Array.isArray(suggestions[field]) ? suggestions[field] : [],
-        enableSave,
-      ),
-    );
-  }
+  container.append(
+    renderPreferenceSection(
+      document,
+      "seed_papers",
+      draft,
+      Array.isArray(suggestions.seed_papers) ? suggestions.seed_papers : [],
+      enableSave,
+      "Add seed paper",
+      model?.seed_paper_details,
+    ),
+    renderTermsSection(document, draft, suggestions, enableSave),
+    renderPreferenceSection(
+      document,
+      "authors",
+      draft,
+      Array.isArray(suggestions.authors) ? suggestions.authors : [],
+      enableSave,
+      "Add author",
+    ),
+  );
 
   const controls = element(document, "div", undefined, "interest-actions");
   controls.append(
-    actionButton(document, "Get fresh suggestions", () => actions.refreshSuggestions?.()),
+    element(document, "p", "Previously shown suggestions may reappear."),
   );
-  saveButton = actionButton(document, "Save interests", () => actions.save?.(draft));
+  controls.append(
+    actionButton(document, "Refresh suggestions", () => actions.refreshSuggestions?.()),
+  );
+  saveButton = actionButton(document, "Update interests", () => actions.save?.(draft));
   saveButton.disabled = !draft.dirty;
   controls.append(saveButton);
   container.append(controls);

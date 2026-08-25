@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:arxiv="http://arxiv.org/schemas/atom"
+      xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <title>Synthetic production-shaped announcements</title>
+  <updated>2026-08-24T04:32:00Z</updated>
+  <entry>
+    <id>oai:arXiv.org:2608.18078v2</id>
+    <updated>2026-08-24T04:22:00Z</updated>
+    <published>2026-08-24T04:00:00Z</published>
+    <title>  Production-Shaped   Synthetic Example  </title>
+    <summary>
+      arXiv:2608.18078v2 Announce Type: new
+      Abstract: A synthetic production-shaped abstract.
+    </summary>
+    <dc:creator>Ada Fixture, Ben Example</dc:creator>
+    <category term="math.AC" />
+    <category term="math.AT" />
+    <category term="math.RT" />
+    <category term="math.AT" />
+    <arxiv:journal_reference>Synthetic Journal 1 (2026)</arxiv:journal_reference>
+    <arxiv:DOI>10.0000/production.fixture</arxiv:DOI>
+    <arxiv:announce_type>new</arxiv:announce_type>
+  </entry>
+</feed>

@@ -7,14 +7,13 @@ from pathlib import Path
 
 from arxiv_digest.models import (
     AnnounceType,
-    Confidence,
-    DateBasis,
-    EventEvidence,
     EvidenceSource,
     PaperMetadata,
     ReviewEvent,
+    SourceObservation,
+    VersionResolution,
 )
-from arxiv_digest.profile import PdfDestination, Profile
+from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
 
 
 DAY = date(2026, 8, 22)
@@ -38,15 +37,33 @@ def _paper(
     )
 
 
-def _event(arxiv_id: str) -> ReviewEvent:
+def _event(
+    arxiv_id: str,
+    *,
+    support_categories: tuple[str, ...] = ("synthetic.alpha",),
+) -> ReviewEvent:
     return ReviewEvent(
         event_id=int(arxiv_id.rsplit(".", 1)[-1]),
         arxiv_id=arxiv_id,
+        daily_list_date=DAY,
         announced_version=1,
-        effective_date=DAY,
-        date_basis=DateBasis.FEED_MAILING,
-        confidence=Confidence.CURRENT,
-        evidence=(),
+        version_resolution=VersionResolution.CHRONOLOGY_MATCHED,
+        observations=tuple(
+            SourceObservation(
+                source_key=f"catchup:{category}:{arxiv_id}",
+                arxiv_id=arxiv_id,
+                source=EvidenceSource.CATCHUP,
+                category=category,
+                announce_type=AnnounceType.NEW,
+                daily_list_date=DAY,
+                announced_version=None,
+                list_position=None,
+                oai_datestamp=None,
+                response_sha256="a" * 64,
+                observed_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
+            )
+            for category in support_categories
+        ),
         queue_revision=1,
         reviewed_at=None,
     )
@@ -56,17 +73,17 @@ def _positioned_event(arxiv_id: str, position: int | None) -> ReviewEvent:
     evidence = ()
     if position is not None:
         evidence = (
-            EventEvidence(
-                source_key=f"atom:{arxiv_id}",
-                source=EvidenceSource.ATOM,
-                confidence=Confidence.CURRENT,
+            SourceObservation(
+                source_key=f"catchup:synthetic.alpha:{arxiv_id}",
+                arxiv_id=arxiv_id,
+                source=EvidenceSource.CATCHUP,
                 category="synthetic.alpha",
                 announce_type=AnnounceType.NEW,
-                mailing_date=DAY,
-                announced_version=1,
+                daily_list_date=DAY,
+                announced_version=None,
                 list_position=position,
                 oai_datestamp=None,
-                raw_sha256="a" * 64,
+                response_sha256="a" * 64,
                 observed_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
             ),
         )
@@ -74,11 +91,10 @@ def _positioned_event(arxiv_id: str, position: int | None) -> ReviewEvent:
     return ReviewEvent(
         event_id=base.event_id,
         arxiv_id=base.arxiv_id,
+        daily_list_date=base.daily_list_date,
         announced_version=base.announced_version,
-        effective_date=base.effective_date,
-        date_basis=base.date_basis,
-        confidence=base.confidence,
-        evidence=evidence,
+        version_resolution=base.version_resolution,
+        observations=evidence,
         queue_revision=base.queue_revision,
         reviewed_at=base.reviewed_at,
     )
@@ -93,9 +109,12 @@ def _profile(
     seed_papers: tuple[str, ...] = (),
 ) -> Profile:
     return Profile(
-        schema_version=1,
+        schema_version=2,
         revision=1,
-        categories=categories,
+        category_coverage=tuple(
+            ProfileCategory(category, date(2026, 8, 1))
+            for category in categories
+        ),
         keywords=keywords,
         phrases=phrases,
         authors=authors,
@@ -255,9 +274,19 @@ def test_selected_categories_receive_one_equal_order_independent_baseline() -> N
             title="Both",
             categories=("synthetic.alpha", "synthetic.beta"),
         ),
-        _paper("2608.01013", title="Outside", categories=("synthetic.gamma",)),
+        # Current metadata can include a selected category without making the
+        # recovered announcement visible or eligible for its baseline.
+        _paper("2608.01013", title="Outside", categories=("synthetic.alpha",)),
     )
-    events = tuple(_event(paper.arxiv_id) for paper in papers)
+    events = (
+        _event("2608.01010", support_categories=("synthetic.alpha",)),
+        _event("2608.01011", support_categories=("synthetic.beta",)),
+        _event(
+            "2608.01012",
+            support_categories=("synthetic.alpha", "synthetic.beta"),
+        ),
+        _event("2608.01013", support_categories=("synthetic.gamma",)),
+    )
 
     forward = rank_date(
         events,
@@ -537,26 +566,26 @@ def test_equal_scores_sort_by_position_then_id_with_missing_position_last() -> N
     assert tuple(item.paper.arxiv_id for item in reranked) == expected
 
 
-def test_position_comes_from_strongest_available_evidence() -> None:
+def test_position_is_smallest_among_active_catchup_support() -> None:
     from arxiv_digest.ranking import rank_date
 
     stronger = _positioned_event("2608.01045", 8)
-    weaker_evidence = EventEvidence(
+    other_support = SourceObservation(
         source_key="catchup:2608.01045",
+        arxiv_id="2608.01045",
         source=EvidenceSource.CATCHUP,
-        confidence=Confidence.RECOVERED,
         category="synthetic.alpha",
         announce_type=AnnounceType.NEW,
-        mailing_date=DAY,
+        daily_list_date=DAY,
         announced_version=None,
         list_position=1,
         oai_datestamp=None,
-        raw_sha256="b" * 64,
+        response_sha256="b" * 64,
         observed_at=datetime(2026, 8, 23, 12, tzinfo=timezone.utc),
     )
     mixed = replace(
         stronger,
-        evidence=(weaker_evidence, stronger.evidence[0]),
+        observations=(other_support, stronger.observations[0]),
     )
     middle = _positioned_event("2608.01046", 5)
     papers = (
@@ -567,8 +596,8 @@ def test_position_comes_from_strongest_available_evidence() -> None:
     ranked = rank_date((mixed, middle), papers, _profile(), {}, {})
 
     assert tuple(item.paper.arxiv_id for item in ranked) == (
-        "2608.01046",
         "2608.01045",
+        "2608.01046",
     )
 
 

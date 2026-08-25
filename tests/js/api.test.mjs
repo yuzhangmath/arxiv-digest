@@ -81,6 +81,59 @@ test("latest request wins even when a fetch implementation ignores abort", async
   await assert.rejects(first, StaleResponseError);
 });
 
+test("all pending API requests can be aborted when the application closes", async () => {
+  let signal;
+  const client = new ApiClient(
+    "http://127.0.0.1:8765",
+    TOKEN,
+    (_url, options) => new Promise((_resolve, reject) => {
+      signal = options.signal;
+      signal.addEventListener("abort", () => {
+        const error = new Error("Application closed");
+        error.name = "AbortError";
+        reject(error);
+      });
+    }),
+  );
+
+  const pending = client.json("setup", "/api/v1/setup/draft");
+  client.abortAll();
+
+  assert.equal(signal.aborted, true);
+  await assert.rejects(pending, (error) => error?.name === "AbortError");
+});
+
+test("aborting during error parsing prevents stale authentication side effects", async () => {
+  let resolveBody;
+  let cleared = 0;
+  const client = new ApiClient(
+    "http://127.0.0.1:8765",
+    TOKEN,
+    async () => ({
+      ok: false,
+      status: 401,
+      json: () => new Promise((resolve) => {
+        resolveBody = resolve;
+      }),
+    }),
+    () => {
+      cleared += 1;
+    },
+  );
+
+  const pending = client.json("status", "/api/v1/status");
+  while (!resolveBody) await new Promise((resolve) => setImmediate(resolve));
+  client.abortAll();
+  resolveBody({
+    api_version: "v1",
+    ok: false,
+    error: { code: "authentication_required", message: "Session expired" },
+  });
+
+  await assert.rejects(pending, StaleResponseError);
+  assert.equal(cleared, 0);
+});
+
 test("401 invokes authentication clearing and exposes a structured redacted error", async () => {
   let cleared = 0;
   const client = new ApiClient(

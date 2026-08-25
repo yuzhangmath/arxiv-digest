@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arxiv-digest"
-version = "0.1.0"
+version = "0.2.0"
 description = "A local, explainable arXiv digest and review queue"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,6 +35,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 arxiv_digest = [
+  "assets/*.icns",
+  "assets/*.svg",
   "storage/migrations/*.sql",
   "web/static/*",
   "web/static/vendor/katex/*",

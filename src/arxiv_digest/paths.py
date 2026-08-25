@@ -79,7 +79,7 @@ def resolve_paths(
         data = absolute_xdg("XDG_DATA_HOME", home / ".local/share") / "arxiv-digest"
         cache = absolute_xdg("XDG_CACHE_HOME", home / ".cache") / "arxiv-digest"
     else:
-        raise RuntimeError("arxiv-digest 0.1 supports macOS and Linux")
+        raise RuntimeError("arxiv-digest 0.2 supports macOS and Linux")
     return AppPaths(
         config_dir=config,
         data_dir=data,

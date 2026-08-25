@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import stat
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from urllib.parse import unquote
@@ -21,6 +21,7 @@ from arxiv_digest.models import PaperMetadata, PaperVersion
 from arxiv_digest.profile import (
     PdfDestination,
     Profile,
+    ProfileCategory,
     ProfileRepository,
 )
 from arxiv_digest.rate_limit import HttpResponse, Interface
@@ -66,7 +67,7 @@ def seeded_store(
 ) -> Store:
     open_database(path).close()
     store = Store(path)
-    store.apply_event_batch(
+    store.apply_article_snapshot(
         PaperMetadata(
             arxiv_id=arxiv_id,
             title=title,
@@ -81,7 +82,6 @@ def seeded_store(
                 datetime(2026, 8, 1, tzinfo=timezone.utc),
             ),
         ),
-        (),
     )
     return store
 
@@ -93,9 +93,11 @@ def profile_repository(root: Path, destination: Path) -> ProfileRepository:
     )
     repository.save_atomic(
         Profile(
-            schema_version=1,
+            schema_version=2,
             revision=1,
-            categories=("cs.SE",),
+            category_coverage=(
+                ProfileCategory("cs.SE", date(2026, 8, 1)),
+            ),
             keywords=(),
             phrases=(),
             authors=(),
@@ -522,9 +524,11 @@ def test_local_presence_is_recomputed_after_destination_changes_and_restore(
     ).download("2608.32010", 1)
     profiles.save_atomic(
         Profile(
-            schema_version=1,
+            schema_version=2,
             revision=2,
-            categories=("cs.SE",),
+            category_coverage=(
+                ProfileCategory("cs.SE", date(2026, 8, 1)),
+            ),
             keywords=(),
             phrases=(),
             authors=(),
@@ -545,9 +549,11 @@ def test_local_presence_is_recomputed_after_destination_changes_and_restore(
     assert (second_destination / second.filename).read_bytes() == PDF_BYTES
     profiles.save_atomic(
         Profile(
-            schema_version=1,
+            schema_version=2,
             revision=3,
-            categories=("cs.SE",),
+            category_coverage=(
+                ProfileCategory("cs.SE", date(2026, 8, 1)),
+            ),
             keywords=(),
             phrases=(),
             authors=(),

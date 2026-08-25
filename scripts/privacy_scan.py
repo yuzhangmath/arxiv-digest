@@ -31,6 +31,10 @@ from urllib.parse import unquote, urlsplit
 
 
 MAX_TEXT_BYTES = 8 * 1024 * 1024
+_AUDITED_APPLICATION_ICON = "src/arxiv_digest/assets/arxiv-digest.icns"
+_AUDITED_APPLICATION_ICON_SHA256 = (
+    "bfd9510940f503cd41e96c7f5e082b282529b158f7e4cb92131df80f1851751f"
+)
 
 _GENERIC_PRIVATE_PATTERNS = (
     re.compile(
@@ -428,10 +432,14 @@ _DERIVATION_EXCLUDED_PARTS = frozenset(
         "node_modules",
     }
 )
-_PUBLIC_PLANNING_ARTIFACTS = frozenset(
+_AUDITED_PUBLIC_ARTIFACTS = frozenset(
     {
         "docs/superpowers/specs/2026-08-22-public-arxiv-digest-design.md",
         "docs/superpowers/plans/2026-08-22-public-arxiv-digest.md",
+        "docs/superpowers/specs/2026-08-25-confirmed-daily-list-review-design.md",
+        "docs/superpowers/plans/2026-08-25-confirmed-daily-list-review.md",
+        "src/arxiv_digest/reconciliation.py",
+        "src/arxiv_digest/storage/migrations/0004_confirmed_daily_list.sql",
     }
 )
 _EMAIL_PATTERN = re.compile(
@@ -480,6 +488,8 @@ def _key_kind(key: str, parent_kind: str | None = None) -> str | None:
     has_seed = "seed" in tokens or normalized.startswith("seed")
     if normalized in {"abstract", "abstracts", "summary", "summaries"}:
         return "excluded"
+    if normalized in {"filename", "path"} or normalized.endswith("_path"):
+        return "path"
     if has_seed and (
         bool(tokens & {"paper", "papers", "id", "ids", "arxiv"})
         or normalized.startswith(("seedpaper", "seedid", "seedarxiv"))
@@ -593,8 +603,6 @@ def _is_authoritative_structured(relative: Path) -> bool:
 def _private_files(root: Path) -> Iterable[tuple[Path, Path]]:
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
-        if relative.as_posix() in _PUBLIC_PLANNING_ARTIFACTS:
-            continue
         if any(part.casefold() in _DERIVATION_EXCLUDED_PARTS for part in relative.parts):
             continue
         if path.is_symlink() or not path.is_file():
@@ -707,6 +715,17 @@ def _sqlite_column_kind(table: str, column: str) -> str | None:
     folded_column = column.casefold()
     if "abstract" in folded_column or "summary" in folded_column:
         return None
+    if folded_column in {"hash", "sha256"} or folded_column.endswith(
+        ("_hash", "_sha256")
+    ):
+        return "hash"
+    if folded_column in {
+        "error_detail",
+        "error_message",
+        "last_error_message",
+        "raw_error",
+    }:
+        return "free-form-error"
     if folded_column in {"arxiv_id", "paper_id", "seed_id"}:
         return "seed-id" if "seed" in folded_table else "paper-id"
     if "title" in folded_column:
@@ -884,7 +903,7 @@ def _private_relative_filename(path: str) -> str | None:
     name = Path(candidate).name.casefold()
     if (
         candidate in {"", "."}
-        or candidate in _PUBLIC_PLANNING_ARTIFACTS
+        or candidate in _AUDITED_PUBLIC_ARTIFACTS
         or candidate.casefold() in _GENERIC_PRIVATE_RELATIVE_PATHS
         or name in {
             "readme",
@@ -951,6 +970,9 @@ def derive_denylist(
         "phrase": set(),
         "git-identity": set(),
         "email": set(),
+        "free-form-error": set(),
+        "hash": set(),
+        "path": set(),
         "absolute-path": {str(root), str(Path.home().resolve())},
         "relative-filename": set(),
     }
@@ -1335,6 +1357,32 @@ def _is_audited_katex_font(
     )
 
 
+def _is_audited_application_icon(relative_path: str, data: bytes) -> bool:
+    return (
+        relative_path == _AUDITED_APPLICATION_ICON
+        and hashlib.sha256(data).hexdigest() == _AUDITED_APPLICATION_ICON_SHA256
+    )
+
+
+def _is_audited_application_icon_archive_member(
+    relative_path: str,
+    data: bytes,
+) -> bool:
+    wheel_path = _AUDITED_APPLICATION_ICON.removeprefix("src/")
+    source_path = relative_path
+    if relative_path == wheel_path:
+        source_path = _AUDITED_APPLICATION_ICON
+    else:
+        root, separator, nested = relative_path.partition("/")
+        if (
+            separator
+            and re.fullmatch(r"arxiv_digest-[A-Za-z0-9][A-Za-z0-9._+-]*", root)
+            and nested == _AUDITED_APPLICATION_ICON
+        ):
+            source_path = nested
+    return _is_audited_application_icon(source_path, data)
+
+
 def _archive_zip_members(
     path: Path,
     limits: ArchiveLimits,
@@ -1459,6 +1507,8 @@ def scan_archive(
                 artifact_class,
                 _rule_id(f"path:{artifact_class}"),
             )
+        if _is_audited_application_icon_archive_member(name, data):
+            continue
         if _is_audited_katex_font(name, data, katex_hashes):
             continue
         _scan_bytes(name, data, denylist=denylist)
@@ -1533,6 +1583,12 @@ def scan_history(
         if (
             item.object_type == "blob"
             and item.path is not None
+            and _is_audited_application_icon(item.path, item.data)
+        ):
+            continue
+        if (
+            item.object_type == "blob"
+            and item.path is not None
             and _is_audited_katex_font(item.path, item.data, katex_hashes)
         ):
             continue
@@ -1599,6 +1655,8 @@ def scan_tree(
                 _rule_id(f"path:{artifact_class}"),
             )
         data = path.read_bytes()
+        if _is_audited_application_icon(relative, data):
+            continue
         if _is_audited_katex_font(relative, data, katex_hashes):
             continue
         _scan_bytes(relative, data, denylist=denylist)

@@ -15,7 +15,7 @@
     "recurring_author": "Casey Crosscategory"
   },
   "explicit_profile": {
-    "custom_keyword": "handpicked invariant",
+    "custom_keyword": "handpicked",
     "custom_phrase": "deliberate custom phrase",
     "custom_author": "Morgan Manual"
   },
@@ -32,5 +32,21 @@
     "initial_completed_through": "2026-07-24",
     "short_gap_dates": ["2026-07-25", "2026-07-26"],
     "long_gap_completed_through": "2026-08-22"
+  },
+  "daily_list_progress": {
+    "target_dates": 32,
+    "checked_dates": 18,
+    "dates_with_papers": 10,
+    "empty_dates": 8,
+    "failed_dates": 2,
+    "pending_dates": 12,
+    "unavailable_dates": 1
+  },
+  "confirmed_review": {
+    "profile_revision": 5,
+    "projection_revision": 9,
+    "unconfirmed_latest_version": 4,
+    "next_unreviewed_date": "2026-09-01",
+    "readded_coverage_start": "2026-08-24"
   }
 }

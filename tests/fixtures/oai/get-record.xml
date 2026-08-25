@@ -19,12 +19,7 @@
             <raw:source_type>I</raw:source_type>
           </raw:version>
           <raw:title>Clockwork Petals in an Invented Vacuum</raw:title>
-          <raw:authors>
-            <raw:author>
-              <raw:keyname>Fable</raw:keyname>
-              <raw:forenames>Rowan</raw:forenames>
-            </raw:author>
-          </raw:authors>
+          <raw:authors>Rowan Fable</raw:authors>
           <raw:categories>synthetic.quantum synthetic.botany</raw:categories>
           <raw:abstract>Clockwork petals bloom only inside this deterministic fixture.</raw:abstract>
         </raw:arXivRaw>

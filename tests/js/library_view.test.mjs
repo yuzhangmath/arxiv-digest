@@ -12,6 +12,31 @@ import {
   findButton,
 } from "./dom_test_helper.mjs";
 
+test("library explains that a blank search lists saved papers below", () => {
+  const root = new FakeNode("main");
+  renderLibraryView(new FakeDocument(), root, { query: "", entries: [] });
+
+  assert.match(root.textContent, /Leave the search blank to show all saved papers below\./);
+});
+
+test("library distinguishes an empty collection from a search with no matches", () => {
+  const empty = new FakeNode("main");
+  const filtered = new FakeNode("main");
+  renderLibraryView(new FakeDocument(), empty, { query: "", entries: [] });
+  renderLibraryView(new FakeDocument(), filtered, {
+    query: "geometry",
+    entries: [],
+  });
+
+  assert.match(
+    empty.textContent,
+    /No saved papers yet\. Save a paper from Review to add it here\./,
+  );
+  assert.doesNotMatch(empty.textContent, /match this search/);
+  assert.match(filtered.textContent, /No saved papers match this search\./);
+  assert.doesNotMatch(filtered.textContent, /No saved papers yet/);
+});
+
 test("library search and pagination are delegated to the local API", async () => {
   const calls = [];
   const api = {
@@ -66,6 +91,7 @@ test("remove and PDF retry use only stored paper and server job identifiers", as
     arxiv_id: "2608.01234",
     version: 3,
     save_first: false,
+    save_version: null,
   });
   assert.equal(calls[2].path, "/api/v1/downloads/download_job_123");
   assert.equal(calls[3].path, "/api/v1/library/pdf");
@@ -73,6 +99,7 @@ test("remove and PDF retry use only stored paper and server job identifiers", as
     arxiv_id: "2608.01234",
     version: 3,
     save_first: false,
+    save_version: null,
   });
   assert.equal(calls.every((call) => !call.path.includes("..")), true);
 });

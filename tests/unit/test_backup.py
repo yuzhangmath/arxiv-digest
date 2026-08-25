@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import stat
 import warnings
 import zipfile
@@ -12,13 +13,25 @@ import pytest
 
 from arxiv_digest.models import CategoryConfig, PaperMetadata, PaperVersion
 from arxiv_digest.paths import AppPaths, resolve_paths
-from arxiv_digest.profile import PdfDestination, Profile, ProfileRepository
+from arxiv_digest.profile import (
+    PdfDestination,
+    Profile,
+    ProfileCategory,
+    ProfileRepository,
+)
 from arxiv_digest.setup import SetupService
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import DownloadFileRecord, Store
 
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=timezone.utc)
+
+
+def test_portable_backup_uses_format_and_record_schema_two() -> None:
+    from arxiv_digest.backup import FORMAT_VERSION, RECORD_SCHEMA_VERSION
+
+    assert FORMAT_VERSION == 2
+    assert RECORD_SCHEMA_VERSION == 2
 
 
 def initialized_paths(tmp_path: Path) -> AppPaths:
@@ -36,9 +49,9 @@ def initialized_paths(tmp_path: Path) -> AppPaths:
     open_database(paths.database_path).close()
     repository = ProfileRepository(paths.profile_path, paths.profile_lock_path)
     profile = Profile(
-        schema_version=1,
+        schema_version=2,
         revision=1,
-        categories=("cs.SE",),
+        category_coverage=(ProfileCategory("cs.SE", date(2026, 8, 1)),),
         keywords=("fictional keyword",),
         phrases=("synthetic phrase",),
         authors=("Ada Example",),
@@ -51,7 +64,7 @@ def initialized_paths(tmp_path: Path) -> AppPaths:
         expected_revision=None,
     )
     store = Store(paths.database_path)
-    store.apply_event_batch(
+    store.apply_article_snapshot(
         PaperMetadata(
             arxiv_id="2608.41001",
             title="Portable Fictional Lattices",
@@ -61,7 +74,6 @@ def initialized_paths(tmp_path: Path) -> AppPaths:
             categories=("cs.SE",),
         ),
         (PaperVersion(1, datetime(2026, 8, 1, tzinfo=timezone.utc)),),
-        (),
     )
     store.save_paper("2608.41001", 1)
     local_pdf = destination / "2608.41001v1 - Portable Fictional Lattices.pdf"
@@ -124,66 +136,86 @@ def initialized_paths(tmp_path: Path) -> AppPaths:
             "2026-08-20T12:00:00Z",
         ),
     )
+    connection.executemany(
+        """INSERT INTO source_observations(
+               observation_id, source_key, arxiv_id, source, category,
+               announce_type, daily_list_date, announced_version,
+               list_position, oai_datestamp, response_sha256, observed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            (
+                51,
+                "catchup:cs.SE:2026-08-20:0:2608.41001",
+                "2608.41001",
+                "catchup",
+                "cs.SE",
+                "new",
+                "2026-08-20",
+                None,
+                0,
+                None,
+                "3" * 64,
+                "2026-08-20T12:00:00Z",
+            ),
+            (
+                52,
+                "atom:cs.SE:2608.41001:v1",
+                "2608.41001",
+                "atom",
+                "cs.SE",
+                "new",
+                None,
+                1,
+                0,
+                None,
+                "4" * 64,
+                "2026-08-20T12:00:00Z",
+            ),
+        ),
+    )
     connection.execute(
-        """INSERT INTO review_events(
-               event_id, arxiv_id, announced_version, effective_date,
-               date_basis, confidence, queue_revision, reviewed_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO catchup_days(
+               category, daily_list_date, status, attempted_at,
+               response_sha256, error_code
+           ) VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            "cs.SE",
+            "2026-08-20",
+            "complete",
+            "2026-08-20T12:00:00Z",
+            "3" * 64,
+            None,
+        ),
+    )
+    connection.execute(
+        """INSERT INTO canonical_events(
+               event_id, arxiv_id, daily_list_date, announced_version,
+               version_resolution, queue_revision, reviewed_at,
+               recovered_after_finish, conflict_code
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             41,
             "2608.41001",
-            1,
             "2026-08-20",
-            "feed_mailing",
-            "current",
+            1,
+            "atom_confirmed",
             7,
+            None,
+            0,
             None,
         ),
     )
-    connection.execute(
-        """INSERT INTO event_evidence(
-               evidence_id, event_id, source_key, source, confidence,
-               category, announce_type, mailing_date, announced_version,
-               list_position, oai_datestamp, raw_sha256, observed_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            51,
-            41,
-            "atom:cs.SE:2026-08-20:0:2608.41001v1",
-            "atom",
-            "current",
-            "cs.SE",
-            "new",
-            "2026-08-20",
-            1,
-            0,
-            None,
-            "3" * 64,
-            "2026-08-20T12:00:00Z",
-        ),
+    connection.executemany(
+        """INSERT INTO canonical_event_observations(event_id, observation_id)
+           VALUES (?, ?)""",
+        ((41, 51), (41, 52)),
     )
     connection.execute(
         """INSERT INTO review_date_state(
-               effective_date, anchor_event_id, profile_revision,
+               daily_list_date, anchor_event_id, profile_revision,
                last_finished_at, last_finished_revision
            ) VALUES (?, ?, ?, ?, ?)""",
         ("2026-08-20", 41, 1, None, None),
-    )
-    connection.execute(
-        """INSERT INTO enrichment_days(
-               category, mailing_date, source, status, fetched_at,
-               raw_sha256, error_code, error_message
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "cs.SE",
-            "2026-08-20",
-            "atom",
-            "failed",
-            "2026-08-20T12:00:00Z",
-            None,
-            "fixture_parse_error",
-            "private enrichment detail /private/source",
-        ),
     )
     connection.execute(
         """INSERT INTO sync_runs(
@@ -251,6 +283,307 @@ def write_member_list(
             archive.writestr(name, payload)
 
 
+def test_export_uses_generation_two_portable_record_allowlist(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import export_backup
+
+    paths = initialized_paths(tmp_path)
+    archive = tmp_path / "portable.zip"
+
+    export_backup(paths, archive, clock=lambda: NOW)
+
+    records = [
+        json.loads(line)
+        for line in archive_payloads(archive)["state.jsonl"].splitlines()
+    ]
+    record_types = {record["record_type"] for record in records}
+    assert record_types == {
+        "article",
+        "oai_tombstone",
+        "version",
+        "author",
+        "category",
+        "category_sync",
+        "category_article_state",
+        "source_observation",
+        "catchup_day",
+        "canonical_event",
+        "canonical_event_observation",
+        "review_date_state",
+        "saved_paper",
+        "download_file",
+    }
+    assert {record["schema_version"] for record in records} == {2}
+
+
+def test_export_manifest_declares_application_generation_two(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import export_backup
+
+    paths = initialized_paths(tmp_path)
+    archive = tmp_path / "portable.zip"
+
+    manifest = export_backup(paths, archive, clock=lambda: NOW)
+    manifest_payload = json.loads(archive_payloads(archive)["manifest.json"])
+
+    assert manifest.application_generation == 2
+    assert manifest_payload["application_generation"] == 2
+    assert manifest_payload["format_version"] == 2
+
+
+def test_export_rejects_a_database_from_another_application_generation(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup
+
+    paths = initialized_paths(tmp_path)
+    connection = sqlite3.connect(paths.database_path)
+    connection.execute("UPDATE application_generation SET generation = 1")
+    connection.commit()
+    connection.close()
+    archive = tmp_path / "portable.zip"
+
+    with pytest.raises(BackupError) as raised:
+        export_backup(paths, archive, clock=lambda: NOW)
+
+    assert raised.value.code == "unsupported_schema"
+    assert not archive.exists()
+
+
+def test_export_rejects_a_database_without_a_generation_marker(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup
+
+    paths = initialized_paths(tmp_path)
+    connection = sqlite3.connect(paths.database_path)
+    connection.execute("DROP TABLE application_generation")
+    connection.commit()
+    connection.close()
+    archive = tmp_path / "portable.zip"
+
+    with pytest.raises(BackupError) as raised:
+        export_backup(paths, archive, clock=lambda: NOW)
+
+    assert raised.value.code == "unsupported_schema"
+    assert not archive.exists()
+
+
+def test_portable_profile_round_trips_exact_category_coverage(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    archive = tmp_path / "portable.zip"
+
+    export_backup(paths, archive, clock=lambda: NOW)
+    portable_profile = json.loads(archive_payloads(archive)["profile.json"])
+    inspection = inspect_backup(archive)
+
+    assert portable_profile["schema_version"] == 2
+    assert portable_profile["category_coverage"] == [
+        {"category": "cs.SE", "coverage_start": "2026-08-01"}
+    ]
+    assert "categories" not in portable_profile
+    assert inspection.profile.category_coverage == (
+        ProfileCategory("cs.SE", date(2026, 8, 1)),
+    )
+
+
+def test_inspection_rejects_v1_without_modifying_archive_or_local_state(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    current = tmp_path / "current.zip"
+    legacy = tmp_path / "legacy-v1.zip"
+    export_backup(paths, current, clock=lambda: NOW)
+    members = archive_payloads(current)
+    manifest = json.loads(members["manifest.json"])
+    manifest["format_version"] = 1
+    rewrite_archive_member(
+        current,
+        legacy,
+        "manifest.json",
+        (
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode(),
+    )
+    before = {
+        "archive": sha256(legacy.read_bytes()).digest(),
+        "database": sha256(paths.database_path.read_bytes()).digest(),
+        "profile": sha256(paths.profile_path.read_bytes()).digest(),
+    }
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(legacy)
+
+    assert raised.value.code == "unsupported_schema"
+    assert sha256(legacy.read_bytes()).digest() == before["archive"]
+    assert sha256(paths.database_path.read_bytes()).digest() == before["database"]
+    assert sha256(paths.profile_path.read_bytes()).digest() == before["profile"]
+
+
+def test_inspection_rejects_another_application_generation(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    current = tmp_path / "current.zip"
+    incompatible = tmp_path / "wrong-generation.zip"
+    export_backup(paths, current, clock=lambda: NOW)
+    manifest = json.loads(archive_payloads(current)["manifest.json"])
+    manifest["application_generation"] = 1
+    rewrite_archive_member(
+        current,
+        incompatible,
+        "manifest.json",
+        (
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode(),
+    )
+    before = sha256(incompatible.read_bytes()).digest()
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(incompatible)
+
+    assert raised.value.code == "unsupported_schema"
+    assert sha256(incompatible.read_bytes()).digest() == before
+
+
+def test_inspection_rejects_portable_profile_schema_one(tmp_path: Path) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    current = tmp_path / "current.zip"
+    incompatible = tmp_path / "profile-v1.zip"
+    export_backup(paths, current, clock=lambda: NOW)
+    profile = json.loads(archive_payloads(current)["profile.json"])
+    profile["schema_version"] = 1
+    rewrite_archive_member(
+        current,
+        incompatible,
+        "profile.json",
+        (
+            json.dumps(profile, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode(),
+    )
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(incompatible)
+
+    assert raised.value.code == "unsupported_schema"
+
+
+def test_inspection_rejects_portable_record_schema_one(tmp_path: Path) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    current = tmp_path / "current.zip"
+    incompatible = tmp_path / "records-v1.zip"
+    export_backup(paths, current, clock=lambda: NOW)
+    records = [
+        json.loads(line)
+        for line in archive_payloads(current)["state.jsonl"].splitlines()
+    ]
+    records[0]["schema_version"] = 1
+    state_payload = b"".join(
+        (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        for record in records
+    )
+    rewrite_archive_member(
+        current,
+        incompatible,
+        "state.jsonl",
+        state_payload,
+    )
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(incompatible)
+
+    assert raised.value.code == "unsupported_schema"
+
+
+def test_inspection_rejects_unsafe_portable_download_filename(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    current = tmp_path / "current.zip"
+    hostile = tmp_path / "unsafe-download.zip"
+    export_backup(paths, current, clock=lambda: NOW)
+    records = [
+        json.loads(line)
+        for line in archive_payloads(current)["state.jsonl"].splitlines()
+    ]
+    download = next(
+        record for record in records if record["record_type"] == "download_file"
+    )
+    download["payload"]["filename"] = "../outside.pdf"
+    state_payload = b"".join(
+        (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        for record in records
+    )
+    rewrite_archive_member(current, hostile, "state.jsonl", state_payload)
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(hostile)
+
+    assert raised.value.code == "unsupported_schema"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("version", 0),
+        ("byte_count", 0),
+        ("sha256", "not-a-sha256"),
+        ("last_verified_at", "not-a-timestamp"),
+    ),
+)
+def test_inspection_rejects_invalid_portable_download_metadata(
+    tmp_path: Path,
+    field: str,
+    value: str | int,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    current = tmp_path / "current.zip"
+    hostile = tmp_path / f"invalid-download-{field}.zip"
+    export_backup(paths, current, clock=lambda: NOW)
+    records = [
+        json.loads(line)
+        for line in archive_payloads(current)["state.jsonl"].splitlines()
+    ]
+    download = next(
+        record for record in records if record["record_type"] == "download_file"
+    )
+    download["payload"][field] = value
+    state_payload = b"".join(
+        (
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        for record in records
+    )
+    rewrite_archive_member(current, hostile, "state.jsonl", state_payload)
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(hostile)
+
+    assert raised.value.code == "unsupported_schema"
+
+
 def test_export_is_deterministic_portable_and_excludes_machine_local_state(
     tmp_path: Path,
 ) -> None:
@@ -276,10 +609,11 @@ def test_export_is_deterministic_portable_and_excludes_machine_local_state(
         state_payload = archive.read("state.jsonl")
     manifest = json.loads(manifest_payload)
     assert manifest == {
-        "application_version": "0.1.0",
+        "application_generation": 2,
+        "application_version": "0.2.0",
         "created_at": "2026-08-22T12:00:00Z",
         "format_name": "arxiv-digest-backup",
-        "format_version": 1,
+        "format_version": 2,
         "members": [
             {
                 "byte_count": len(profile_payload),
@@ -296,11 +630,13 @@ def test_export_is_deterministic_portable_and_excludes_machine_local_state(
     portable_profile = json.loads(profile_payload)
     assert portable_profile == {
         "authors": ["Ada Example"],
-        "categories": ["cs.SE"],
+        "category_coverage": [
+            {"category": "cs.SE", "coverage_start": "2026-08-01"}
+        ],
         "keywords": ["fictional keyword"],
         "phrases": ["synthetic phrase"],
         "revision": 1,
-        "schema_version": 1,
+        "schema_version": 2,
         "seed_papers": ["2608.41001"],
     }
     records = [json.loads(line) for line in state_payload.splitlines()]
@@ -314,11 +650,13 @@ def test_export_is_deterministic_portable_and_excludes_machine_local_state(
         "category",
         "category_sync",
         "category_article_state",
-        "review_event",
-        "event_evidence",
+        "source_observation",
+        "catchup_day",
+        "canonical_event",
+        "canonical_event_observation",
         "review_date_state",
-        "enrichment_day",
         "saved_paper",
+        "download_file",
     }
     archive_bytes = first.read_bytes()
     for excluded in (
@@ -331,7 +669,6 @@ def test_export_is_deterministic_portable_and_excludes_machine_local_state(
         b"private enrichment detail",
         b"private transient run detail",
         b"sync_run",
-        b"download_file",
         b"%PDF-1.7",
     ):
         assert excluded not in archive_bytes
@@ -439,6 +776,32 @@ def test_inspection_rejects_an_active_category_without_sync_state(
         for record in records
     )
     rewrite_archive_member(valid, hostile, "state.jsonl", payload)
+
+    with pytest.raises(BackupError) as raised:
+        inspect_backup(hostile)
+
+    assert raised.value.code == "cross_record_invalid"
+
+
+def test_inspection_rejects_profile_coverage_misaligned_with_sync_state(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_backup
+
+    paths = initialized_paths(tmp_path)
+    valid = tmp_path / "valid.zip"
+    hostile = tmp_path / "misaligned-coverage.zip"
+    export_backup(paths, valid, clock=lambda: NOW)
+    profile = json.loads(archive_payloads(valid)["profile.json"])
+    profile["category_coverage"][0]["coverage_start"] = "2026-08-02"
+    rewrite_archive_member(
+        valid,
+        hostile,
+        "profile.json",
+        (
+            json.dumps(profile, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode(),
+    )
 
     with pytest.raises(BackupError) as raised:
         inspect_backup(hostile)
@@ -734,7 +1097,7 @@ def test_inspection_rejects_checksum_mismatch_and_unsupported_schemas(
 
     manifest_schema = tmp_path / "manifest-schema.zip"
     manifest = json.loads(members["manifest.json"])
-    manifest["format_version"] = 2
+    manifest["format_version"] = 3
     rewrite_archive_member(
         valid,
         manifest_schema,
@@ -751,7 +1114,7 @@ def test_inspection_rejects_checksum_mismatch_and_unsupported_schemas(
     records = [
         json.loads(line) for line in members["state.jsonl"].splitlines()
     ]
-    records[0]["schema_version"] = 2
+    records[0]["schema_version"] = 3
     state_payload = b"".join(
         (
             json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
