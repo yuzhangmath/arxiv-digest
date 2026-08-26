@@ -106,6 +106,10 @@ jobs:
         shell: bash
         env:
           EXPECTED_REMOTE: ${{ github.server_url }}/${{ github.repository }}
+          GIT_AUTHOR_NAME: "github-actions[bot]"
+          GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
+          GIT_COMMITTER_NAME: "github-actions[bot]"
+          GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
           VERSION: ${{ steps.identity.outputs.version }}
         run: |
           set -euo pipefail

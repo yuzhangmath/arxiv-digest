@@ -1422,3 +1422,31 @@ def test_ci_privacy_scan_uses_checkout_origin_exactly(
             f"python scripts/privacy_scan.py {mode} . "
             '--expected-remote "$EXPECTED_REMOTE"'
         ) in workflow
+
+
+@pytest.mark.parametrize(
+    "workflow_name",
+    ("tests.yml", "release.yml"),
+)
+def test_ci_privacy_scan_uses_deterministic_public_git_identity(
+    workflow_name: str,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    workflow = (project_root / ".github/workflows" / workflow_name).read_text(
+        encoding="utf-8"
+    )
+    privacy_step = workflow.split("- name: Run privacy gates", 1)[1].split(
+        "\n      - name:",
+        1,
+    )[0]
+
+    assert 'GIT_AUTHOR_NAME: "github-actions[bot]"' in privacy_step
+    assert 'GIT_COMMITTER_NAME: "github-actions[bot]"' in privacy_step
+    assert (
+        'GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"'
+        in privacy_step
+    )
+    assert (
+        'GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"'
+        in privacy_step
+    )
