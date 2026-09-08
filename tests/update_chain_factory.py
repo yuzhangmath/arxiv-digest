@@ -1,11 +1,13 @@
 """External-boundary fixtures for full production update/relaunch chains.
 
 Application wheels retain the production coordinator, helper, detector, storage
-and internal commands. Only the release HTTP transport, desktop browser boundary
-and one explicitly broken target import differ in these synthetic releases.
+and internal commands. Release HTTP transport and desktop browser boundaries are
+synthetic; bounded exception observers retain failures without changing decisions.
+One explicitly broken target import exercises rollback.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -16,6 +18,109 @@ from arxiv_digest.update_manifest import AutomaticUpdateFrom, build_update_manif
 
 SOURCE = Path(__file__).resolve().parents[1] / "src/arxiv_digest"
 API_URL = "https://api.github.com/repos/yuzhangmath/arxiv-digest/releases?per_page=100"
+BOUNDARY_FUNCTIONS = {
+    "update_internal.py": ("_authenticate", "_validate_package", "run_self_check", "run_relaunch"),
+    "update_runtime/helper.py": ("validate_prepared_inputs", "run_installer", "internal_operation", "healthy_relaunch",
+        "restore_and_relaunch", "_wait_parent_exit", "_acquire"),
+    "update_runtime/guard.py": ("installer_child", "run_guard"),
+}
+ERROR_CLASSES = frozenset({"EOFError", "TimeoutError", "OSError", "FileNotFoundError", "PermissionError", "ValueError",
+    "RuntimeError", "TypeError", "KeyError", "AssertionError", "HelperError", "GuardError", "SnapshotError",
+    "ProtocolError", "StoreError", "LockTimeoutError", "InstanceSecurityError", "ProcessDeathUnproven",
+    "ModuleNotFoundError", "ImportError", "AttributeError", "SystemExit", "KeyboardInterrupt", "OtherError"})
+FRAME_FUNCTIONS = {
+    Path(name).name: frozenset(node.name for node in ast.walk(ast.parse((SOURCE / name).read_text()))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))) | {"<module>"}
+    for name in (*BOUNDARY_FUNCTIONS, "update_runtime/recovery.py", "update_runtime/protocol.py",
+        "web/lifecycle.py", "backup.py", "application.py", "atomic.py", "update_locks.py", "maintenance.py", "storage/database.py")
+}
+
+
+def _exception_observers(root: Path, module: str) -> str:
+    """Install observers only in synthetic releases, preserving returns/raises."""
+    return '''
+
+# Test-only structural exception observations; no exception messages or values.
+def _install_fixture_exception_observers():
+    import fcntl, functools, json, os, stat
+    from pathlib import Path
+    destination = Path(ROOT_LITERAL, "update-boundary-errors.jsonl")
+    allowed_frames = FRAME_LITERAL
+    allowed_errors = ERROR_LITERAL
+    def record(boundary, error):
+        frames = []
+        traceback = error.__traceback__
+        while traceback is not None:
+            code = traceback.tb_frame.f_code
+            module = Path(code.co_filename).name
+            if module in allowed_frames and code.co_name in allowed_frames[module]:
+                frames.append({"module": module, "function": code.co_name, "line": traceback.tb_lineno})
+                frames = frames[-8:]
+            traceback = traceback.tb_next
+        event = {"boundary": boundary, "error": type(error).__name__ if type(error).__name__ in allowed_errors else "OtherError",
+                 "frames": frames}
+        payload = (json.dumps(event, separators=(",", ":")) + "\\n").encode()
+        if len(payload) > 4096:
+            return
+        descriptor = os.open(destination, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+                return
+            if info.st_size + len(payload) > 65536:
+                return
+            if os.read(descriptor, 65537).count(b"\\n") >= 64:
+                return
+            os.write(descriptor, payload)
+        finally:
+            os.close(descriptor)
+    def observe(function):
+        @functools.wraps(function)
+        def observed(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
+            except BaseException as error:
+                try:
+                    record(function.__name__, error)
+                except Exception:
+                    pass
+                raise
+        return observed
+    for name in BOUNDARY_LITERAL:
+        globals()[name] = observe(globals()[name])
+_install_fixture_exception_observers()
+del _install_fixture_exception_observers
+'''.replace("ROOT_LITERAL", repr(str(root))).replace("FRAME_LITERAL", repr({key: sorted(value) for key, value in FRAME_FUNCTIONS.items()})).replace(
+        "ERROR_LITERAL", repr(sorted(ERROR_CLASSES))).replace("BOUNDARY_LITERAL", repr(BOUNDARY_FUNCTIONS[module]))
+
+
+def boundary_error_diagnostics(root: Path):
+    """Validate the complete bounded record before exposing structural labels."""
+    try:
+        with (root / "update-boundary-errors.jsonl").open("rb") as stream:
+            payload = stream.read(65537)
+        if len(payload) > 65536:
+            return "over_limit"
+        records = [json.loads(line) for line in payload.splitlines()]
+        if len(records) > 64:
+            return "over_limit"
+        boundaries = {name for names in BOUNDARY_FUNCTIONS.values() for name in names}
+        for record in records:
+            if (type(record) is not dict or set(record) != {"boundary", "error", "frames"}
+                    or record["boundary"] not in boundaries or record["error"] not in ERROR_CLASSES
+                    or type(record["frames"]) is not list or len(record["frames"]) > 8):
+                return "unreadable"
+            for frame in record["frames"]:
+                if (type(frame) is not dict or set(frame) != {"module", "function", "line"}
+                        or frame["module"] not in FRAME_FUNCTIONS or frame["function"] not in FRAME_FUNCTIONS[frame["module"]]
+                        or type(frame["line"]) is not int or not 1 <= frame["line"] <= 100000):
+                    return "unreadable"
+        return records
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, TypeError, KeyError):
+        return "unreadable"
 
 
 def source_overrides(root: Path, version: str, *, broken_target: bool = False) -> dict[str, bytes]:
@@ -72,6 +177,8 @@ _test_sys.addaudithook(_test_network_audit)
         "src/arxiv_digest/update_http.py": SOURCE.joinpath("update_http.py").read_bytes() + transport.encode(),
         "src/arxiv_digest/browser.py": SOURCE.joinpath("browser.py").read_bytes() + browser.encode(),
     }
+    for module in BOUNDARY_FUNCTIONS:
+        result["src/arxiv_digest/" + module] = (SOURCE / module).read_bytes() + _exception_observers(root, module).encode()
     if broken_target:
         # The wheel itself is well-formed. The real authenticated target
         # self-check reaches this import failure after the real pipx install.

@@ -20,13 +20,13 @@ from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory, Profi
 from arxiv_digest.setup import SetupService
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.update_runtime import protocol
-from tests.update_chain_factory import publish_releases, source_overrides
+from tests.update_chain_factory import boundary_error_diagnostics, publish_releases, source_overrides
 
 
 pytestmark = pytest.mark.skipif(sys.platform not in {"darwin", "linux"}, reason="native updater supports macOS/Linux")
 
 
-def wait_for(probe, *, timeout=90, description="condition"):
+def wait_for(probe, *, timeout=90, description="condition", diagnostics=None):
     deadline = time.monotonic() + timeout
     last_error = None
     while time.monotonic() < deadline:
@@ -37,7 +37,63 @@ def wait_for(probe, *, timeout=90, description="condition"):
         except (FileNotFoundError, ConnectionError, OSError, json.JSONDecodeError) as error:
             last_error = type(error).__name__
         time.sleep(0.1)
-    raise AssertionError(f"timed out waiting for {description}; last transient error={last_error}")
+    details = "" if diagnostics is None else "; update diagnostics=" + json.dumps(diagnostics(), sort_keys=True)
+    raise AssertionError(f"timed out waiting for {description}; last transient error={last_error}{details}")
+
+
+def chain_diagnostics(root, paths):
+    """Only bounded, validated state labels; never log URLs, tokens or paths."""
+    from arxiv_digest.web.lifecycle import _read_private_descriptor
+
+    result = {}
+    latest_pid = None
+    try:
+        current = protocol.JournalStore(paths.update_recovery_dir).read_snapshot()
+        result["journal_state"] = "absent" if current is None else current.record["state"]
+        if current is not None:
+            if "subphase" in current.record:
+                result["journal_subphase"] = current.record["subphase"]
+            if "receipt" in current.record:
+                result["receipt_outcome"] = current.record["receipt"]["outcome"]
+    except (OSError, ValueError, RuntimeError):
+        result["journal_state"] = "unreadable"
+    try:
+        with (root / "browser-launches.jsonl").open("rb") as stream:
+            payload = stream.read(65537)
+        if len(payload) > 65536:
+            result["browser_launch_versions"] = "over_limit"
+        else:
+            launches = [json.loads(line) for line in payload.splitlines()]
+            versions = [entry["version"] for entry in launches]
+            if any(version not in ("0.3.0", "0.3.1", "0.3.2") for version in versions):
+                raise ValueError("unexpected fixture release")
+            result["browser_launch_versions"] = versions[-16:]
+            if launches and type(launches[-1].get("pid")) is int and launches[-1]["pid"] > 0:
+                latest_pid = launches[-1]["pid"]
+    except (OSError, ValueError, TypeError, KeyError):
+        result["browser_launch_versions"] = "unreadable"
+    result["runtime_descriptor_readable"] = False
+    result["runtime_matches_latest_launch"] = False
+    try:
+        runtime = _read_private_descriptor(paths.runtime_descriptor_path)
+        result["runtime_descriptor_readable"] = True
+        result["runtime_matches_latest_launch"] = runtime.pid == latest_pid
+    except (OSError, ValueError, RuntimeError):
+        pass
+    result["boundary_errors"] = boundary_error_diagnostics(root)
+    return result
+
+
+def relaunch_runtime(root, paths, *, version, outcome, after_pid=None):
+    current = protocol.JournalStore(paths.update_recovery_dir).read_snapshot()
+    if current is not None and current.record["state"] in protocol.TERMINAL_STATES:
+        if (current.record["state"] != "complete"
+                or current.record.get("receipt", {}).get("outcome") != outcome):
+            # A durable incompatible result cannot become the expected launch.
+            # Report it immediately while retaining the normal startup deadline.
+            raise AssertionError("relaunch ended without the expected outcome; update diagnostics="
+                                 + json.dumps(chain_diagnostics(root, paths), sort_keys=True))
+    return browser_runtime(root, paths, version=version, after_pid=after_pid)
 
 
 def api(runtime, method, path, data=None, *, expected=200, error_code=None):
@@ -188,7 +244,8 @@ def test_real_consecutive_updates_reuse_verified_provenance_and_restore_eligible
         publish_releases(root, wheels, visible=("0.3.0", "0.3.1", "0.3.2"))
         first_job, first_plan, _ = handoff(first, "0.3.1", paths)
         assert process.wait(timeout=20) == 0
-        second = wait_for(lambda: browser_runtime(root, paths, version="0.3.1"), description="healthy first updated dashboard")
+        second = wait_for(lambda: relaunch_runtime(root, paths, version="0.3.1", outcome="updated"), description="healthy first updated dashboard",
+                          diagnostics=lambda: chain_diagnostics(root, paths))
         assert second["startup_nonce"] != first["startup_nonce"]
         receipt = api(second, "GET", "/api/v1/update/receipt")["receipt"]
         assert receipt["outcome"] == "updated" and receipt["installed_version"] == "0.3.1"
@@ -205,8 +262,9 @@ def test_real_consecutive_updates_reuse_verified_provenance_and_restore_eligible
         assert api(second, "GET", "/api/v1/update/receipt") == {"receipt": None}
         second_job, second_plan, second_snapshot_identity = handoff(second, "0.3.2", paths)
         final_version = "0.3.1" if broken_second else "0.3.2"
-        final = wait_for(lambda: browser_runtime(root, paths, version=final_version, after_pid=second["pid"]),
-                         description="healthy final dashboard after second attempt")
+        final = wait_for(lambda: relaunch_runtime(root, paths, version=final_version,
+                         outcome="restored" if broken_second else "updated", after_pid=second["pid"]),
+                         description="healthy final dashboard after second attempt", diagnostics=lambda: chain_diagnostics(root, paths))
         assert final["startup_nonce"] != second["startup_nonce"]
         receipt = api(final, "GET", "/api/v1/update/receipt")["receipt"]
         assert receipt["outcome"] == ("restored" if broken_second else "updated")
@@ -240,3 +298,94 @@ def test_real_consecutive_updates_reuse_verified_provenance_and_restore_eligible
             process.kill()
         process.wait(timeout=10)
         log.close()
+
+
+@pytest.mark.parametrize("state,outcome", [
+    ("complete", "updated"), ("complete", "restored"), ("aborted_no_mutation", "handoff_failed"),
+    ("recovery_failed", "recovery_failed"), ("external_change_detected", "external_change_detected"),
+])
+@pytest.mark.parametrize("runtime_pid", [12345, 54321])
+def test_chain_timeout_reports_validated_state_without_private_fixture_details(tmp_path, state, outcome, runtime_pid, monkeypatch):
+    from tests.update_protocol_factory import completed_journal
+
+    paths = resolve_paths(home=tmp_path, environ={})
+    _, current = completed_journal(paths.update_recovery_dir)
+    record = {**current.record, "state": state, "receipt": {
+        **current.record["receipt"], "outcome": outcome, "message_code": protocol.OUTCOME_MESSAGES[outcome],
+        "installed_version": "0.3.1" if outcome == "updated" else "0.3.0",
+        "launch_id": current.record["receipt"]["launch_id"] if state == "complete" else None,
+    }}
+    paths.update_journal_path.write_bytes(protocol.encode_journal(record))
+    (tmp_path / "browser-launches.jsonl").write_text(json.dumps({
+        "version": "0.3.1", "pid": 12345,
+        "url": "http://127.0.0.1:1234/#secret-token", "path": str(tmp_path),
+    }) + "\n")
+    paths.runtime_descriptor_path.write_text(json.dumps({
+        "pid": runtime_pid, "port": 1234, "startup_nonce": "a" * 32,
+        "token": "A" * 43, "started_at": "2026-01-01T00:00:00Z",
+    }))
+    paths.runtime_descriptor_path.chmod(0o600)
+    with pytest.raises(AssertionError) as failure:
+        wait_for(lambda: None, timeout=0, description="synthetic dashboard",
+                 diagnostics=lambda: chain_diagnostics(tmp_path, paths))
+    message = str(failure.value)
+    assert f'"journal_state": "{state}"' in message
+    assert f'"receipt_outcome": "{outcome}"' in message
+    assert '"browser_launch_versions": ["0.3.1"]' in message
+    assert '"runtime_descriptor_readable": true' in message
+    assert ('"runtime_matches_latest_launch": ' + str(runtime_pid == 12345).lower()) in message
+    assert "secret-token" not in message and "127.0.0.1" not in message
+    assert str(tmp_path) not in message and "12345" not in message
+    monkeypatch.setattr(time, "sleep", lambda _: pytest.fail("terminal failures must not wait"))
+    marker = object()
+    monkeypatch.setattr(sys.modules[__name__], "browser_runtime", lambda *args, **kwargs: marker)
+    if state != "complete" or outcome != "updated":
+        with pytest.raises(AssertionError, match="relaunch ended without the expected outcome"):
+            wait_for(lambda: relaunch_runtime(tmp_path, paths, version="0.3.1", outcome="updated"))
+    if state == "complete":
+        assert relaunch_runtime(tmp_path, paths, version="0.3.1", outcome=outcome) is marker
+
+
+@pytest.mark.parametrize("payload", [
+    b'{"version":"/private/synthetic-secret"}\n',
+    b"malformed synthetic-secret\n", b"synthetic-secret" * 6000,
+])
+def test_chain_diagnostics_bound_and_redact_untrusted_fixture_bytes(tmp_path, payload):
+    paths = resolve_paths(home=tmp_path, environ={})
+    paths.update_recovery_dir.mkdir(mode=0o700, parents=True)
+    paths.update_journal_path.write_bytes(b"malformed synthetic-secret")
+    paths.update_journal_path.chmod(0o600)
+    (tmp_path / "browser-launches.jsonl").write_bytes(payload)
+    (tmp_path / "update-boundary-errors.jsonl").write_bytes(payload)
+    details = chain_diagnostics(tmp_path, paths)
+    assert details["journal_state"] == "unreadable"
+    assert details["browser_launch_versions"] == ("over_limit" if len(payload) > 65536 else "unreadable")
+    assert details["boundary_errors"] == ("over_limit" if len(payload) > 65536 else "unreadable")
+    assert "synthetic-secret" not in json.dumps(details)
+
+
+def test_chain_exception_observers_preserve_behavior_and_bound_structural_logs(tmp_path):
+    from tests.update_chain_factory import BOUNDARY_FUNCTIONS, _exception_observers
+
+    namespace = {name: lambda value: value for name in BOUNDARY_FUNCTIONS["update_internal.py"]}
+    exec(compile("def _validate_package(value):\n    raise ValueError(value)\n",
+                 "/private/synthetic-secret/update_internal.py", "exec"), namespace)
+    exec(_exception_observers(tmp_path, "update_internal.py"), namespace)
+    marker = object()
+    assert namespace["run_self_check"](marker) is marker
+    for _ in range(70):
+        with pytest.raises(ValueError, match="synthetic-secret"):
+            namespace["_validate_package"]("synthetic-secret")
+    records = boundary_error_diagnostics(tmp_path)
+    assert len(records) == 64
+    assert records[0] == {"boundary": "_validate_package", "error": "ValueError", "frames": [
+        {"module": "update_internal.py", "function": "_validate_package", "line": 2},
+    ]}
+    payload = (tmp_path / "update-boundary-errors.jsonl").read_bytes()
+    assert len(payload) <= 65536
+    assert b"synthetic-secret" not in payload and str(tmp_path).encode() not in payload
+    # A diagnostic I/O failure must also preserve the original exception.
+    (tmp_path / "update-boundary-errors.jsonl").unlink()
+    (tmp_path / "update-boundary-errors.jsonl").mkdir()
+    with pytest.raises(ValueError, match="synthetic-secret"):
+        namespace["_validate_package"]("synthetic-secret")

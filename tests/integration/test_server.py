@@ -49,6 +49,53 @@ def test_server_binds_ephemeral_ipv4_loopback_with_fresh_256_bit_token() -> None
         first.stop()
 
 
+@pytest.mark.parametrize("method,target,authorized,expected_status", [
+    ("GET", "/api/v1/status", True, 200),
+    ("GET", "/api/v1/status", False, 401),
+    ("POST", "/api/v1/update/receipt/" + "c" * 64 + "/ack", True, 500),
+    ("GET", "/index.html", False, 200),
+    ("GET", "/missing.html", False, 404),
+])
+def test_single_request_connections_advertise_close_before_client_reuse(
+    method, target, authorized, expected_status,
+) -> None:
+    from arxiv_digest.web.server import LoopbackServer, StaticAsset
+
+    def failed_acknowledgement(_payload):
+        raise RuntimeError("synthetic failed acknowledgement")
+
+    server = LoopbackServer(
+        handlers={"status": lambda _: {"state": "ready"}, "update_receipt_ack": failed_acknowledgement},
+        static_assets={"/index.html": StaticAsset(content_type="text/html", data=b"synthetic dashboard")},
+    )
+    server.start()
+    connection = http.client.HTTPConnection(server.host, server.port, timeout=2)
+    try:
+        headers = {"Host": f"{server.host}:{server.port}"}
+        if authorized:
+            headers["Authorization"] = f"Bearer {server.token}"
+        if method == "POST":
+            headers.update(Origin=f"http://{server.host}:{server.port}", **{"Content-Type": "application/json"})
+        connection.request(method, target, body=b"{}" if method == "POST" else None, headers=headers)
+        response = connection.getresponse()
+        assert response.status == expected_status
+        assert response.version == 11
+        assert response.getheader("Connection") == "close"
+        response.read()
+        assert response.will_close
+        assert connection.sock is None
+        # The same HTTP client must open a fresh transport for its next request.
+        connection.request("GET", "/api/v1/status", headers={
+            "Host": f"{server.host}:{server.port}", "Authorization": f"Bearer {server.token}",
+        })
+        following = connection.getresponse()
+        assert following.status == 200
+        assert json.loads(following.read())["data"]["state"] == "ready"
+    finally:
+        connection.close()
+        server.stop()
+
+
 @pytest.mark.parametrize("incomplete_part", ["connection", "headers", "body"])
 def test_incomplete_requests_are_closed_after_the_server_deadline(
     incomplete_part: str,

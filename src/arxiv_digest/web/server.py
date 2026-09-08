@@ -459,6 +459,7 @@ class LoopbackServer:
                     self.send_header(name, value)
                 for name, value in (extra_headers or {}).items():
                     self.send_header(name, value)
+                self.send_header("Connection", "close")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 if self.command != "HEAD":
@@ -468,6 +469,7 @@ class LoopbackServer:
                 self.send_response(response.status)
                 for name, value in response.headers.items():
                     self.send_header(name, value)
+                self.send_header("Connection", "close")
                 self.send_header("Content-Length", str(len(response.body)))
                 self.end_headers()
                 if self.command != "HEAD":

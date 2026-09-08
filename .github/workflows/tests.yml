@@ -11,29 +11,36 @@ permissions:
 
 jobs:
   test:
+    name: Validate (${{ matrix.os }}, Python ${{ matrix.python }}, ${{ matrix.suite }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-latest]
         python: ["3.11", "3.x"]
+        suite: [python, browser]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out source and historical tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
           check-latest: false
       - name: Prepare private Python for native updater validation
         run: python scripts/ci_python.py
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Set up Node.js
+        if: matrix.suite == 'python'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.19.0"
           package-manager-cache: false
-      - run: |
+      - name: Install application and development dependencies
+        run: |
           umask 022
           python -m pip install ".[dev]"
       - name: Resolve canonical application version
@@ -49,7 +56,8 @@ jobs:
           printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
           printf 'ARXIV_DIGEST_RELEASE_ARTIFACT_DIR=%s/dist\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
           printf 'COMMIT_SHA=%s\n' "$commit_sha" >> "$GITHUB_ENV"
-      - run: python -m build
+      - name: Build package artifacts
+        run: python -m build
       - name: Generate the updater manifest
         run: >-
           python scripts/update_manifest.py
@@ -84,26 +92,41 @@ jobs:
           (root / "COMMIT_SHA").write_bytes((os.environ["COMMIT_SHA"] + "\n").encode("ascii"))
           PY_BUNDLE
           python scripts/release_bundle.py local --bundle "$BUNDLE" --version "$ARXIV_DIGEST_VERSION" --commit "$COMMIT_SHA"
-      - run: |
+      - name: Run update-chain tests for early native feedback
+        if: matrix.suite == 'python'
+        run: |
           umask 022
-          python -m pytest tests/unit tests/integration -q --junitxml="$RUNNER_TEMP/python-tests.xml"
+          python -m pytest tests/integration/test_update_chain.py -q --junitxml="$RUNNER_TEMP/update-chain-tests.xml" --durations=10
+      - name: Summarize update-chain test failures
+        if: failure() && matrix.suite == 'python'
+        run: python scripts/ci_test_summary.py "$RUNNER_TEMP/update-chain-tests.xml"
+      - name: Run Python tests including native installation and recovery
+        if: matrix.suite == 'python'
+        run: |
+          umask 022
+          python -m pytest tests/unit tests/integration -q --junitxml="$RUNNER_TEMP/python-tests.xml" --ignore=tests/integration/test_update_chain.py --durations=10
       - name: Summarize Python test failures
-        if: failure()
+        if: failure() && matrix.suite == 'python'
         run: python scripts/ci_test_summary.py "$RUNNER_TEMP/python-tests.xml"
-      - run: node --test tests/js/*.test.mjs
+      - name: Run JavaScript tests
+        if: matrix.suite == 'python'
+        run: node --test tests/js/*.test.mjs
       - name: Install Playwright browsers and Linux dependencies
-        if: runner.os == 'Linux'
+        if: matrix.suite == 'browser' && runner.os == 'Linux'
         run: python -m playwright install --with-deps chromium webkit
       - name: Install Playwright browsers on macOS
-        if: runner.os == 'macOS'
+        if: matrix.suite == 'browser' && runner.os == 'macOS'
         run: python -m playwright install chromium webkit
-      - run: |
+      - name: Run browser tests
+        if: matrix.suite == 'browser'
+        run: |
           umask 022
-          python -m pytest tests/browser -q --junitxml="$RUNNER_TEMP/browser-tests.xml"
+          python -m pytest tests/browser -q --junitxml="$RUNNER_TEMP/browser-tests.xml" --durations=10
       - name: Summarize browser test failures
-        if: failure()
+        if: failure() && matrix.suite == 'browser'
         run: python scripts/ci_test_summary.py "$RUNNER_TEMP/browser-tests.xml"
       - name: Run privacy gates
+        if: matrix.suite == 'python'
         shell: bash
         env:
           EXPECTED_REMOTE: ${{ github.server_url }}/${{ github.repository }}
@@ -118,6 +141,7 @@ jobs:
           python scripts/privacy_scan.py archive "dist/arxiv_digest-${ARXIV_DIGEST_VERSION}.tar.gz"
           python scripts/privacy_scan.py archive "dist/arxiv_digest-${ARXIV_DIGEST_VERSION}-py3-none-any.whl"
       - name: Smoke-test the wheel through pipx
+        if: matrix.suite == 'python'
         shell: bash
         run: |
           set -euo pipefail

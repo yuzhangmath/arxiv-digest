@@ -88,9 +88,14 @@ hand-authored eligibility record or a mocked installation is not that evidence.
 
 Both macOS and Linux native installation/recovery results are required before
 release, using Python 3.11 and the current Python release on each platform.
-The release workflow builds one candidate bundle, then all four native jobs
-validate that bundle at its verified source commit. Publication depends on
-every native job succeeding. Report unavailable native coverage explicitly.
+The release workflow builds one candidate bundle, then runs Python and browser
+validation in separate concurrent jobs for each OS/Python combination. All eight
+native jobs validate that bundle at its verified source commit, and publication
+depends on every job succeeding. Each browser job covers Chromium and WebKit.
+Python jobs run the update-chain integration file first for prompt failure
+feedback, then exclude that file from the remaining unit/integration run so every
+test still runs once. Both suites report their ten slowest tests.
+Report unavailable native coverage explicitly.
 Passing mocked platform branches does not establish native platform readiness.
 
 Follow the maintained workflows in `.github/workflows/` for the single isolated

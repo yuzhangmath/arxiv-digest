@@ -50,15 +50,16 @@ def test_workflows_preserve_pytest_failure_and_only_summarize_failed_jobs() -> N
     for name in ("tests.yml", "release.yml"):
         workflow = (root / ".github/workflows" / name).read_text()
         assert "continue-on-error:" not in workflow
-        for label, tests, report in (
-            ("Python", "tests/unit tests/integration", "python-tests.xml"),
-            ("browser", "tests/browser", "browser-tests.xml"),
+        for label, tests, report, suite_name in (
+            ("update-chain", "tests/integration/test_update_chain.py", "update-chain-tests.xml", "python"),
+            ("Python", "tests/unit tests/integration", "python-tests.xml", "python"),
+            ("browser", "tests/browser", "browser-tests.xml", "browser"),
         ):
             command = f'python -m pytest {tests} -q --junitxml="$RUNNER_TEMP/{report}"'
             assert command in workflow
             assert (
                 f"      - name: Summarize {label} test failures\n"
-                "        if: failure()\n"
+                f"        if: failure() && matrix.suite == '{suite_name}'\n"
                 f'        run: python scripts/ci_test_summary.py "$RUNNER_TEMP/{report}"\n'
             ) in workflow
             suite = workflow.index(command)

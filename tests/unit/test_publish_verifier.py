@@ -170,6 +170,7 @@ def test_publication_requires_native_matrix_for_the_exact_build_candidate():
     assert "    needs: build\n" in validation
     assert "        os: [ubuntu-24.04, macos-latest]\n" in validation
     assert '        python: ["3.11", "3.x"]\n' in validation
+    assert '        suite: [python, browser]\n' in validation
     assert "      fail-fast: false\n" in validation
     assert "    runs-on: ${{ matrix.os }}\n" in validation
     assert "          python-version: ${{ matrix.python }}\n" in validation
@@ -211,3 +212,53 @@ def test_publication_requires_native_matrix_for_the_exact_build_candidate():
     assert 'python -m pipx install "$wheel"' in validation
     assert "git diff --exit-code" in validation
     assert "git diff --cached --exit-code" in validation
+
+
+@pytest.mark.parametrize("name,job_name", [("tests.yml", "test"), ("release.yml", "native_validation")])
+def test_native_validation_runs_both_suites_independently_without_reducing_coverage(name, job_name):
+    workflow = (ROOT / ".github/workflows" / name).read_text()
+    jobs = dict(re.findall(
+        r"^  ([a-z_]+):\n(.*?)(?=^  [a-z_]+:\n|\Z)",
+        workflow.split("jobs:\n", 1)[1], re.MULTILINE | re.DOTALL,
+    ))
+    job = jobs[job_name]
+    assert "        os: [ubuntu-24.04, macos-latest]\n" in job
+    assert '        python: ["3.11", "3.x"]\n' in job
+    assert "        suite: [python, browser]\n" in job
+    assert "exclude:" not in job and "include:" not in job
+    assert "continue-on-error:" not in job
+    assert "      fail-fast: false\n" in job
+    assert "${{ matrix.suite }}" in job.split("    steps:\n", 1)[0]
+    steps = dict(re.findall(r"^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", job, re.MULTILINE | re.DOTALL))
+    for step in ("Set up Node.js", "Run update-chain tests for early native feedback",
+                 "Run Python tests including native installation and recovery", "Run JavaScript tests"):
+        assert "        if: matrix.suite == 'python'\n" in steps[step]
+    assert "        if: matrix.suite == 'browser'\n" in steps["Run browser tests"]
+    for platform in ("Linux", "macOS"):
+        step = "Install Playwright browsers and Linux dependencies" if platform == "Linux" else "Install Playwright browsers on macOS"
+        assert f"        if: matrix.suite == 'browser' && runner.os == '{platform}'\n" in steps[step]
+    for suite, label in (("python", "update-chain"), ("python", "Python"), ("browser", "browser")):
+        assert f"        if: failure() && matrix.suite == '{suite}'\n" in steps[f"Summarize {label} test failures"]
+    for step in ("Run update-chain tests for early native feedback",
+                 "Run Python tests including native installation and recovery", "Run browser tests"):
+        assert "--durations=10" in steps[step]
+    first = steps["Run update-chain tests for early native feedback"]
+    remaining = steps["Run Python tests including native installation and recovery"]
+    assert 'python -m pytest tests/integration/test_update_chain.py -q --junitxml="$RUNNER_TEMP/update-chain-tests.xml"' in first
+    assert "--ignore=tests/integration/test_update_chain.py" in remaining
+    assert job.count("--ignore=") == 1
+    assert job.index("      - name: Run update-chain tests for early native feedback\n") < job.index(
+        "      - name: Summarize update-chain test failures\n"
+    ) < job.index("      - name: Run Python tests including native installation and recovery\n")
+    smoke = "Smoke-test the wheel through pipx" if name == "tests.yml" else "Smoke-test the candidate wheel through pipx"
+    assert "        if: matrix.suite == 'python'\n" in steps[smoke]
+    if name == "tests.yml":
+        assert "        if: matrix.suite == 'python'\n" in steps["Run privacy gates"]
+        common = ("Resolve canonical application version", "Verify the local release bundle",
+                  "Confirm verification did not alter tracked source")
+    else:
+        common = ("Check out the built commit and historical upgrade tags", "Download the single build candidate",
+                  "Verify candidate source and historical upgrade identity", "Install the candidate wheel and development dependencies",
+                  "Verify downloaded candidate bytes and source resources", "Confirm validation preserved candidate bytes and tracked source")
+    for step in common:
+        assert "        if:" not in steps[step]
