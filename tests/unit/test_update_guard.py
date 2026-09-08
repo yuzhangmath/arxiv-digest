@@ -1,18 +1,41 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import pytest
 
-from arxiv_digest.update_runtime import guard
+from arxiv_digest.update_runtime import guard, recovery
 from tests.update_protocol_factory import plan_record
 
 
-def test_guard_uses_exact_offline_argv_and_sanitized_private_environment(tmp_path, monkeypatch):
+def installation_plan(tmp_path, *, alias_directory=None, metadata_change=None):
+    from tests.update_installation_factory import synthetic_pipx_installation
+
+    fixture = synthetic_pipx_installation(tmp_path / "installation")
+    selector = fixture.base_interpreter
+    if alias_directory is not None:
+        parent = fixture.base_interpreter.parent if alias_directory == "same" else tmp_path / "alias"
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        selector = parent / "python-alias"
+        selector.symlink_to(fixture.base_interpreter)
+    path = fixture.venv / "pipx_metadata.json"
+    metadata = json.loads(path.read_bytes())
+    metadata["source_interpreter"]["__Path__"] = str(selector)
+    if metadata_change is not None:
+        metadata_change(metadata)
+    path.write_text(json.dumps(metadata))
+    token = recovery.capture_installation_token(fixture.venv, fixture.exposed_command,
+        fixture.base_interpreter, allowed_external_symlinks={"bin/python": str(fixture.base_interpreter)})
     root = tmp_path / "recovery"
     root.mkdir(mode=0o700)
-    plan = plan_record(root)
+    return fixture, selector, plan_record(root, old_token=token)
+
+
+def test_guard_uses_exact_offline_argv_and_sanitized_private_environment(tmp_path, monkeypatch):
+    _, _, plan = installation_plan(tmp_path)
+    root = Path(plan["paths"]["recovery_root"])
     monkeypatch.setenv("PIP_INDEX_URL", "https://untrusted.invalid/simple")
     monkeypatch.setenv("PYTHONPATH", "/untrusted/modules")
     command = guard.install_argv(plan)
@@ -22,6 +45,67 @@ def test_guard_uses_exact_offline_argv_and_sanitized_private_environment(tmp_pat
     assert environment["PIP_NO_INDEX"] == "1"
     assert environment["PIPX_HOME"] == plan["paths"]["pipx_home"]
     assert Path(environment["HOME"]).is_relative_to(root)
+
+
+@pytest.mark.parametrize("alias_directory", ["same", "different"])
+def test_guard_retains_authenticated_original_interpreter_selector(tmp_path, alias_directory):
+    fixture, selector, plan = installation_plan(tmp_path, alias_directory=alias_directory)
+    argv = guard.install_argv(plan)
+    assert argv[argv.index("--python") + 1] == str(selector)
+    assert plan["paths"]["base_interpreter"] == str(fixture.base_interpreter)
+
+
+@pytest.mark.parametrize("change", ["metadata", "mode", "wrong_target", "unsafe_parent", "base_bytes"])
+def test_guard_refuses_changed_interpreter_selection_evidence(tmp_path, change):
+    fixture, selector, plan = installation_plan(tmp_path, alias_directory="different")
+    metadata = fixture.venv / "pipx_metadata.json"
+    if change == "metadata":
+        metadata.write_bytes(metadata.read_bytes() + b"\n")
+    elif change == "mode":
+        metadata.chmod(0o644 if metadata.stat().st_mode & 0o777 == 0o600 else 0o600)
+    elif change == "wrong_target":
+        different = selector.parent / "different-python"
+        different.write_bytes(fixture.base_interpreter.read_bytes())
+        different.chmod(0o700)
+        selector.unlink()
+        selector.symlink_to(different)
+    elif change == "unsafe_parent":
+        selector.parent.chmod(0o777)
+    else:
+        fixture.base_interpreter.write_bytes(b"#!/bin/sh\nexit 1\n")
+    with pytest.raises((guard.GuardError, recovery.SnapshotError)):
+        guard.install_argv(plan)
+
+
+@pytest.mark.parametrize("wire", [
+    {"__type__": "Unexpected", "__Path__": "/synthetic/python"},
+    {"__type__": "Path", "__Path__": "/synthetic/../python"},
+    {"__type__": "Path", "__Path__": "relative/python"},
+])
+def test_guard_refuses_invalid_authenticated_interpreter_wire(tmp_path, wire):
+    _, _, plan = installation_plan(tmp_path,
+        metadata_change=lambda metadata: metadata.update(source_interpreter=wire))
+    with pytest.raises((guard.GuardError, recovery.SnapshotError, ValueError)):
+        guard.install_argv(plan)
+
+
+def test_guard_refuses_interpreter_link_replaced_during_resolution(tmp_path, monkeypatch):
+    fixture, selector, plan = installation_plan(tmp_path, alias_directory="different")
+    original = Path.resolve
+    replaced = False
+
+    def replace_link(path, *args, **kwargs):
+        nonlocal replaced
+        resolved = original(path, *args, **kwargs)
+        if path == selector and not replaced:
+            replaced = True
+            selector.unlink()
+            selector.symlink_to(fixture.base_interpreter)
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", replace_link)
+    with pytest.raises((guard.GuardError, recovery.SnapshotError)):
+        guard.install_argv(plan)
 
 
 @pytest.mark.parametrize("kind", ["populated", "symlink", "writable", "file"])

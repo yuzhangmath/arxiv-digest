@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import fcntl
+import hashlib
+import json
 import selectors
 import signal
 import socket
@@ -42,9 +44,60 @@ def require_empty_safe_trash(path):
         os.close(fd)
 
 
+def _installation_interpreter(plan):
+    """Retain pipx's original selector without changing the verified executable.
+
+    Pinned pipx recreates venv configuration even for ``install --force``.
+    Replacing an admitted interpreter alias with its resolved path can therefore
+    change nonapplication files. The old inventory authenticates the selector;
+    its current resolution must still identify the exact retained interpreter.
+    """
+    old = plan["old_token"]["core"]
+    entries = [entry for entry in old["inventory"]["entries"]
+               if entry["path"] == "pipx_metadata.json" and entry["kind"] == "file"]
+    if len(entries) != 1:
+        raise GuardError("old installation lacks authenticated pipx metadata")
+    payload, identity = recovery.read_owned_bytes(Path(plan["paths"]["environment"]) / "pipx_metadata.json")
+    if entries[0] != {"kind": "file", "path": "pipx_metadata.json", "mode": identity["mode"],
+                      "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}:
+        raise GuardError("original pipx metadata changed")
+    try:
+        metadata = json.loads(payload)
+        wire = metadata["source_interpreter"]
+        if type(wire) is not dict or set(wire) != {"__type__", "__Path__"} or wire["__type__"] != "Path":
+            raise GuardError("original interpreter selector is invalid")
+        selector = Path(protocol.validate_path(wire["__Path__"]))
+    except (KeyError, TypeError, ValueError, RecursionError) as error:
+        raise GuardError("original interpreter selector is invalid") from error
+
+    parent_before = selector.parent.lstat()
+    recovery._check(parent_before, kind="directory", allow_root=True)
+    parent = os.open(selector.parent, recovery._flags(True))
+    try:
+        if recovery._stable(os.fstat(parent)) != recovery._stable(parent_before):
+            raise GuardError("interpreter selector parent changed")
+        before = os.stat(selector.name, dir_fd=parent, follow_symlinks=False)
+        is_link = stat.S_ISLNK(before.st_mode)
+        recovery._check(before, kind="symlink" if is_link else "file", allow_root=True)
+        target = os.readlink(selector.name, dir_fd=parent) if is_link else None
+        resolved = selector.resolve(strict=True)
+        if (str(resolved) != plan["paths"]["base_interpreter"]
+                or recovery.capture_executable_identity(resolved) != old["interpreter"]):
+            raise GuardError("original interpreter selector changed executable")
+        if (selector.resolve(strict=True) != resolved
+                or recovery._stable(os.stat(selector.name, dir_fd=parent, follow_symlinks=False)) != recovery._stable(before)
+                or (is_link and os.readlink(selector.name, dir_fd=parent) != target)
+                or recovery._stable(selector.parent.lstat()) != recovery._stable(parent_before)
+                or recovery._stable(os.fstat(parent)) != recovery._stable(parent_before)):
+            raise GuardError("original interpreter selector changed during validation")
+    finally:
+        os.close(parent)
+    return str(selector)
+
+
 def install_argv(plan):
     return (plan["paths"]["pipx"], "install", "--force", "--app", "arxiv-digest",
-            "--python", plan["paths"]["base_interpreter"], "--fetch-python=never",
+            "--python", _installation_interpreter(plan), "--fetch-python=never",
             "--skip-maintenance", "--backend=pip", "--pip-args=--no-deps --no-index",
             plan["target_wheel"]["path"])
 

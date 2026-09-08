@@ -467,3 +467,38 @@ def test_chain_inventory_differences_expose_categories_without_paths_or_configur
 def test_chain_diagnostic_reader_rejects_untrusted_installer_and_inventory_values(tmp_path, record):
     (tmp_path / "update-boundary-errors.jsonl").write_text(json.dumps(record) + "\n")
     assert boundary_error_diagnostics(tmp_path) == "unreadable"
+
+
+def test_real_guard_install_retains_original_interpreter_selector_and_venv_configuration(tmp_path):
+    from arxiv_digest.update_runtime import guard, recovery
+    from tests.update_release_factory import real_release_installation
+
+    fixture = real_release_installation(tmp_path / "interpreter-selector")
+    base = fixture.source_python.resolve()
+    selector = fixture.root / "python-selector" / fixture.source_python.name
+    selector.parent.mkdir(mode=0o700)
+    selector.symlink_to(base)
+    fixture.source_python = selector
+    fixture.add_source_tag("0.3.0")
+    fixture.bootstrap("0.3.0")
+    before = (fixture.venv / "pyvenv.cfg").read_bytes()
+    external = {path.relative_to(fixture.venv).as_posix(): os.readlink(path)
+                for path in (fixture.venv / "bin").iterdir()
+                if path.is_symlink() and path.name.startswith("python") and path.resolve() == base}
+    core = recovery.capture_core_installation_token(fixture.venv, fixture.exposed, base, allowed_external_symlinks=external)
+    target = fixture.write_wheel("0.3.1")
+    plan = {"old_version": "0.3.0", "target_version": "0.3.1", "old_token": {"core": core, "provenance": None},
+        "target_wheel": {"path": str(target)}, "paths": {
+            "environment": str(fixture.venv), "exposed_command": str(fixture.exposed),
+            "base_interpreter": str(base), "pipx": str(fixture.pipx),
+            **{key: fixture.environ[env] for key, env in (
+                ("pipx_home", "PIPX_HOME"), ("pipx_bin_dir", "PIPX_BIN_DIR"),
+                ("pipx_shared_libs", "PIPX_SHARED_LIBS"), ("pipx_man_dir", "PIPX_MAN_DIR"),
+                ("pipx_completion_dir", "PIPX_COMPLETION_DIR"),
+            )},
+        }}
+    fixture.run(guard.install_argv(plan), environ=guard.install_environment(plan))
+    native = json.loads((fixture.venv / "pipx_metadata.json").read_bytes())
+    assert native["source_interpreter"]["__Path__"] == str(selector)
+    assert (fixture.venv / "pyvenv.cfg").read_bytes() == before
+    recovery.validate_target_installation(plan)

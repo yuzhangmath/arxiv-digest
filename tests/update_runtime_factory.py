@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import venv
 from pathlib import Path
@@ -28,7 +29,6 @@ def prepared_runtime(root: Path, *, source_overrides=None, pipx_payload=None):
     (env / "bin").mkdir(mode=0o700)
     (env / "bin/arxiv-digest").write_bytes(b"synthetic old application")
     (env / "bin/arxiv-digest").chmod(0o700)
-    (env / "pipx_metadata.json").write_bytes(b'{"synthetic":true}')
     exposed = root.parent / "bin/arxiv-digest"
     exposed.parent.mkdir(mode=0o700)
     exposed.symlink_to(env / "bin/arxiv-digest")
@@ -36,6 +36,9 @@ def prepared_runtime(root: Path, *, source_overrides=None, pipx_payload=None):
     pipx.write_bytes(pipx_payload or b"#!/bin/sh\nexit 17\n")
     pipx.chmod(0o700)
     interpreter = private_test_interpreter(root.parent / "fixture-interpreter")
+    (env / "pipx_metadata.json").write_text(json.dumps({
+        "synthetic": True, "source_interpreter": {"__type__": "Path", "__Path__": str(interpreter)},
+    }))
     snapshot = root.parent / "pipx/arxiv-digest-update-snapshots" / ("a" * 64)
     snapshot.parent.mkdir(mode=0o700)
     token = recovery.create_snapshot(env, snapshot, exposed, interpreter)
