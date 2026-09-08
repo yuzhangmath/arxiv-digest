@@ -3,11 +3,22 @@ from __future__ import annotations
 
 import hashlib
 import os
-import sys
+import venv
 from pathlib import Path
 
 from arxiv_digest.update_runtime import helper, protocol, recovery
 from tests.update_protocol_factory import plan_record
+
+
+def private_test_interpreter(root: Path) -> Path:
+    """Copy Python into a synthetic venv without trusting host file metadata."""
+    root = root.resolve()
+    root.mkdir(mode=0o700, parents=True)
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(root)
+    interpreter = root / "bin/python"
+    assert not interpreter.is_symlink()
+    recovery.capture_executable_identity(interpreter)
+    return interpreter
 
 
 def prepared_runtime(root: Path, *, source_overrides=None, pipx_payload=None):
@@ -24,7 +35,7 @@ def prepared_runtime(root: Path, *, source_overrides=None, pipx_payload=None):
     pipx = root.parent / "pipx-command"
     pipx.write_bytes(pipx_payload or b"#!/bin/sh\nexit 17\n")
     pipx.chmod(0o700)
-    interpreter = Path(sys.executable).resolve()
+    interpreter = private_test_interpreter(root.parent / "fixture-interpreter")
     snapshot = root.parent / "pipx/arxiv-digest-update-snapshots" / ("a" * 64)
     snapshot.parent.mkdir(mode=0o700)
     token = recovery.create_snapshot(env, snapshot, exposed, interpreter)

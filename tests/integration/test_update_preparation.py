@@ -19,6 +19,7 @@ from tests.unit.test_update_discovery import _eligible_bundle
 from tests.unit.test_update_download import Response
 from tests.unit.test_update_installation import _detect
 from tests.update_installation_factory import synthetic_pipx_installation
+from tests.update_runtime_factory import private_test_interpreter
 from tests.update_wheel_factory import write_valid_wheel
 
 
@@ -26,7 +27,7 @@ def test_production_first_preparation_and_copied_helper_cancel_preserve_data(tmp
     import arxiv_digest.update_download as download
     fixture = synthetic_pipx_installation(tmp_path / "installation")
     fixture.base_interpreter.unlink()
-    fixture.base_interpreter.symlink_to(Path(sys.executable).resolve())
+    fixture.base_interpreter.symlink_to(private_test_interpreter(tmp_path / "fixture-interpreter"))
     fixture.paths = initialized_paths(tmp_path / "application")
     detected = _detect(fixture)
     assert detected.installation is not None, detected.reason

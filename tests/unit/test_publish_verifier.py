@@ -145,6 +145,9 @@ def test_workflows_build_once_verify_manifest_and_preserve_permission_boundary()
         assert "ARXIV_DIGEST_RELEASE_ARTIFACT_DIR" in workflow
         assert "SOURCE_DATE_EPOCH" in workflow
         assert "git diff --exit-code" in workflow and "git diff --cached --exit-code" in workflow
+        assert workflow.count("python scripts/ci_python.py") == 1
+        assert "umask 022\n          python -m pytest tests/unit tests/integration -q" in workflow
+        assert "umask 022\n          python -m pytest tests/browser -q" in workflow
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
     build, publish = workflow.split("  publish:\n", 1)
     assert "contents: write" not in build
@@ -173,6 +176,9 @@ def test_publication_requires_native_matrix_for_the_exact_build_candidate():
     assert "          ref: ${{ needs.build.outputs.commit_sha }}\n" in validation
     assert "          fetch-depth: 0\n" in validation
     assert "          fetch-tags: true\n" in validation
+    assert validation.index("python scripts/ci_python.py") < validation.index(
+        "      - name: Install the candidate wheel and development dependencies\n"
+    )
     for job in (validation, publish):
         assert "          artifact-ids: ${{ needs.build.outputs.artifact_id }}\n" in job
         assert "          digest-mismatch: error\n" in job
@@ -185,7 +191,15 @@ def test_publication_requires_native_matrix_for_the_exact_build_candidate():
     assert "exclude:" not in validation and "include:" not in validation
     assert "python -m build" not in validation
     assert "scripts/release_bundle.py local" in validation
-    assert "ARXIV_DIGEST_RELEASE_ARTIFACT_DIR: ${{ runner.temp }}/release-bundle" in validation
+    assert "runner." not in validation.split("    steps:\n", 1)[0]
+    artifact_environment = (
+        "printf 'ARXIV_DIGEST_RELEASE_ARTIFACT_DIR=%s/release-bundle\\n' "
+        '\"$RUNNER_TEMP\" >> \"$GITHUB_ENV\"'
+    )
+    assert artifact_environment in validation
+    assert validation.index(artifact_environment) < validation.index(
+        "      - name: Install the candidate wheel and development dependencies\n"
+    )
     assert '"$head_commit" == "$EXPECTED_COMMIT"' in validation
     assert 'git rev-parse --verify "refs/tags/v0.2.1^{commit}"' in validation
     assert 'python -m pip install --disable-pip-version-check "$wheel[dev]"' in validation

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import copy
+import sys
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +12,39 @@ import pytest
 from arxiv_digest.update_runtime import helper, protocol, recovery
 from tests.update_protocol_factory import next_record, proposal
 from tests.update_runtime_factory import prepared_runtime
+
+
+@pytest.mark.parametrize("host_metadata", ["group_writable", "hardlinked"])
+def test_prepared_runtime_owns_safe_interpreter_without_changing_host(
+    tmp_path, monkeypatch, host_metadata
+):
+    hosted = tmp_path / "hosted-python"
+    hosted.write_bytes(b"synthetic host executable")
+    hosted.chmod(0o775 if host_metadata == "group_writable" else 0o755)
+    if host_metadata == "hardlinked":
+        os.link(hosted, tmp_path / "hosted-python-alias")
+    before = recovery._stable(hosted.stat())
+    monkeypatch.setattr(sys, "executable", str(hosted))
+
+    with pytest.raises(recovery.SnapshotError, match="unsafe installation object"):
+        recovery.capture_executable_identity(hosted)
+    plan, _, _, locks = prepared_runtime(tmp_path / "recovery")
+    try:
+        interpreter = Path(plan.record["paths"]["base_interpreter"])
+        assert interpreter.is_relative_to(tmp_path)
+        assert interpreter != hosted and not interpreter.is_symlink()
+        assert recovery.capture_executable_identity(interpreter) == (
+            plan.record["old_token"]["core"]["interpreter"]
+        )
+        launched = subprocess.run(
+            (str(interpreter), "-I", "-B", "-c", "import sys; print(sys.executable)"),
+            capture_output=True, check=True, text=True, timeout=10,
+        )
+        assert Path(launched.stdout.strip()).resolve() == interpreter
+        assert recovery._stable(hosted.stat()) == before
+    finally:
+        for lock in locks.values():
+            lock.close()
 
 
 @pytest.fixture

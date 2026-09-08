@@ -27,11 +27,15 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           check-latest: false
+      - name: Prepare private Python for native updater validation
+        run: python scripts/ci_python.py
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.19.0"
           package-manager-cache: false
-      - run: python -m pip install ".[dev]"
+      - run: |
+          umask 022
+          python -m pip install ".[dev]"
       - name: Resolve canonical application version
         shell: bash
         run: |
@@ -80,7 +84,9 @@ jobs:
           (root / "COMMIT_SHA").write_bytes((os.environ["COMMIT_SHA"] + "\n").encode("ascii"))
           PY_BUNDLE
           python scripts/release_bundle.py local --bundle "$BUNDLE" --version "$ARXIV_DIGEST_VERSION" --commit "$COMMIT_SHA"
-      - run: python -m pytest tests/unit tests/integration -q
+      - run: |
+          umask 022
+          python -m pytest tests/unit tests/integration -q
       - run: node --test tests/js/*.test.mjs
       - name: Install Playwright browsers and Linux dependencies
         if: runner.os == 'Linux'
@@ -88,7 +94,9 @@ jobs:
       - name: Install Playwright browsers on macOS
         if: runner.os == 'macOS'
         run: python -m playwright install chromium webkit
-      - run: python -m pytest tests/browser -q
+      - run: |
+          umask 022
+          python -m pytest tests/browser -q
       - name: Run privacy gates
         shell: bash
         env:
@@ -107,6 +115,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 022
           mkdir -p "${{ runner.temp }}/pipx-bin" "${{ runner.temp }}/unrelated"
           cd "${{ runner.temp }}/unrelated"
           PIPX_HOME="${{ runner.temp }}/pipx-home" PIPX_BIN_DIR="${{ runner.temp }}/pipx-bin" python -m pipx install "${{ github.workspace }}/dist/arxiv_digest-${ARXIV_DIGEST_VERSION}-py3-none-any.whl"

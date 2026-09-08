@@ -184,7 +184,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
-      ARXIV_DIGEST_RELEASE_ARTIFACT_DIR: ${{ runner.temp }}/release-bundle
       EXPECTED_COMMIT: ${{ needs.build.outputs.commit_sha }}
       VERSION: ${{ needs.build.outputs.version }}
 
@@ -202,6 +201,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           check-latest: false
+
+      - name: Prepare private Python for native updater validation
+        run: python scripts/ci_python.py
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -227,11 +229,13 @@ jobs:
           PYTHONPATH=src python scripts/release_check.py --tag="v${VERSION}"
           source_date_epoch="$(git show -s --format=%ct "$head_commit")"
           printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+          printf 'ARXIV_DIGEST_RELEASE_ARTIFACT_DIR=%s/release-bundle\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Install the candidate wheel and development dependencies
         shell: bash
         run: |
           set -euo pipefail
+          umask 022
           wheel="${ARXIV_DIGEST_RELEASE_ARTIFACT_DIR}/arxiv_digest-${VERSION}-py3-none-any.whl"
           python -m pip install --disable-pip-version-check "$wheel[dev]"
 
@@ -242,7 +246,9 @@ jobs:
           python scripts/release_bundle.py local --bundle "$ARXIV_DIGEST_RELEASE_ARTIFACT_DIR" --version "$VERSION" --commit "$EXPECTED_COMMIT"
 
       - name: Run Python tests including native installation and recovery
-        run: python -m pytest tests/unit tests/integration -q
+        run: |
+          umask 022
+          python -m pytest tests/unit tests/integration -q
 
       - name: Run JavaScript tests
         run: node --test tests/js/*.test.mjs
@@ -256,12 +262,15 @@ jobs:
         run: python -m playwright install chromium webkit
 
       - name: Run browser tests
-        run: python -m pytest tests/browser -q
+        run: |
+          umask 022
+          python -m pytest tests/browser -q
 
       - name: Smoke-test the candidate wheel through pipx
         shell: bash
         run: |
           set -euo pipefail
+          umask 022
           wheel="${ARXIV_DIGEST_RELEASE_ARTIFACT_DIR}/arxiv_digest-${VERSION}-py3-none-any.whl"
           mkdir -p \
             "${RUNNER_TEMP}/pipx-home" \
