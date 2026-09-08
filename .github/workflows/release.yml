@@ -248,7 +248,11 @@ jobs:
       - name: Run Python tests including native installation and recovery
         run: |
           umask 022
-          python -m pytest tests/unit tests/integration -q
+          python -m pytest tests/unit tests/integration -q --junitxml="$RUNNER_TEMP/python-tests.xml"
+
+      - name: Summarize Python test failures
+        if: failure()
+        run: python scripts/ci_test_summary.py "$RUNNER_TEMP/python-tests.xml"
 
       - name: Run JavaScript tests
         run: node --test tests/js/*.test.mjs
@@ -264,7 +268,11 @@ jobs:
       - name: Run browser tests
         run: |
           umask 022
-          python -m pytest tests/browser -q
+          python -m pytest tests/browser -q --junitxml="$RUNNER_TEMP/browser-tests.xml"
+
+      - name: Summarize browser test failures
+        if: failure()
+        run: python scripts/ci_test_summary.py "$RUNNER_TEMP/browser-tests.xml"
 
       - name: Smoke-test the candidate wheel through pipx
         shell: bash

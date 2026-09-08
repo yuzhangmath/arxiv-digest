@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import struct
 import warnings
@@ -1012,11 +1013,24 @@ def test_wheel_size_is_rejected_before_archive_parsing(
         update_manifest.inspect_update_wheel(valid_wheel)
 
 
+@pytest.mark.parametrize("implicit_zip_tail_read", [False, True])
 def test_wheel_hashing_uses_only_bounded_reads(
     valid_wheel: Path,
     monkeypatch: pytest.MonkeyPatch,
+    implicit_zip_tail_read: bool,
 ) -> None:
     from arxiv_digest import update_manifest
+
+    if implicit_zip_tail_read:
+        real_end_record = zipfile._EndRecData
+
+        def legacy_end_record(stream):
+            # Older supported CPython reads the fixed EOCD tail to EOF.
+            stream.seek(-zipfile.sizeEndCentDir, os.SEEK_END)
+            assert len(stream.read()) == zipfile.sizeEndCentDir
+            return real_end_record(stream)
+
+        monkeypatch.setattr(zipfile, "_EndRecData", legacy_end_record)
 
     real_fdopen = update_manifest.os.fdopen
     read_sizes: list[int] = []
@@ -1042,7 +1056,15 @@ def test_wheel_hashing_uses_only_bounded_reads(
     def observed_fdopen(descriptor: int, mode: str, **options: object) -> ObservedFile:
         return ObservedFile(real_fdopen(descriptor, mode, **options))
 
+    real_open_archive = update_manifest._open_wheel_archive
+
+    def open_archive(wheel_file: ObservedFile):
+        # Observe application reads, including preflight and local headers.
+        # ZipFile may read to EOF after seeking to a bounded footer.
+        return real_open_archive(wheel_file._wrapped)
+
     monkeypatch.setattr(update_manifest.os, "fdopen", observed_fdopen)
+    monkeypatch.setattr(update_manifest, "_open_wheel_archive", open_archive)
 
     assert update_manifest.inspect_update_wheel(valid_wheel).version == "0.3.0"
     assert read_sizes
