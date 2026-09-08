@@ -564,6 +564,13 @@ def test_api_v1_route_surface_is_exact() -> None:
     assert API_ROUTE_SURFACE == frozenset(
         {
             ("GET", "/api/v1/status"),
+            ("GET", "/api/v1/update"),
+            ("POST", "/api/v1/update/start"),
+            ("GET", "/api/v1/update/jobs/{job_id}"),
+            ("POST", "/api/v1/update/jobs/{job_id}/commit"),
+            ("POST", "/api/v1/update/jobs/{job_id}/handoff-ack"),
+            ("GET", "/api/v1/update/receipt"),
+            ("POST", "/api/v1/update/receipt/{receipt_id}/ack"),
             ("GET", "/api/v1/categories"),
             ("GET", "/api/v1/setup/draft"),
             ("PUT", "/api/v1/setup/draft"),
@@ -835,7 +842,12 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
         SourceObservation,
         VersionResolution,
     )
-    from arxiv_digest.ranking import RankedPaper, RankingReason, RankingTier
+    from arxiv_digest.ranking import (
+        RankedPaper,
+        RankingReason,
+        RankingReference,
+        RankingTier,
+    )
     from arxiv_digest.review import ReviewPage
     from arxiv_digest.web.api import ReviewPagePayload, project_review_page
 
@@ -879,7 +891,15 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
         paper=paper,
         tier=RankingTier.TOP,
         score=4.5,
-        reasons=(RankingReason("author", "Matched Aster Vale", "authors"),),
+        reasons=(
+            RankingReason("author", "Matched Aster Vale", "authors"),
+            RankingReason(
+                "seed_similarity",
+                "Related to selected seed paper",
+                None,
+                RankingReference("2501.00001", "Named seed paper"),
+            ),
+        ),
     )
     page = ReviewPage(
         day=day,
@@ -932,7 +952,20 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
             "tier": "top",
             "score": 4.5,
             "reasons": [
-                {"kind": "author", "label": "Matched Aster Vale", "location": "authors"}
+                {
+                    "kind": "author",
+                    "label": "Matched Aster Vale",
+                    "location": "authors",
+                },
+                {
+                    "kind": "seed_similarity",
+                    "label": "Related to selected seed paper",
+                    "location": None,
+                    "reference": {
+                        "arxiv_id": "2501.00001",
+                        "title": "Named seed paper",
+                    },
+                },
             ],
         }
     ]
@@ -1061,7 +1094,7 @@ def test_setup_draft_projection_uses_a_read_only_home_relative_destination_path(
 
     seed = SimpleNamespace(
         paper=SimpleNamespace(
-            arxiv_id="2205.13427",
+            arxiv_id="2608.49003",
             title="A titled seed paper",
         )
     )
@@ -1107,10 +1140,10 @@ def test_setup_draft_projection_uses_a_read_only_home_relative_destination_path(
     assert projected["recommended_coverage_start"] == "2026-07-23"
     assert projected["coverage_min"] == "2026-05-25"
     assert projected["coverage_max"] == "2026-08-22"
-    assert projected["seed_papers"] == ["2205.13427"]
+    assert projected["seed_papers"] == ["2608.49003"]
     assert projected["profile_summary"]["seed_paper_details"] == [
         {
-            "arxiv_id": "2205.13427",
+            "arxiv_id": "2608.49003",
             "title": "A titled seed paper",
         }
     ]
@@ -1231,6 +1264,19 @@ def test_default_service_graph_accepts_the_revision_zero_categories_step(
         assert runtime.setup.load_draft().revision == 1
     finally:
         connection.close()
+
+
+def test_application_quit_handler_adapts_shutdown_acceptance_to_api_payload() -> None:
+    from arxiv_digest.application import _DefaultRuntime
+    from arxiv_digest.update_contract import ShutdownIntent
+    from arxiv_digest.web.lifecycle import LifecycleController
+
+    runtime = object.__new__(_DefaultRuntime)
+    runtime.store = object()
+    runtime.lifecycle = LifecycleController()
+
+    assert runtime.handlers()["application_quit"]({}) == {"quitting": True}
+    assert runtime.lifecycle.shutdown_intent is ShutdownIntent.QUIT
 
 
 def test_oai_set_specs_map_to_categories_without_changing_exact_pairs() -> None:
@@ -1463,6 +1509,7 @@ def test_browser_backup_inspection_bounds_concurrent_pending_archives(
     from arxiv_digest.application import _DefaultRuntime
 
     runtime = object.__new__(_DefaultRuntime)
+    runtime.maintenance = application.MaintenanceBarrier()
     runtime.paths = SimpleNamespace(cache_dir=tmp_path)
     runtime._pending_restores_lock = threading.RLock()
     runtime._restore_cleanup_timer = None
@@ -1523,6 +1570,7 @@ def test_browser_backup_inspection_bounds_total_pending_archive_bytes(
     from arxiv_digest.application import _DefaultRuntime
 
     runtime = object.__new__(_DefaultRuntime)
+    runtime.maintenance = application.MaintenanceBarrier()
     runtime.paths = SimpleNamespace(cache_dir=tmp_path)
     runtime._pending_restores_lock = threading.RLock()
     runtime._restore_cleanup_timer = None
@@ -1560,6 +1608,7 @@ def test_browser_backup_inspection_bounds_total_pending_archive_bytes(
 
 def test_runtime_shutdown_removes_pending_backup_uploads(tmp_path) -> None:
     from arxiv_digest.application import _DefaultRuntime
+    from arxiv_digest.maintenance import MaintenanceBarrier
 
     archive = tmp_path / ".arxiv-digest-restore-pending.zip"
     archive.write_bytes(b"sensitive portable backup")
@@ -1567,6 +1616,7 @@ def test_runtime_shutdown_removes_pending_backup_uploads(tmp_path) -> None:
     timer = SimpleNamespace(cancelled=False)
     timer.cancel = lambda: setattr(timer, "cancelled", True)
     runtime = object.__new__(_DefaultRuntime)
+    runtime.maintenance = MaintenanceBarrier()
     runtime._pending_restores_lock = threading.RLock()
     runtime._restore_shutdown = False
     runtime._pending_restore_reservations = {}
@@ -2367,3 +2417,102 @@ def test_runtime_projects_durable_mailing_evidence_into_candidate_documents() ->
         date(2026, 8, 21),
     )
     assert documents[1].eligible_categories == ("cs.LG",)
+
+
+def test_update_latch_rejects_reads_mutations_and_unknown_routes_before_handlers() -> None:
+    from arxiv_digest.maintenance import MaintenanceBarrier
+    from arxiv_digest.web.api import ApiRouter
+
+    barrier = MaintenanceBarrier()
+    calls = []
+    router = ApiRouter(
+        token=TOKEN, host=HOST, maintenance=barrier,
+        handlers={
+            "settings_get": lambda payload: calls.append("settings"),
+            "backup_export": lambda payload: calls.append("backup"),
+            "library_save": lambda payload: calls.append("save"),
+        },
+        known_paper=lambda arxiv_id: calls.append("known-paper") or True,
+    )
+    requests = (
+        _request("GET", "/api/v1/settings"),
+        _request("GET", "/api/v1/backup/export"),
+        _request("GET", "/api/v1/not-a-route"),
+        _request("POST", "/api/v1/library/2501.00001/save", origin=ORIGIN),
+        _request("POST", "/api/v1/application/quit", origin=ORIGIN),
+    )
+    with barrier.update_latch():
+        for request in requests:
+            response = router.dispatch(request)
+            assert response.status == 409
+            assert _json(response)["error"]["code"] == "update_in_progress"
+        # Authority checks still take precedence over maintenance state.
+        assert router.dispatch(_request("GET", "/api/v1/settings", token=None)).status == 401
+    assert calls == []
+
+
+def test_update_latch_admission_is_rechecked_after_http_preflight() -> None:
+    from arxiv_digest.maintenance import MaintenanceBarrier
+    from arxiv_digest.web.api import ApiRouter
+
+    barrier = MaintenanceBarrier()
+    calls = []
+    router = ApiRouter(
+        token=TOKEN, host=HOST, maintenance=barrier,
+        handlers={"settings_get": lambda payload: calls.append("settings")},
+    )
+    request = _request("GET", "/api/v1/settings")
+    assert router.preflight(request) is None
+    with barrier.update_latch():
+        response = router.dispatch(request)
+        assert response.status == 409
+    assert calls == []
+
+
+def test_update_latch_allows_cached_control_and_guarded_failure_quit() -> None:
+    from arxiv_digest.maintenance import MaintenanceBarrier
+    from arxiv_digest.web.api import ApiRouter
+
+    barrier = MaintenanceBarrier()
+    allow_quit = False
+    router = ApiRouter(
+        token=TOKEN, host=HOST, maintenance=barrier,
+        allow_update_quit=lambda: allow_quit,
+        handlers={
+            "status": lambda payload: {"startup_nonce": "cached-fixture"},
+            "update": lambda payload: {"status": "preparing"},
+            "application_quit": lambda payload: {"quitting": True},
+        },
+    )
+    with barrier.update_latch():
+        with barrier.exclusive(timeout=0):
+            assert router.dispatch(_request("GET", "/api/v1/status")).status == 200
+            assert router.dispatch(_request("GET", "/api/v1/update")).status == 200
+            allow_quit = True
+            assert router.dispatch(_request("POST", "/api/v1/application/quit", origin=ORIGIN)).status == 200
+
+
+def test_update_control_routes_have_closed_bodies_canonical_ids_and_accepted_status() -> None:
+    from arxiv_digest.web.api import ApiRouter, JsonPayload
+
+    identifier = "a" * 64
+    calls = []
+    def start(payload):
+        calls.append(payload)
+        return JsonPayload(202, {"job_id": identifier, "state": "running", "phase": "downloading"})
+    router = ApiRouter(token=TOKEN, host=HOST, handlers={"update_start": start})
+    response = router.dispatch(_request("POST", "/api/v1/update/start", origin=ORIGIN,
+        body=b'{"target_version":"0.3.1"}', content_type="application/json"))
+    assert response.status == 202
+    assert _json(response)["data"]["job_id"] == identifier
+    for body in (b'{"target_version":"01.3.1"}', b'{"target_version":"0.3.1","url":"x"}'):
+        assert router.dispatch(_request("POST", "/api/v1/update/start", origin=ORIGIN,
+            body=body, content_type="application/json")).status == 400
+    assert calls == [{"target_version": "0.3.1"}]
+    for path in (f"/api/v1/update/jobs/{identifier}", f"/api/v1/update/jobs/{identifier}/commit",
+        f"/api/v1/update/jobs/{identifier}/handoff-ack", "/api/v1/update/receipt",
+        f"/api/v1/update/receipt/{identifier}/ack"):
+        method = "GET" if path.endswith(identifier) or path.endswith("receipt") else "POST"
+        assert router.dispatch(_request(method, path, origin=ORIGIN, body=b'{}' if method == "POST" else b'',
+            content_type="application/json")).status == 503
+    assert router.dispatch(_request("GET", "/api/v1/update/jobs/" + "A" * 64)).status == 404

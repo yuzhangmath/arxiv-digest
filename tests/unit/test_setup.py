@@ -106,6 +106,62 @@ def test_desktop_launcher_prompt_and_actions_are_exact_and_unselected() -> None:
     assert NOT_NOW_LABEL == "Not now"
 
 
+def test_pending_setup_launcher_obeys_the_same_transition_guard_and_can_retry(
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.desktop_launcher import (
+        DesktopLauncherManager,
+        LauncherState,
+        launcher_operation_guard,
+    )
+    from arxiv_digest.paths import resolve_paths
+    from arxiv_digest.update_locks import acquire_exclusive
+
+    paths = resolve_paths(
+        platform="linux",
+        home=tmp_path,
+        environ={
+            "ARXIV_DIGEST_TESTING": "1",
+            "ARXIV_DIGEST_TEST_ROOT": str(tmp_path / "application"),
+        },
+    )
+    paths.ensure()
+    paths.ensure_update_coordination()
+    connection = open_database(paths.database_path)
+    connection.execute(
+        "UPDATE application_settings SET launcher_operation = 'create_failed', "
+        "launcher_last_error_code = 'launcher_io_error' WHERE singleton = 1"
+    )
+    connection.commit()
+    connection.close()
+    executable = tmp_path / "arxiv-digest"
+    executable.write_bytes(b"synthetic executable")
+    manager = DesktopLauncherManager(
+        platform="linux",
+        home=tmp_path,
+        executable=executable,
+        operation_guard=lambda: launcher_operation_guard(paths, timeout=0.01),
+    )
+    service = SetupService(
+        paths.database_path,
+        ProfileRepository(paths.profile_path, paths.profile_lock_path),
+        launcher_manager=manager,
+    )
+    owner = acquire_exclusive(paths.update_transition_lock_path, timeout=0)
+    try:
+        blocked = service.retry_launcher()
+        assert blocked.operation == "create_failed"
+        assert blocked.error_code == "launcher_io_error"
+        assert not manager.target.exists()
+    finally:
+        owner.release()
+
+    retried = service.retry_launcher()
+    assert retried.operation == "none"
+    assert retried.error_code is None
+    assert manager.status().state is LauncherState.INSTALLED
+
+
 def test_draft_decoder_rejects_invalid_payload_types(tmp_path: Path) -> None:
     database_path = tmp_path / "state.sqlite3"
     open_database(database_path).close()

@@ -526,3 +526,43 @@ def test_default_application_starts_once_from_an_unrelated_directory(
     assert launch.fragment.endswith("&view=setup")
     assert (root / "data/state.sqlite3").is_file()
     assert not (root / "data/runtime.json").exists()
+
+
+def test_server_stop_waits_for_admitted_handler_completion() -> None:
+    from arxiv_digest.web.server import LoopbackServer
+
+    entered = Event()
+    release = Event()
+    stopped = Event()
+    responses = []
+    def status(_payload):
+        entered.set()
+        assert release.wait(2)
+        return {"finished": True}
+    server = LoopbackServer(handlers={"status": status})
+    server.start()
+    def request():
+        connection = http.client.HTTPConnection(server.host, server.port, timeout=3)
+        connection.request("GET", "/api/v1/status", headers={
+            "Host": f"{server.host}:{server.port}",
+            "Authorization": f"Bearer {server.token}",
+        })
+        response = connection.getresponse()
+        responses.append(json.loads(response.read())["data"])
+        connection.close()
+    requester = Thread(target=request)
+    requester.start()
+    assert entered.wait(2)
+    def stop():
+        server.stop()
+        stopped.set()
+    stopper = Thread(target=stop)
+    stopper.start()
+    try:
+        assert not stopped.wait(0.6)
+    finally:
+        release.set()
+        requester.join(3)
+        stopper.join(3)
+    assert stopped.is_set()
+    assert responses == [{"finished": True, "startup_nonce": server.startup_nonce}]

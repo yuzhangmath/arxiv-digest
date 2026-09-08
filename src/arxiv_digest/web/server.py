@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +13,7 @@ from socket import SHUT_RDWR, socket
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+from arxiv_digest.maintenance import MaintenanceBarrier
 from arxiv_digest.web.api import (
     BACKUP_BODY_LIMIT,
     ApiRequest,
@@ -72,6 +74,8 @@ class _DashboardHttpServer(ThreadingHTTPServer):
         self._request_slots = threading.BoundedSemaphore(max_request_threads)
         self._deadline_lock = threading.Lock()
         self._input_deadlines: dict[socket, threading.Timer] = {}
+        self._request_condition = threading.Condition()
+        self._active_requests = 0
         super().__init__(server_address, request_handler)
 
     def _expire_request_input(self, request: socket) -> None:
@@ -113,13 +117,31 @@ class _DashboardHttpServer(ThreadingHTTPServer):
         if not self._request_slots.acquire(blocking=False):
             self.shutdown_request(request)
             return
+        with self._request_condition:
+            self._active_requests += 1
         self._arm_request_input_deadline(request)
         try:
             super().process_request(request, client_address)
         except BaseException:
             self.finish_request_input(request)
             self._request_slots.release()
+            self._request_finished()
             raise
+
+    def _request_finished(self) -> None:
+        with self._request_condition:
+            self._active_requests -= 1
+            self._request_condition.notify_all()
+
+    def drain_requests(self) -> None:
+        """Wait for bounded input/response sockets and admitted handlers."""
+        deadline = time.monotonic() + self.request_timeout + 1.0
+        with self._request_condition:
+            while self._active_requests:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("loopback requests did not stop before the deadline")
+                self._request_condition.wait(remaining)
 
     def process_request_thread(
         self,
@@ -131,6 +153,7 @@ class _DashboardHttpServer(ThreadingHTTPServer):
         finally:
             self.finish_request_input(request)
             self._request_slots.release()
+            self._request_finished()
 
 
 class LoopbackServer:
@@ -142,6 +165,7 @@ class LoopbackServer:
         logger: Callable[[str], None] | None = None,
         static_assets: Mapping[str, StaticAsset] | None = None,
         lifecycle: LifecycleController | None = None,
+        maintenance: MaintenanceBarrier | None = None,
         request_timeout: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_request_threads: int = _DEFAULT_MAX_REQUEST_THREADS,
         max_pending_backup_inspections: int = (
@@ -187,14 +211,23 @@ class LoopbackServer:
         self.token = secrets.token_urlsafe(32)
         self.startup_nonce = secrets.token_urlsafe(24)
         self.lifecycle = lifecycle or LifecycleController()
+        self.maintenance = maintenance
         self._handlers = dict(handlers)
         status_handler = self._handlers.get("status")
+        self._cached_status: dict[str, Any] = {"startup_nonce": self.startup_nonce}
+        self._cached_status_lock = threading.Lock()
 
         def status(payload: dict[str, Any]) -> dict[str, Any]:
+            if self.maintenance is not None and self.maintenance.update_active:
+                with self._cached_status_lock:
+                    return dict(self._cached_status)
             supplied = {} if status_handler is None else status_handler(payload)
             if not isinstance(supplied, Mapping):
                 raise TypeError("status handler must return a mapping")
-            return {**supplied, "startup_nonce": self.startup_nonce}
+            result = {**supplied, "startup_nonce": self.startup_nonce}
+            with self._cached_status_lock:
+                self._cached_status = result
+            return result
 
         self._handlers["status"] = status
         self._handlers["tabs_connect"] = self._connect_tab
@@ -259,8 +292,8 @@ class LoopbackServer:
         return {"connected": False}
 
     def _request_quit(self, payload: dict[str, Any]) -> dict[str, bool]:
-        self.lifecycle.request_quit()
-        return {"quitting": True}
+        accepted = self.lifecycle.request_quit()
+        return {"quitting": accepted}
 
     def _request_handler(self) -> type[BaseHTTPRequestHandler]:
         owner = self
@@ -285,6 +318,8 @@ class LoopbackServer:
                     host=host,
                     handlers=owner._handlers,
                     known_paper=owner._known_paper,
+                    maintenance=owner.maintenance,
+                    allow_update_quit=lambda: owner.lifecycle.update_failure_quit_allowed,
                 )
                 framing_request = ApiRequest(
                     method=self.command,
@@ -478,6 +513,7 @@ class LoopbackServer:
             return
         self._httpd.shutdown()
         self._httpd.server_close()
+        self._httpd.drain_requests()
         if self._thread is not None:
             self._thread.join(timeout=5)
         self._httpd = None

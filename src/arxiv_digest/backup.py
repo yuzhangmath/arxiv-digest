@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
+import math
 import os
 import re
 import sqlite3
 import stat
 import tempfile
+import time
 import zipfile
-from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,7 +34,7 @@ from arxiv_digest.profile import (
     decode_profile,
     encode_profile,
 )
-from arxiv_digest.storage.database import open_database
+from arxiv_digest.storage.database import _migration_scripts, open_database
 
 
 FORMAT_NAME = "arxiv-digest-backup"
@@ -230,6 +233,14 @@ class BackupInspection:
     manifest: BackupManifest
     profile: PortableProfile
     records: tuple[PortableRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PortableBackupSourceInspection:
+    application_generation: int
+    database_schema_version: int
+    profile_schema_version: int
+    profile_revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -802,6 +813,8 @@ def _build_restored_state(
     destination: PdfDestination,
     profile_revision: int,
     now: datetime,
+    *,
+    preserve_download_records: bool = False,
 ) -> tuple[Path, Path]:
     database_path = root / "state.sqlite3"
     profile_path = root / "profile.json"
@@ -853,12 +866,24 @@ def _build_restored_state(
                 hashlib.sha256(profile_payload).hexdigest(),
             ),
         )
-        _recompute_local_downloads(
-            connection,
-            destination.path,
-            now,
-            inspection.records,
-        )
+        if preserve_download_records:
+            # Internal same-machine update recovery retains the saved destination
+            # and validated backup records without touching the PDF collection.
+            fields = PORTABLE_FIELDS["download_file"]
+            for record in inspection.records:
+                if record.record_type == "download_file":
+                    payload = _record_payload(record)
+                    connection.execute(
+                        f"INSERT INTO download_files({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+                        tuple(payload[field] for field in fields),
+                    )
+        else:
+            _recompute_local_downloads(
+                connection,
+                destination.path,
+                now,
+                inspection.records,
+            )
         connection.commit()
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         connection.execute("PRAGMA journal_mode = DELETE")
@@ -973,19 +998,36 @@ def _restore_old_file(
     old_digest: str | None,
     new_digest: str,
 ) -> None:
+    # Rollback owns only the recorded old/new bytes. A failed publication may
+    # have observed an external replacement; never overwrite it while unwinding.
+    if active.is_symlink() or (active.exists() and (
+        not active.is_file() or _sha256_file(active) not in {old_digest, new_digest}
+    )):
+        raise BackupError(
+            "rollback_failed", "active restore file changed unexpectedly"
+        )
     if old_digest is None:
-        if active.exists() and _sha256_file(active) != new_digest:
-            raise BackupError(
-                "rollback_failed", "active restore file changed unexpectedly"
-            )
         _remove_and_fsync(active)
         return
     if rollback is None or not rollback.is_file() or rollback.is_symlink():
         raise BackupError("rollback_failed", "restore rollback file is missing")
     if _sha256_file(rollback) != old_digest:
         raise BackupError("rollback_failed", "restore rollback hash is invalid")
+    rollback_identity = rollback.lstat()
     os.replace(rollback, active)
     _fsync_directory(active.parent)
+    # rename of two hard links to the same inode is a no-op. Before the first
+    # publication this leaves the rollback name behind unless removed explicitly.
+    try:
+        remaining = rollback.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        published = active.lstat()
+        expected = (rollback_identity.st_dev, rollback_identity.st_ino)
+        if (remaining.st_dev, remaining.st_ino) != expected or (published.st_dev, published.st_ino) != expected:
+            raise BackupError("rollback_failed", "restore rollback identity changed")
+        _remove_and_fsync(rollback)
     if _sha256_file(active) != old_digest:
         raise BackupError("rollback_failed", "restore rollback did not verify")
 
@@ -997,8 +1039,9 @@ def _publish_restored_state(
     *,
     suffix: str,
     crash_injector: Callable[[str], None],
+    opaque_previous: bool = False,
 ) -> None:
-    if paths.database_path.exists():
+    if paths.database_path.exists() and not opaque_previous:
         _checkpoint_database(paths.database_path)
     old_database_digest = (
         _sha256_file(paths.database_path) if paths.database_path.exists() else None
@@ -1107,9 +1150,9 @@ def _publish_restored_state(
                 old_profile_digest,
                 new_profile_digest,
             )
-            if old_database_digest is not None:
+            if old_database_digest is not None and not opaque_previous:
                 _verify_database_readonly(paths.database_path)
-            if old_profile_digest is not None:
+            if old_profile_digest is not None and not opaque_previous:
                 decode_profile(paths.profile_path.read_bytes())
         except Exception as rollback_error:
             raise BackupError(
@@ -1268,7 +1311,7 @@ def _cleanup_recovery_files(
     _remove_and_fsync(paths.restore_journal_path)
 
 
-def _recover_restore_locked(paths: AppPaths) -> None:
+def _recover_restore_locked(paths: AppPaths, *, opaque_previous: bool = False) -> None:
     journal = _parse_restore_journal(paths)
     old_database_digest = journal["old_database_sha256"]
     old_profile_digest = journal["old_profile_sha256"]
@@ -1318,7 +1361,7 @@ def _recover_restore_locked(paths: AppPaths) -> None:
         old_profile_digest if isinstance(old_profile_digest, str) else None,
         new_profile_digest,
     )
-    if old_database_digest is not None or old_profile_digest is not None:
+    if not opaque_previous and (old_database_digest is not None or old_profile_digest is not None):
         _verify_published_pair(paths)
     _cleanup_recovery_files(
         paths,
@@ -1485,9 +1528,16 @@ def _portable_profile_bytes(profile_payload: bytes) -> bytes:
     )
 
 
-def _state_bytes(connection: sqlite3.Connection) -> bytes:
+def _state_bytes(
+    connection: sqlite3.Connection,
+    *,
+    check_deadline: Callable[[], None] = lambda: None,
+    max_bytes: int | None = None,
+) -> bytes:
     lines: list[bytes] = []
+    byte_count = 0
     for record_type, fields in PORTABLE_FIELDS.items():
+        check_deadline()
         table, order_fields = _PORTABLE_TABLES[record_type]
         selected = ", ".join(fields)
         ordering = ", ".join(order_fields)
@@ -1495,19 +1545,223 @@ def _state_bytes(connection: sqlite3.Connection) -> bytes:
             f"SELECT {selected} FROM {table} ORDER BY {ordering}"
         )
         for row in rows:
-            lines.append(
-                _json_bytes(
-                    {
-                        "payload": {
-                            field: row[field]
-                            for field in fields
-                        },
-                        "record_type": record_type,
-                        "schema_version": RECORD_SCHEMA_VERSION,
-                    }
-                )
+            check_deadline()
+            line = _json_bytes(
+                {
+                    "payload": {
+                        field: row[field]
+                        for field in fields
+                    },
+                    "record_type": record_type,
+                    "schema_version": RECORD_SCHEMA_VERSION,
+                }
             )
+            byte_count += len(line)
+            if max_bytes is not None and byte_count > max_bytes:
+                raise BackupError("archive_too_large", "portable source is too large")
+            lines.append(line)
     return b"".join(lines)
+
+
+def _portable_source_payloads(
+    connection: sqlite3.Connection,
+    profile_payload: bytes,
+    *,
+    check_deadline: Callable[[], None] = lambda: None,
+    max_state_bytes: int | None = None,
+) -> tuple[PortableBackupSourceInspection, bytes, bytes]:
+    """Validate one read transaction using the export's portable projection."""
+
+    try:
+        generation = connection.execute(
+            "SELECT singleton, generation FROM application_generation"
+        ).fetchall()
+        if [tuple(row) for row in generation] != [(1, 2)]:
+            raise BackupError("unsupported_schema", "application data generation is unsupported")
+        expected_version = len(_migration_scripts())
+        migrations = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        if [tuple(row) for row in migrations] != [
+            (version,) for version in range(1, expected_version + 1)
+        ]:
+            raise BackupError("unsupported_schema", "database schema version is unsupported")
+        if tuple(connection.execute("PRAGMA quick_check").fetchone()) != ("ok",):
+            raise BackupError("unsupported_schema", "database integrity check failed")
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise BackupError("cross_record_invalid", "database references are invalid")
+        check_deadline()
+        marker = connection.execute(
+            "SELECT pending_revision, pending_sha256, status "
+            "FROM profile_publication WHERE singleton = 1"
+        ).fetchone()
+        try:
+            profile = decode_profile(profile_payload)
+        except (ValueError, TypeError) as error:
+            raise BackupError("unsupported_schema", "profile schema is unsupported") from error
+        digest = hashlib.sha256(profile_payload).hexdigest()
+        if (
+            marker is None
+            or marker["status"] != "published"
+            or marker["pending_revision"] != profile.revision
+            or marker["pending_sha256"] != digest
+        ):
+            raise BackupError(
+                "publication_incomplete",
+                "profile publication must be reconciled before export",
+            )
+        portable_profile = _portable_profile_bytes(profile_payload)
+        state_payload = _state_bytes(
+            connection, check_deadline=check_deadline, max_bytes=max_state_bytes,
+        )
+        _validate_cross_records(
+            _parse_portable_profile(portable_profile), _parse_records(state_payload),
+        )
+        check_deadline()
+        return (
+            PortableBackupSourceInspection(2, expected_version, profile.schema_version, profile.revision),
+            portable_profile,
+            state_payload,
+        )
+    except sqlite3.DatabaseError as error:
+        check_deadline()
+        raise BackupError("unsupported_schema", "portable source database is unsupported") from error
+
+
+def _source_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise BackupError("source_unsafe", "portable source must be a private regular file")
+    return metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_mode, metadata.st_nlink
+
+
+def _verify_source_identity(path: Path, descriptor: int, before: os.stat_result) -> None:
+    expected = _source_identity(before)
+    if (
+        _source_identity(os.fstat(descriptor)) != expected
+        or _source_identity(path.lstat()) != expected
+        or os.get_inheritable(descriptor)
+    ):
+        raise BackupError("source_unsafe", "portable source identity changed")
+
+
+@contextmanager
+def _existing_source_file(path: Path) -> Iterator[tuple[int, os.stat_result]]:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise BackupError("source_unsafe", "private source inspection is unsupported")
+    before = path.lstat()
+    _source_identity(before)
+    descriptor = os.open(
+        path, os.O_RDONLY | nofollow | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        _verify_source_identity(path, descriptor, before)
+        yield descriptor, before
+        _verify_source_identity(path, descriptor, before)
+    finally:
+        os.close(descriptor)
+
+
+def inspect_portable_backup_source(
+    paths: AppPaths,
+    *,
+    maintenance: MaintenanceBarrier,
+    timeout: float = 0.25,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> PortableBackupSourceInspection:
+    """Read validated source metadata without repairing or creating durable state.
+
+    SQLite may initialize transient WAL/SHM coordination for its normal read
+    transaction. The existing maintenance API does not bound operation admission;
+    expiry is checked immediately before and after entering that barrier.
+    """
+
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("source inspection timeout must be finite and positive")
+    deadline = monotonic() + timeout
+
+    def check_deadline() -> None:
+        if monotonic() >= deadline:
+            raise BackupError("source_timeout", "portable source inspection timed out")
+
+    try:
+        check_deadline()
+        with maintenance.operation(), ExitStack() as stack:
+            check_deadline()
+            lock_fd, lock_identity = stack.enter_context(_existing_source_file(paths.profile_lock_path))
+            while True:
+                _verify_source_identity(paths.profile_lock_path, lock_fd, lock_identity)
+                try:
+                    if monotonic() >= deadline:
+                        raise BackupError("source_busy", "portable source profile lock is busy")
+                    fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except (BlockingIOError, InterruptedError):
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise BackupError("source_busy", "portable source profile lock is busy")
+                    time.sleep(min(0.005, remaining))
+            _verify_source_identity(paths.profile_lock_path, lock_fd, lock_identity)
+            profile_fd, profile_identity = stack.enter_context(_existing_source_file(paths.profile_path))
+            database_fd, database_identity = stack.enter_context(_existing_source_file(paths.database_path))
+
+            def verify_profile() -> None:
+                _verify_source_identity(paths.profile_path, profile_fd, profile_identity)
+                after = os.fstat(profile_fd)
+                if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+                    profile_identity.st_size, profile_identity.st_mtime_ns, profile_identity.st_ctime_ns,
+                ):
+                    raise BackupError("source_unsafe", "profile source changed while reading")
+
+            chunks: list[bytes] = []
+            byte_count = 0
+            while True:
+                check_deadline()
+                chunk = os.read(profile_fd, 64 * 1024)
+                if not chunk:
+                    break
+                byte_count += len(chunk)
+                if byte_count > DEFAULT_BACKUP_LIMITS.max_profile_bytes:
+                    raise BackupError("archive_too_large", "profile source is too large")
+                chunks.append(chunk)
+            profile_payload = b"".join(chunks)
+            verify_profile()
+            check_deadline()
+            encoded = quote(str(paths.database_path.absolute()), safe="/")
+            connection = sqlite3.connect(
+                f"file:{encoded}?mode=ro", uri=True, timeout=max(0.0, deadline - monotonic()),
+            )
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.set_progress_handler(lambda: int(monotonic() >= deadline), 1000)
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("BEGIN")
+                result, _, _ = _portable_source_payloads(
+                    connection, profile_payload, check_deadline=check_deadline,
+                    max_state_bytes=DEFAULT_BACKUP_LIMITS.max_state_bytes,
+                )
+                _verify_source_identity(paths.database_path, database_fd, database_identity)
+                verify_profile()
+                check_deadline()
+                return result
+            finally:
+                connection.set_progress_handler(None, 0)
+                connection.rollback()
+                connection.close()
+    except BackupError:
+        raise
+    except FileNotFoundError as error:
+        raise BackupError("not_initialized", "portable source files are missing") from error
+    except OSError as error:
+        raise BackupError("source_unsafe", "portable source cannot be opened safely") from error
+    except sqlite3.DatabaseError as error:
+        check_deadline()
+        raise BackupError("unsupported_schema", "portable source database is unsupported") from error
 
 
 def _manifest_value(manifest: BackupManifest) -> dict[str, object]:
@@ -1614,39 +1868,10 @@ def _snapshot_payloads(
     connection.execute("PRAGMA query_only = ON")
     try:
         connection.execute("BEGIN")
-        try:
-            generation = connection.execute(
-                "SELECT singleton, generation FROM application_generation"
-            ).fetchone()
-        except sqlite3.DatabaseError as error:
-            raise BackupError(
-                "unsupported_schema",
-                "application data generation is unsupported",
-            ) from error
-        if generation is None or tuple(generation) != (1, 2):
-            raise BackupError(
-                "unsupported_schema",
-                "application data generation is unsupported",
-            )
-        marker = connection.execute(
-            "SELECT pending_revision, pending_sha256, status "
-            "FROM profile_publication WHERE singleton = 1"
-        ).fetchone()
         profile_payload = paths.profile_path.read_bytes()
-        profile = decode_profile(profile_payload)
-        digest = hashlib.sha256(profile_payload).hexdigest()
-        if (
-            marker is None
-            or marker["status"] != "published"
-            or marker["pending_revision"] != profile.revision
-            or marker["pending_sha256"] != digest
-        ):
-            raise BackupError(
-                "publication_incomplete",
-                "profile publication must be reconciled before export",
-            )
-        portable_profile = _portable_profile_bytes(profile_payload)
-        state_payload = _state_bytes(connection)
+        source, portable_profile, state_payload = _portable_source_payloads(
+            connection, profile_payload,
+        )
         members = (
             BackupMember(
                 "profile.json",
@@ -1662,7 +1887,7 @@ def _snapshot_payloads(
         manifest = BackupManifest(
             FORMAT_NAME,
             FORMAT_VERSION,
-            generation["generation"],
+            source.application_generation,
             application_version,
             created_at,
             members,
@@ -1731,3 +1956,58 @@ def export_backup(
                 application_version=application_version,
                 created_at=created_at,
             )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedUpdateBackup:
+    path: Path
+    inspection: BackupInspection
+    pdf_destination: PdfDestination
+    identity: dict[str, int]
+
+
+def export_update_backup_under_lease(
+    paths: AppPaths,
+    attempt_id: str,
+    *,
+    source_version: str = __version__,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> PreparedUpdateBackup:
+    """Export under the coordinator's existing exclusive lease; never nest one."""
+
+    from arxiv_digest.atomic import ensure_private_directory_strict
+    from arxiv_digest.update_contract import canonical_version
+    from arxiv_digest.update_download import file_identity
+
+    if type(attempt_id) is not str or re.fullmatch(r"[0-9a-f]{64}", attempt_id) is None:
+        raise ValueError("update attempt identifier is invalid")
+    canonical_version(source_version)
+    now = clock()
+    _utc_text(now)
+    parent = paths.update_recovery_dir / "backups"
+    ensure_private_directory_strict(parent)
+    destination = parent / f"update-backup-{now:%Y%m%dT%H%M%SZ}-{attempt_id}.zip"
+    saved_destination = decode_profile(paths.profile_path.read_bytes()).pdf_destination
+    export_backup(
+        paths, destination, maintenance=None, clock=lambda: now,
+        application_version=source_version,
+    )
+    with _existing_source_file(destination) as (descriptor, before):
+        if stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1:
+            raise BackupError("archive_invalid", "update backup identity is unsafe")
+        os.fsync(descriptor)
+        inspection = inspect_backup(destination)
+        if (inspection.manifest.application_version != source_version
+                or inspection.manifest.application_generation != 2):
+            raise BackupError("archive_invalid", "update backup is incompatible")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 64 * 1024):
+            digest.update(chunk)
+        if digest.hexdigest() != inspection.archive_sha256:
+            raise BackupError("archive_changed", "update backup identity changed")
+        _verify_source_identity(destination, descriptor, before)
+        identity = file_identity(os.fstat(descriptor))
+        if identity != file_identity(before) or identity != file_identity(destination.lstat()):
+            raise BackupError("archive_changed", "update backup identity changed")
+        _fsync_directory(parent)
+    return PreparedUpdateBackup(destination, inspection, saved_destination, identity)

@@ -14,13 +14,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
         python: ["3.11", "3.x"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -37,8 +38,48 @@ jobs:
           set -euo pipefail
           ARXIV_DIGEST_VERSION="$(python -c 'from arxiv_digest import __version__; print(__version__)')"
           python scripts/release_check.py --tag "v${ARXIV_DIGEST_VERSION}"
+          commit_sha="$(git rev-parse --verify HEAD)"
+          [[ "$commit_sha" =~ ^[0-9a-f]{40}$ ]]
+          source_date_epoch="$(git show -s --format=%ct "$commit_sha")"
           printf 'ARXIV_DIGEST_VERSION=%s\n' "$ARXIV_DIGEST_VERSION" >> "$GITHUB_ENV"
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+          printf 'ARXIV_DIGEST_RELEASE_ARTIFACT_DIR=%s/dist\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          printf 'COMMIT_SHA=%s\n' "$commit_sha" >> "$GITHUB_ENV"
       - run: python -m build
+      - name: Generate the updater manifest
+        run: >-
+          python scripts/update_manifest.py
+          --wheel "dist/arxiv_digest-${ARXIV_DIGEST_VERSION}-py3-none-any.whl"
+          --policy release/update-policy.json
+          --output dist/UPDATE_MANIFEST.json
+      - name: Verify the local release bundle
+        shell: bash
+        env:
+          BUNDLE: ${{ runner.temp }}/release-bundle
+        run: |
+          set -euo pipefail
+          python - <<'PY_BUNDLE'
+          import hashlib
+          import os
+          import shutil
+          from pathlib import Path
+          root = Path(os.environ["BUNDLE"])
+          root.mkdir()
+          version = os.environ["ARXIV_DIGEST_VERSION"]
+          names = (f"arxiv_digest-{version}-py3-none-any.whl", f"arxiv_digest-{version}.tar.gz", "UPDATE_MANIFEST.json")
+          lines = []
+          for name in names:
+              shutil.copyfile(Path("dist") / name, root / name)
+              digest = hashlib.sha256()
+              with (root / name).open("rb") as source:
+                  while chunk := source.read(65536):
+                      digest.update(chunk)
+              lines.append(f"{digest.hexdigest()}  {name}\n")
+          (root / "SHA256SUMS").write_bytes("".join(lines).encode("ascii"))
+          shutil.copyfile(Path("docs/releases") / f"v{version}.md", root / "RELEASE_NOTES.md")
+          (root / "COMMIT_SHA").write_bytes((os.environ["COMMIT_SHA"] + "\n").encode("ascii"))
+          PY_BUNDLE
+          python scripts/release_bundle.py local --bundle "$BUNDLE" --version "$ARXIV_DIGEST_VERSION" --commit "$COMMIT_SHA"
       - run: python -m pytest tests/unit tests/integration -q
       - run: node --test tests/js/*.test.mjs
       - name: Install Playwright browsers and Linux dependencies
@@ -71,4 +112,12 @@ jobs:
           PIPX_HOME="${{ runner.temp }}/pipx-home" PIPX_BIN_DIR="${{ runner.temp }}/pipx-bin" python -m pipx install "${{ github.workspace }}/dist/arxiv_digest-${ARXIV_DIGEST_VERSION}-py3-none-any.whl"
           doctor_output="$(ARXIV_DIGEST_TESTING=1 ARXIV_DIGEST_TEST_ROOT="${{ runner.temp }}/doctor-state" "${{ runner.temp }}/pipx-bin/arxiv-digest" doctor)"
           test "${doctor_output%%$'\n'*}" = "arXiv Digest ${ARXIV_DIGEST_VERSION}"
-          test ! -e "${{ runner.temp }}/doctor-state"
+          test ! -e "${{ runner.temp }}/doctor-state/config/profile.json"
+          test ! -e "${{ runner.temp }}/doctor-state/data/state.sqlite3"
+          test ! -e "${{ runner.temp }}/doctor-state/data/runtime.json"
+      - name: Confirm verification did not alter tracked source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git diff --cached --exit-code

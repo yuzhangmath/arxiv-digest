@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -10,7 +11,19 @@ from arxiv_digest import __version__
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DIST = PROJECT_ROOT / "dist"
+
+
+def _artifact_directory(environ=None) -> Path:
+    environment = os.environ if environ is None else environ
+    if "ARXIV_DIGEST_RELEASE_ARTIFACT_DIR" not in environment:
+        return PROJECT_ROOT / "dist"
+    value = environment["ARXIV_DIGEST_RELEASE_ARTIFACT_DIR"]
+    if not value or not Path(value).is_absolute():
+        raise ValueError("ARXIV_DIGEST_RELEASE_ARTIFACT_DIR must be an absolute artifact directory")
+    return Path(value)
+
+
+DIST = _artifact_directory()
 SDIST = DIST / f"arxiv_digest-{__version__}.tar.gz"
 WHEEL = DIST / f"arxiv_digest-{__version__}-py3-none-any.whl"
 
@@ -30,6 +43,7 @@ EXPECTED_PYTHON_MODULES = frozenset(
         "application.py",
         "atomic.py",
         "backup.py",
+        "browser.py",
         "candidates.py",
         "cli.py",
         "desktop_launcher.py",
@@ -57,12 +71,41 @@ EXPECTED_PYTHON_MODULES = frozenset(
         "storage/database.py",
         "sync.py",
         "text.py",
+        "update_check.py",
+        "update_artifacts.py",
+        "update_contract.py",
+        "update_coordinator.py",
+        "update_data_recovery.py",
+        "update_discovery.py",
+        "update_download.py",
+        "update_http.py",
+        "update_installation.py",
+        "update_internal.py",
+        "update_journal.py",
+        "update_locks.py",
+        "update_manifest.py",
+        "update_pipx.py",
+        "update_protocol.py",
+        "update_recovery.py",
+        "update_runtime/__init__.py",
+        "update_runtime/guard.py",
+        "update_runtime/helper.py",
+        "update_runtime/protocol.py",
+        "update_runtime/recovery.py",
+        "update_snapshot.py",
         "web/__init__.py",
         "web/api.py",
         "web/lifecycle.py",
         "web/server.py",
     }
 )
+
+EXPECTED_APPLICATION_STATIC_FILES = frozenset({
+    "api.mjs", "app.js", "calendar_view.mjs", "index.html", "interests_view.mjs",
+    "library_view.mjs", "math_view.mjs", "paper_view.mjs", "review_view.mjs",
+    "settings_view.mjs", "setup_view.mjs", "state.mjs", "styles.css",
+    "update_flow.mjs", "update_poll.mjs", "update_transition.mjs", "update_view.mjs",
+})
 
 EXPECTED_MIGRATIONS = frozenset(
     {
@@ -106,7 +149,7 @@ def _source_resources() -> dict[str, bytes]:
 
 
 def _sdist_resources() -> dict[str, bytes]:
-    assert SDIST.is_file(), f"release sdist is missing: {SDIST.name}; run python -m build"
+    assert SDIST.is_file(), f"release sdist is missing in the selected artifact directory: {DIST}; run python -m build --outdir there"
     result: dict[str, bytes] = {}
     with tarfile.open(SDIST, "r:gz") as archive:
         for member in archive:
@@ -140,7 +183,7 @@ def _sdist_resources() -> dict[str, bytes]:
 
 
 def _wheel_resources() -> tuple[dict[str, bytes], list[str]]:
-    assert WHEEL.is_file(), f"release wheel is missing: {WHEEL.name}; run python -m build"
+    assert WHEEL.is_file(), f"release wheel is missing in the selected artifact directory: {DIST}; run python -m build --outdir there"
     result: dict[str, bytes] = {}
     unexpected_binary: list[str] = []
     expected_source = _source_resources()
@@ -222,6 +265,11 @@ def test_sdist_and_wheel_contain_exact_release_resources() -> None:
     }
     for resources in (source, sdist, wheel):
         assert {
+            key.removeprefix("package/web/static/") for key in resources
+            if key.startswith("package/web/static/")
+            and not key.startswith("package/web/static/vendor/")
+        } == EXPECTED_APPLICATION_STATIC_FILES
+        assert {
             key: _sha256(data)
             for key, data in resources.items()
             if key.startswith("package/assets/")
@@ -267,3 +315,14 @@ def test_python_module_and_migration_allowlists_are_exact() -> None:
             if key.startswith("package/storage/migrations/")
             and key.endswith(".sql")
         } == expected_migrations
+
+
+def test_explicit_artifact_directory_never_falls_back_to_ignored_dist(tmp_path) -> None:
+    import pytest
+
+    chosen = tmp_path / "fresh-artifacts"
+    assert _artifact_directory({"ARXIV_DIGEST_RELEASE_ARTIFACT_DIR": str(chosen)}) == chosen
+    assert _artifact_directory({}) == PROJECT_ROOT / "dist"
+    for value in ("", "dist"):
+        with pytest.raises(ValueError, match="absolute artifact directory"):
+            _artifact_directory({"ARXIV_DIGEST_RELEASE_ARTIFACT_DIR": value})

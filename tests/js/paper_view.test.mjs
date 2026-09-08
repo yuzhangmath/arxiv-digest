@@ -68,6 +68,55 @@ test("paper ranking rationale is initially hidden in a disclosure", () => {
   assert.match(explanation.textContent, /Why: <img src=x/);
 });
 
+test("paper ranking rationale links referenced titles without exposing IDs", () => {
+  const root = new FakeNode("div");
+  const source = paper();
+  delete source.ranking_text;
+  source.reasons = [
+    {
+      kind: "seed_similarity",
+      label: "Related to selected seed paper",
+      location: null,
+      reference: {
+        arxiv_id: "2608.49002",
+        title: "Named Seed Paper",
+      },
+    },
+    {
+      kind: "saved_similarity",
+      label: "Similar to saved paper",
+      location: null,
+      reference: {
+        arxiv_id: "2608.49001",
+        title: "Named Saved Paper",
+      },
+    },
+  ];
+
+  renderPaperCard(new FakeDocument(), root, source, {});
+
+  const explanation = descendants(root, "details").find((node) =>
+    node.className === "ranking-explanation"
+  );
+  const links = descendants(explanation, "a");
+  assert.deepEqual(
+    links.map((link) => link.textContent),
+    ["Named Seed Paper", "Named Saved Paper"],
+  );
+  assert.deepEqual(
+    links.map((link) => link.getAttribute("href")),
+    [
+      "https://arxiv.org/abs/2608.49002",
+      "https://arxiv.org/abs/2608.49001",
+    ],
+  );
+  assert.doesNotMatch(explanation.textContent, /2411\.12890|2410\.08029/);
+  for (const link of links) {
+    assert.equal(link.getAttribute("target"), "_blank");
+    assert.equal(link.getAttribute("rel"), "noopener noreferrer");
+  }
+});
+
 test("review paper titles do not impose a fixed reading-width cap", () => {
   const titleRule = stylesheet.match(/\.paper-card h3\s*\{([^}]*)\}/)?.[1] ?? "";
   assert.doesNotMatch(titleRule, /max-width\s*:/);

@@ -460,9 +460,14 @@ def test_review_builds_seed_vectors_from_durable_metadata(
     page = service.open_date(day)
 
     assert page.cards[0].event.event_id == related_id
-    assert any(
-        reason.kind == "seed_similarity" for reason in page.cards[0].reasons
+    seed_reason = next(
+        reason
+        for reason in page.cards[0].reasons
+        if reason.kind == "seed_similarity"
     )
+    assert seed_reason.label == "Related to selected seed paper"
+    assert seed_reason.reference.arxiv_id == seed_id
+    assert seed_reason.reference.title == "Quantum widget alignment"
 
     from arxiv_digest.ranking import (
         CATEGORY_BASELINE_WEIGHT,
@@ -486,3 +491,43 @@ def test_review_builds_seed_vectors_from_durable_metadata(
     )
     related = next(card for card in page.cards if card.event.event_id == related_id)
     assert isclose(related.score, expected_score, rel_tol=1e-12)
+
+
+def test_review_names_the_saved_paper_behind_a_similarity_reason(
+    review: tuple[Store, Profiles, ReviewService],
+) -> None:
+    store, _profiles, service = review
+    saved_id = "2608.00998"
+    saved = PaperMetadata(
+        arxiv_id=saved_id,
+        title="Persistent widgets in topology",
+        authors=("Saved Author",),
+        abstract="A distinct synthetic saved-paper abstract.",
+        primary_category="cs.SE",
+        categories=("cs.SE",),
+    )
+    store.apply_article_snapshot(
+        saved,
+        (PaperVersion(1, datetime(2026, 8, 1, tzinfo=timezone.utc)),),
+    )
+    store.save_paper(saved_id, 1)
+    day = date(2026, 8, 3)
+    related_id = _add(
+        store,
+        1,
+        day,
+        title="Persistent widgets for deterministic groups",
+    )
+    _add(store, 2, day, title="Unrelated queue bookkeeping")
+
+    page = service.open_date(day)
+
+    related = next(card for card in page.cards if card.event.event_id == related_id)
+    saved_reason = next(
+        reason
+        for reason in related.reasons
+        if reason.kind == "saved_similarity"
+    )
+    assert saved_reason.label == "Similar to saved paper"
+    assert saved_reason.reference.arxiv_id == saved_id
+    assert saved_reason.reference.title == "Persistent widgets in topology"

@@ -38,12 +38,6 @@ jobs:
           python-version: "3.11"
           check-latest: false
 
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "24.19.0"
-          package-manager-cache: false
-
       - name: Verify release identity
         id: identity
         shell: bash
@@ -76,6 +70,12 @@ jobs:
             exit 1
           fi
 
+          remote_tag="$(git ls-remote --exit-code origin "refs/tags/${RELEASE_TAG}^{}")"
+          if [[ "$remote_tag" != "${head_commit}"$'\t'"refs/tags/${RELEASE_TAG}^{}" ]]; then
+            echo "The remote peeled release tag differs from the verified commit." >&2
+            exit 1
+          fi
+          printf 'ARXIV_DIGEST_RELEASE_ARTIFACT_DIR=%s/dist\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
           source_date_epoch="$(git show -s --format=%ct "$head_commit")"
           printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
           {
@@ -90,17 +90,14 @@ jobs:
       - name: Build wheel and source distribution once
         run: python -m build
 
-      - name: Run Python tests
-        run: python -m pytest tests/unit tests/integration -q
-
-      - name: Run JavaScript tests
-        run: node --test tests/js/*.test.mjs
-
-      - name: Install browser-test dependencies
-        run: python -m playwright install --with-deps chromium webkit
-
-      - name: Run browser tests
-        run: python -m pytest tests/browser -q
+      - name: Generate the updater manifest
+        env:
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: >-
+          python scripts/update_manifest.py
+          --wheel "dist/arxiv_digest-${VERSION}-py3-none-any.whl"
+          --policy release/update-policy.json
+          --output dist/UPDATE_MANIFEST.json
 
       - name: Run privacy gates
         shell: bash
@@ -117,35 +114,6 @@ jobs:
           python scripts/privacy_scan.py history . --expected-remote "$EXPECTED_REMOTE"
           python scripts/privacy_scan.py archive "dist/arxiv_digest-${VERSION}.tar.gz"
           python scripts/privacy_scan.py archive "dist/arxiv_digest-${VERSION}-py3-none-any.whl"
-
-      - name: Smoke-test the wheel through pipx
-        shell: bash
-        env:
-          VERSION: ${{ steps.identity.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          wheel="${GITHUB_WORKSPACE}/dist/arxiv_digest-${VERSION}-py3-none-any.whl"
-          mkdir -p \
-            "${RUNNER_TEMP}/pipx-home" \
-            "${RUNNER_TEMP}/pipx-bin" \
-            "${RUNNER_TEMP}/unrelated"
-          cd "${RUNNER_TEMP}/unrelated"
-
-          PIPX_HOME="${RUNNER_TEMP}/pipx-home" \
-          PIPX_BIN_DIR="${RUNNER_TEMP}/pipx-bin" \
-            python -m pipx install "$wheel"
-
-          doctor_output="$(
-            ARXIV_DIGEST_TESTING=1 \
-            ARXIV_DIGEST_TEST_ROOT="${RUNNER_TEMP}/doctor-state" \
-              "${RUNNER_TEMP}/pipx-bin/arxiv-digest" doctor
-          )"
-          if [[ "${doctor_output%%$'\n'*}" != "arXiv Digest ${VERSION}" ]]; then
-            echo "The installed wheel reported an unexpected version." >&2
-            exit 1
-          fi
-          test ! -e "${RUNNER_TEMP}/doctor-state"
 
       - name: Confirm verification did not alter tracked source
         shell: bash
@@ -169,14 +137,29 @@ jobs:
           mkdir "$BUNDLE"
           cp -- "dist/${wheel}" "$BUNDLE/"
           cp -- "dist/${sdist}" "$BUNDLE/"
+          cp -- "dist/UPDATE_MANIFEST.json" "$BUNDLE/"
           cp -- "docs/releases/${RELEASE_TAG}.md" "$BUNDLE/RELEASE_NOTES.md"
           printf '%s\n' "$COMMIT_SHA" > "$BUNDLE/COMMIT_SHA"
 
-          (
-            cd "$BUNDLE"
-            sha256sum "$wheel" "$sdist" > SHA256SUMS
-            sha256sum --check --strict SHA256SUMS
-          )
+          python - <<'PY_CHECKSUMS'
+          import hashlib
+          import os
+          from pathlib import Path
+          root = Path(os.environ["BUNDLE"])
+          version = os.environ["VERSION"]
+          names = (f"arxiv_digest-{version}-py3-none-any.whl", f"arxiv_digest-{version}.tar.gz", "UPDATE_MANIFEST.json")
+          lines = []
+          for name in names:
+              digest = hashlib.sha256()
+              with (root / name).open("rb") as source:
+                  while chunk := source.read(65536):
+                      digest.update(chunk)
+              lines.append(f"{digest.hexdigest()}  {name}\n")
+          (root / "SHA256SUMS").write_bytes("".join(lines).encode("ascii"))
+          PY_CHECKSUMS
+          python scripts/release_bundle.py local --bundle "$BUNDLE" --version "$VERSION" --commit "$COMMIT_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
 
       - name: Upload verified release bundle
         id: upload
@@ -190,9 +173,126 @@ jobs:
           overwrite: false
           include-hidden-files: false
 
+  native_validation:
+    name: Validate candidate (${{ matrix.os }}, Python ${{ matrix.python }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+        python: ["3.11", "3.x"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      ARXIV_DIGEST_RELEASE_ARTIFACT_DIR: ${{ runner.temp }}/release-bundle
+      EXPECTED_COMMIT: ${{ needs.build.outputs.commit_sha }}
+      VERSION: ${{ needs.build.outputs.version }}
+
+    steps:
+      - name: Check out the built commit and historical upgrade tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build.outputs.commit_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          check-latest: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.19.0"
+          package-manager-cache: false
+
+      - name: Download the single build candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: ${{ runner.temp }}/release-bundle
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Verify candidate source and historical upgrade identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_commit="$(git rev-parse --verify HEAD)"
+          [[ "$head_commit" == "$EXPECTED_COMMIT" ]]
+          git rev-parse --verify "refs/tags/v0.2.1^{commit}" > /dev/null
+          PYTHONPATH=src python scripts/release_check.py --tag="v${VERSION}"
+          source_date_epoch="$(git show -s --format=%ct "$head_commit")"
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+
+      - name: Install the candidate wheel and development dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="${ARXIV_DIGEST_RELEASE_ARTIFACT_DIR}/arxiv_digest-${VERSION}-py3-none-any.whl"
+          python -m pip install --disable-pip-version-check "$wheel[dev]"
+
+      - name: Verify downloaded candidate bytes and source resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/release_bundle.py local --bundle "$ARXIV_DIGEST_RELEASE_ARTIFACT_DIR" --version "$VERSION" --commit "$EXPECTED_COMMIT"
+
+      - name: Run Python tests including native installation and recovery
+        run: python -m pytest tests/unit tests/integration -q
+
+      - name: Run JavaScript tests
+        run: node --test tests/js/*.test.mjs
+
+      - name: Install Playwright browsers and Linux dependencies
+        if: runner.os == 'Linux'
+        run: python -m playwright install --with-deps chromium webkit
+
+      - name: Install Playwright browsers on macOS
+        if: runner.os == 'macOS'
+        run: python -m playwright install chromium webkit
+
+      - name: Run browser tests
+        run: python -m pytest tests/browser -q
+
+      - name: Smoke-test the candidate wheel through pipx
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="${ARXIV_DIGEST_RELEASE_ARTIFACT_DIR}/arxiv_digest-${VERSION}-py3-none-any.whl"
+          mkdir -p \
+            "${RUNNER_TEMP}/pipx-home" \
+            "${RUNNER_TEMP}/pipx-bin" \
+            "${RUNNER_TEMP}/unrelated"
+          cd "${RUNNER_TEMP}/unrelated"
+          PIPX_HOME="${RUNNER_TEMP}/pipx-home" \
+          PIPX_BIN_DIR="${RUNNER_TEMP}/pipx-bin" \
+            python -m pipx install "$wheel"
+          doctor_output="$(
+            ARXIV_DIGEST_TESTING=1 \
+            ARXIV_DIGEST_TEST_ROOT="${RUNNER_TEMP}/doctor-state" \
+              "${RUNNER_TEMP}/pipx-bin/arxiv-digest" doctor
+          )"
+          test "${doctor_output%%$'\n'*}" = "arXiv Digest ${VERSION}"
+          test ! -e "${RUNNER_TEMP}/doctor-state/config/profile.json"
+          test ! -e "${RUNNER_TEMP}/doctor-state/data/state.sqlite3"
+          test ! -e "${RUNNER_TEMP}/doctor-state/data/runtime.json"
+
+      - name: Confirm validation preserved candidate bytes and tracked source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/release_bundle.py local --bundle "$ARXIV_DIGEST_RELEASE_ARTIFACT_DIR" --version "$VERSION" --commit "$EXPECTED_COMMIT"
+          git diff --exit-code
+          git diff --cached --exit-code
+
   publish:
     name: Publish or verify GitHub prerelease
-    needs: build
+    needs: [build, native_validation]
+    if: ${{ needs.build.result == 'success' && needs.native_validation.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -207,7 +307,8 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
 
-      - name: Validate downloaded bundle
+      - name: Validate downloaded bundle with trusted inline verifier
+        id: bundle
         shell: bash
         env:
           BUNDLE: ${{ runner.temp }}/release-bundle
@@ -215,42 +316,326 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          # This source belongs to the workflow; no downloaded code is executed.
+          cat > "$RUNNER_TEMP/trusted-publish-verifier.py" <<'PY_VERIFIER'
+          #!/usr/bin/env python3
+          """Stdlib verifier embedded literally in the write-enabled release workflow.
 
-          wheel="arxiv_digest-${VERSION}-py3-none-any.whl"
-          sdist="arxiv_digest-${VERSION}.tar.gz"
-          expected=(
-            "$wheel"
-            "$sdist"
-            "SHA256SUMS"
-            "RELEASE_NOTES.md"
-            "COMMIT_SHA"
-          )
+          The workflow executes this trusted inline source, never a downloaded script or
+          an import from the downloaded wheel. Keep the embedded source synchronized.
+          """
+          from __future__ import annotations
 
-          shopt -s nullglob dotglob
-          entries=("$BUNDLE"/*)
-          if (( ${#entries[@]} != ${#expected[@]} )); then
-            echo "The release bundle has an unexpected file inventory." >&2
-            exit 1
-          fi
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          from dataclasses import dataclass
+          from pathlib import Path
 
-          for name in "${expected[@]}"; do
-            if [[ ! -f "$BUNDLE/$name" || -L "$BUNDLE/$name" ]]; then
-              echo "The release bundle contains a missing or unsafe entry." >&2
-              exit 1
-            fi
-          done
-          test -s "$BUNDLE/RELEASE_NOTES.md"
-          if [[ "$(cat "$BUNDLE/COMMIT_SHA")" != "$EXPECTED_COMMIT" ]]; then
-            echo "The release bundle commit does not match the verified build." >&2
-            exit 1
-          fi
+          MANIFEST_BYTE_LIMIT = 1024 * 1024
+          RELEASE_PAGE_BYTE_LIMIT = 4 * 1024 * 1024
+          REPOSITORY = "https://github.com/yuzhangmath/arxiv-digest"
 
-          (
-            cd "$BUNDLE"
-            sha256sum "$wheel" "$sdist" > "${RUNNER_TEMP}/expected-SHA256SUMS"
-            cmp --silent SHA256SUMS "${RUNNER_TEMP}/expected-SHA256SUMS"
-            sha256sum --check --strict SHA256SUMS
-          )
+
+          def canonical_version(value):
+              if type(value) is not str or re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", value) is None:
+                  raise ValueError("noncanonical version")
+              return tuple(map(int, value.split(".")))
+
+
+          class BundleError(ValueError):
+              """A local or published release bundle violates the closed contract."""
+
+
+          @dataclass(frozen=True, slots=True)
+          class BundleAsset:
+              name: str
+              size: int
+              sha256: str
+
+
+          @dataclass(frozen=True, slots=True)
+          class VerifiedBundle:
+              version: str
+              commit: str
+              channel: str
+              assets: tuple[BundleAsset, ...]
+              release_notes_sha256: str
+
+
+          def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+              value: dict[str, object] = {}
+              for key, member in pairs:
+                  if key in value:
+                      raise BundleError("published release JSON contains duplicate keys")
+                  value[key] = member
+              return value
+
+
+          def _reject_json_constant(value: str) -> object:
+              del value
+              raise BundleError("published release JSON contains a nonfinite number")
+
+
+          def _asset(path: Path) -> BundleAsset:
+              flags = (
+                  os.O_RDONLY
+                  | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_CLOEXEC", 0)
+                  | getattr(os, "O_NONBLOCK", 0)
+              )
+              try:
+                  descriptor = os.open(path, flags)
+                  with os.fdopen(descriptor, "rb") as source:
+                      before = os.fstat(source.fileno())
+                      if not stat.S_ISREG(before.st_mode):
+                          raise BundleError("local release asset is not a regular file")
+                      digest = hashlib.sha256()
+                      size = 0
+                      remaining = before.st_size + 1
+                      while remaining and (chunk := source.read(min(64 * 1024, remaining))):
+                          digest.update(chunk)
+                          size += len(chunk)
+                          remaining -= len(chunk)
+                      after = os.fstat(source.fileno())
+              except BundleError:
+                  raise
+              except OSError as error:
+                  raise BundleError("local release asset could not be read") from error
+              if _file_identity(before) != _file_identity(after) or size != before.st_size:
+                  raise BundleError("local release asset changed during verification")
+              return BundleAsset(path.name, size, digest.hexdigest())
+
+
+          def _asset_from_payload(name: str, payload: bytes) -> BundleAsset:
+              return BundleAsset(name, len(payload), hashlib.sha256(payload).hexdigest())
+
+
+          def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+              return (
+                  value.st_dev,
+                  value.st_ino,
+                  value.st_size,
+                  value.st_mtime_ns,
+                  value.st_ctime_ns,
+              )
+
+
+          def _read_regular_bytes(path: Path, *, byte_limit: int) -> bytes:
+              flags = (
+                  os.O_RDONLY
+                  | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_CLOEXEC", 0)
+                  | getattr(os, "O_NONBLOCK", 0)
+              )
+              try:
+                  descriptor = os.open(path, flags)
+                  with os.fdopen(descriptor, "rb") as source:
+                      before = os.fstat(source.fileno())
+                      if not stat.S_ISREG(before.st_mode) or before.st_size > byte_limit:
+                          raise BundleError("local release file is invalid")
+                      payload = source.read(byte_limit + 1)
+                      after = os.fstat(source.fileno())
+              except BundleError:
+                  raise
+              except OSError as error:
+                  raise BundleError("local release file could not be read") from error
+              if (
+                  len(payload) != before.st_size
+                  or len(payload) > byte_limit
+                  or _file_identity(before) != _file_identity(after)
+              ):
+                  raise BundleError("local release file changed during verification")
+              return payload
+
+
+          def verify_github_release(
+              release_payload: bytes,
+              *,
+              bundle: VerifiedBundle,
+              tag: str,
+              remote_tag_commit: str,
+          ) -> None:
+              """Verify a GitHub release response against an already verified bundle."""
+
+              if type(bundle) is not VerifiedBundle:
+                  raise BundleError("verified bundle record is invalid")
+              try:
+                  canonical_version(bundle.version)
+              except ValueError as error:
+                  raise BundleError("verified bundle record is invalid") from error
+              expected_asset_names = (
+                  f"arxiv_digest-{bundle.version}-py3-none-any.whl",
+                  f"arxiv_digest-{bundle.version}.tar.gz",
+                  "UPDATE_MANIFEST.json",
+                  "SHA256SUMS",
+              )
+              if (
+                  type(bundle.commit) is not str
+                  or re.fullmatch(r"[0-9a-f]{40}", bundle.commit) is None
+                  or type(bundle.channel) is not str
+                  or bundle.channel not in {"prerelease", "stable"}
+                  or type(bundle.assets) is not tuple
+                  or len(bundle.assets) != len(expected_asset_names)
+                  or any(type(asset) is not BundleAsset for asset in bundle.assets)
+                  or any(
+                      type(asset.name) is not str
+                      or type(asset.size) is not int
+                      or asset.size <= 0
+                      or type(asset.sha256) is not str
+                      or re.fullmatch(r"[0-9a-f]{64}", asset.sha256) is None
+                      for asset in bundle.assets
+                  )
+                  or tuple(asset.name for asset in bundle.assets) != expected_asset_names
+                  or type(bundle.release_notes_sha256) is not str
+                  or re.fullmatch(r"[0-9a-f]{64}", bundle.release_notes_sha256) is None
+              ):
+                  raise BundleError("verified bundle record is invalid")
+              if type(release_payload) is not bytes:
+                  raise BundleError("published release response is invalid")
+              if len(release_payload) > RELEASE_PAGE_BYTE_LIMIT:
+                  raise BundleError("published release response exceeds the byte limit")
+              try:
+                  release = json.loads(
+                      release_payload.decode("utf-8"),
+                      object_pairs_hook=_strict_object,
+                      parse_constant=_reject_json_constant,
+                  )
+              except BundleError:
+                  raise
+              except (
+                  RecursionError,
+                  UnicodeError,
+                  json.JSONDecodeError,
+                  TypeError,
+                  ValueError,
+              ) as error:
+                  raise BundleError("published release response is invalid") from error
+
+              expected_tag = f"v{bundle.version}"
+              if type(tag) is not str or tag != expected_tag:
+                  raise BundleError("published release tag is invalid")
+              if type(remote_tag_commit) is not str or remote_tag_commit != bundle.commit:
+                  raise BundleError("published release tag commit is invalid")
+              if type(release) is not dict:
+                  raise BundleError("published release record is invalid")
+              expected_prerelease = bundle.channel == "prerelease"
+              if (
+                  release.get("tag_name") != expected_tag
+                  or release.get("draft") is not False
+                  or release.get("prerelease") is not expected_prerelease
+              ):
+                  raise BundleError("published release identity is invalid")
+              body = release.get("body")
+              if type(body) is not str:
+                  raise BundleError("published release notes are invalid")
+              try:
+                  body_digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+              except UnicodeEncodeError as error:
+                  raise BundleError("published release notes are invalid") from error
+              if body_digest != bundle.release_notes_sha256:
+                  raise BundleError("published release notes do not match")
+
+              assets = release.get("assets")
+              if type(assets) is not list or len(assets) != len(bundle.assets):
+                  raise BundleError("published release asset inventory is invalid")
+              records: dict[str, dict[str, object]] = {}
+              for record in assets:
+                  if type(record) is not dict or type(record.get("name")) is not str:
+                      raise BundleError("published release asset record is invalid")
+                  name = record["name"]
+                  if name in records:
+                      raise BundleError("published release asset names are duplicated")
+                  records[name] = record
+              if set(records) != {asset.name for asset in bundle.assets}:
+                  raise BundleError("published release asset inventory is invalid")
+
+              base_url = f"{REPOSITORY}/releases/download/{expected_tag}/"
+              for asset in bundle.assets:
+                  record = records[asset.name]
+                  if (
+                      record.get("state") != "uploaded"
+                      or type(record.get("size")) is not int
+                      or record.get("size") != asset.size
+                      or record.get("digest") != f"sha256:{asset.sha256}"
+                      or record.get("browser_download_url") != f"{base_url}{asset.name}"
+                  ):
+                      raise BundleError("published release asset does not match")
+
+
+          def verify_downloaded_bundle(root: Path, *, version: str, commit: str) -> VerifiedBundle:
+              """Verify authenticated build output without executing its contents."""
+              canonical_version(version)
+              if type(commit) is not str or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+                  raise BundleError("invalid build commit")
+              if root.is_symlink() or not root.is_dir():
+                  raise BundleError("invalid bundle directory")
+              wheel = f"arxiv_digest-{version}-py3-none-any.whl"
+              sdist = f"arxiv_digest-{version}.tar.gz"
+              names = {wheel, sdist, "UPDATE_MANIFEST.json", "SHA256SUMS", "RELEASE_NOTES.md", "COMMIT_SHA"}
+              if {path.name for path in root.iterdir()} != names:
+                  raise BundleError("unexpected bundle inventory")
+              before = {name: (root / name).lstat() for name in names}
+              if any(not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size <= 0 for info in before.values()):
+                  raise BundleError("unsafe bundle entry")
+              if before[wheel].st_size > 128 * 1024 * 1024 or before[sdist].st_size > 512 * 1024 * 1024:
+                  raise BundleError("oversize bundle asset")
+              if _read_regular_bytes(root / "COMMIT_SHA", byte_limit=41) != (commit + "\n").encode("ascii"):
+                  raise BundleError("bundle commit mismatch")
+              payload = _read_regular_bytes(root / "UPDATE_MANIFEST.json", byte_limit=MANIFEST_BYTE_LIMIT)
+              manifest = json.loads(payload, object_pairs_hook=_strict_object, parse_constant=_reject_json_constant)
+              expected_keys = {"application_data_generation", "automatic_update", "automatic_update_from", "channel", "platforms", "product",
+                               "python", "runtime_requirements_sha256", "schema_version", "updater_protocol", "version", "wheel"}
+              if type(manifest) is not dict or set(manifest) != expected_keys:
+                  raise BundleError("invalid bundle manifest")
+              if (manifest["version"] != version or manifest["product"] != "arxiv-digest"
+                      or type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1
+                      or type(manifest["updater_protocol"]) is not int or manifest["updater_protocol"] != 1
+                      or type(manifest["application_data_generation"]) is not int or manifest["application_data_generation"] != 2
+                      or manifest["channel"] not in {"prerelease", "stable"}
+                      or manifest["platforms"] != ["darwin", "linux"]
+                      or type(manifest["automatic_update"]) is not bool
+                      or type(manifest["runtime_requirements_sha256"]) is not str
+                      or re.fullmatch(r"[0-9a-f]{64}", manifest["runtime_requirements_sha256"]) is None):
+                  raise BundleError("bundle manifest identity mismatch")
+              assets = (_asset(root / wheel), _asset(root / sdist), _asset_from_payload("UPDATE_MANIFEST.json", payload))
+              if (type(manifest["wheel"]) is not dict or set(manifest["wheel"]) != {"name", "sha256", "size"}
+                      or type(manifest["wheel"]["size"]) is not int
+                      or manifest["wheel"] != {"name": assets[0].name, "size": assets[0].size, "sha256": assets[0].sha256}):
+                  raise BundleError("bundle wheel identity mismatch")
+              expected = b"".join(f"{asset.sha256}  {asset.name}\n".encode("ascii") for asset in assets)
+              checksums = _read_regular_bytes(root / "SHA256SUMS", byte_limit=len(expected))
+              if checksums != expected:
+                  raise BundleError("bundle checksum mismatch")
+              notes = _read_regular_bytes(root / "RELEASE_NOTES.md", byte_limit=RELEASE_PAGE_BYTE_LIMIT)
+              notes.decode("utf-8")
+              if {path.name for path in root.iterdir()} != names or any(
+                      _file_identity(before[name]) != _file_identity((root / name).lstat()) for name in names):
+                  raise BundleError("bundle changed during verification")
+              return VerifiedBundle(version, commit, manifest["channel"], (*assets, _asset_from_payload("SHA256SUMS", checksums)), hashlib.sha256(notes).hexdigest())
+
+
+          def main():
+              try:
+                  bundle = verify_downloaded_bundle(Path(os.environ["BUNDLE"]), version=os.environ["VERSION"], commit=os.environ["EXPECTED_COMMIT"])
+                  if os.environ.get("VERIFY_REMOTE") == "1":
+                      payload = _read_regular_bytes(Path(os.environ["RELEASE_JSON"]), byte_limit=RELEASE_PAGE_BYTE_LIMIT)
+                      verify_github_release(payload, bundle=bundle, tag=os.environ["RELEASE_TAG"], remote_tag_commit=os.environ["REMOTE_TAG_COMMIT"])
+                  print(bundle.channel)
+                  return 0
+              except (OSError, ValueError, TypeError, KeyError, RecursionError):
+                  print("release verification failed", file=sys.stderr)
+                  return 1
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY_VERIFIER
+          channel="$(python3 -I "$RUNNER_TEMP/trusted-publish-verifier.py")"
+          printf 'channel=%s\n' "$channel" >> "$GITHUB_OUTPUT"
 
       - name: Publish new prerelease or verify existing release
         shell: bash
@@ -261,6 +646,7 @@ jobs:
           EXPECTED_COMMIT: ${{ needs.build.outputs.commit_sha }}
           BUNDLE: ${{ runner.temp }}/release-bundle
           RELEASE_JSON: ${{ runner.temp }}/release.json
+          CHANNEL: ${{ steps.bundle.outputs.channel }}
         run: |
           set -euo pipefail
 
@@ -292,69 +678,8 @@ jobs:
           }
 
           verify_release() {
-            local require_prerelease="$1"
-            REQUIRE_PRERELEASE="$require_prerelease" \
-            WHEEL_NAME="$wheel" \
-            SDIST_NAME="$sdist" \
-              python3 - <<'PY'
-          from __future__ import annotations
-
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-
-
-          def fail(reason: str) -> None:
-              raise SystemExit(f"release verification failed: {reason}")
-
-
-          release = json.loads(Path(os.environ["RELEASE_JSON"]).read_text())
-          tag = os.environ["RELEASE_TAG"]
-          bundle = Path(os.environ["BUNDLE"])
-          require_prerelease = os.environ["REQUIRE_PRERELEASE"] == "1"
-          expected_names = {
-              os.environ["WHEEL_NAME"],
-              os.environ["SDIST_NAME"],
-              "SHA256SUMS",
-          }
-
-          if release.get("tag_name") != tag:
-              fail("tag mismatch")
-          if release.get("draft") is not False:
-              fail("an existing draft requires manual inspection")
-          if require_prerelease and release.get("prerelease") is not True:
-              fail("new release was not marked as a prerelease")
-          if release.get("body") != (bundle / "RELEASE_NOTES.md").read_text():
-              fail("release notes mismatch")
-
-          raw_assets = release.get("assets")
-          if not isinstance(raw_assets, list):
-              fail("invalid asset inventory")
-
-          assets: dict[str, dict[str, object]] = {}
-          for item in raw_assets:
-              if not isinstance(item, dict):
-                  fail("invalid asset record")
-              name = item.get("name")
-              if not isinstance(name, str) or name in assets:
-                  fail("invalid or duplicate asset name")
-              assets[name] = item
-
-          if set(assets) != expected_names:
-              fail("asset inventory mismatch")
-
-          for name in sorted(expected_names):
-              path = bundle / name
-              digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-              record = assets[name]
-              if record.get("state") != "uploaded":
-                  fail("asset upload is incomplete")
-              if record.get("size") != path.stat().st_size:
-                  fail("asset size mismatch")
-              if record.get("digest") != digest:
-                  fail("asset digest mismatch")
-          PY
+            REMOTE_TAG_COMMIT="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq .sha)" \
+            VERIFY_REMOTE=1 python3 -I "$RUNNER_TEMP/trusted-publish-verifier.py"
           }
 
           verify_remote_tag
@@ -362,21 +687,24 @@ jobs:
           case "$status" in
             200)
               # Do not modify an existing release. A manually promoted release
-              # is accepted only when its notes and assets remain identical.
-              verify_release 0
+              # is accepted only when its channel, notes and assets remain identical.
+              verify_release
               verify_remote_tag
               echo "The existing release and its immutable assets match."
               ;;
             404)
+              channel_args=()
+              if [[ "$CHANNEL" == "prerelease" ]]; then channel_args+=(--prerelease); fi
               gh release create "$RELEASE_TAG" \
                 "$BUNDLE/$wheel" \
                 "$BUNDLE/$sdist" \
                 "$BUNDLE/SHA256SUMS" \
+                "$BUNDLE/UPDATE_MANIFEST.json" \
                 --repo "$GITHUB_REPOSITORY" \
                 --verify-tag \
                 --title "arXiv Digest ${RELEASE_TAG}" \
                 --notes-file "$BUNDLE/RELEASE_NOTES.md" \
-                --prerelease \
+                "${channel_args[@]}" \
                 --latest=false
 
               status="$(fetch_release)"
@@ -384,7 +712,7 @@ jobs:
                 echo "The newly created release could not be read back." >&2
                 exit 1
               fi
-              verify_release 1
+              verify_release
               verify_remote_tag
               echo "The prerelease was published and verified."
               ;;

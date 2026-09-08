@@ -1192,6 +1192,7 @@ def _structured_field_values(
         "author": set(),
         "keyword": set(),
         "phrase": set(),
+        "path": set(),
     }
     try:
         if suffix == ".py":

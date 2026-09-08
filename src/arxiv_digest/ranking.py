@@ -40,11 +40,19 @@ _TIER_ORDER = {
     RankingTier.OTHER: 2,
 }
 
+
+@dataclass(frozen=True, slots=True)
+class RankingReference:
+    arxiv_id: str
+    title: str
+
+
 @dataclass(frozen=True, slots=True)
 class RankingReason:
     kind: str
     label: str
     location: str | None
+    reference: RankingReference | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +98,28 @@ def _best_similarity(
     return score, arxiv_id
 
 
+def _paper_reference_reason(
+    kind: str,
+    prefix: str,
+    arxiv_id: str,
+    reference_titles: Mapping[str, str] | None,
+) -> RankingReason:
+    title = (
+        None
+        if reference_titles is None
+        else reference_titles.get(arxiv_id)
+    )
+    reference = (
+        None if not title else RankingReference(arxiv_id, title)
+    )
+    return RankingReason(
+        kind=kind,
+        label=prefix,
+        location=None,
+        reference=reference,
+    )
+
+
 def _mailing_position(event: ReviewEvent) -> int | None:
     positioned = tuple(
         observation.list_position
@@ -131,6 +161,7 @@ def rank_date(
     saved_vectors: Mapping[str, Mapping[str, float]],
     *,
     date_vectors: Mapping[str, Mapping[str, float]] | None = None,
+    reference_titles: Mapping[str, str] | None = None,
 ) -> tuple[RankedPaper, ...]:
     """Rank every supplied event without mutating inputs or external state."""
 
@@ -295,18 +326,20 @@ def rank_date(
         reasons = list(item.reasons)
         if seed_score > 0.0 and seed_id is not None:
             reasons.append(
-                RankingReason(
-                    kind="seed_similarity",
-                    label=f"Related to selected seed paper {seed_id}",
-                    location=None,
+                _paper_reference_reason(
+                    "seed_similarity",
+                    "Related to selected seed paper",
+                    seed_id,
+                    reference_titles,
                 )
             )
         if saved_score > 0.0 and saved_id is not None:
             reasons.append(
-                RankingReason(
-                    kind="saved_similarity",
-                    label=f"Similar to saved paper {saved_id}",
-                    location=None,
+                _paper_reference_reason(
+                    "saved_similarity",
+                    "Similar to saved paper",
+                    saved_id,
+                    reference_titles,
                 )
             )
         score = (

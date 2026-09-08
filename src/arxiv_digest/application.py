@@ -10,8 +10,8 @@ import sys
 import tempfile
 import threading
 import time
-import webbrowser
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from importlib.resources import files
 from pathlib import Path
@@ -19,11 +19,13 @@ from types import SimpleNamespace
 from typing import Any
 
 from arxiv_digest import __version__
+from arxiv_digest.browser import copy_url as copy_dashboard_url, open_browser
 from arxiv_digest.maintenance import MaintenanceBarrier
 from arxiv_digest.paths import AppPaths, resolve_paths
 from arxiv_digest.profile import ProfileRepository
 from arxiv_digest.setup import SetupRecoveryError
 from arxiv_digest.storage.database import CorruptDatabaseError
+from arxiv_digest.update_check import UpdateChecker
 from arxiv_digest.web.lifecycle import (
     ExistingInstance,
     LifecycleController,
@@ -50,11 +52,14 @@ class Application:
         start_sync: Callable[[], Any],
         browser_open: Callable[[str], bool],
         wait_for_server: Callable[[Any], None],
+        clipboard_copy: Callable[[str], bool] = copy_dashboard_url,
         output: Callable[[str], None] = print,
         doctor_action: Callable[[], int] | None = None,
         export_action: Callable[[Path], int] | None = None,
         import_action: Callable[[Path], int] | None = None,
         install_launcher_action: Callable[[], int] | None = None,
+        application_stopping: Callable[[], None] = lambda: None,
+        application_started: Callable[[], None] = lambda: None,
     ) -> None:
         self.paths = paths
         self.profile_exists = profile_exists
@@ -65,12 +70,15 @@ class Application:
         self.open_database_action = open_database
         self.start_sync = start_sync
         self.browser_open = browser_open
+        self.clipboard_copy = clipboard_copy
         self.wait_for_server = wait_for_server
         self.output = output
         self.doctor_action = doctor_action
         self.export_action = export_action
         self.import_action = import_action
         self.install_launcher_action = install_launcher_action
+        self.application_stopping = application_stopping
+        self.application_started = application_started
 
     def _view(self, intent: str, initialized: bool) -> str:
         if intent == "library":
@@ -83,24 +91,50 @@ class Application:
             return "review" if initialized else "setup"
         raise ValueError("unsupported dashboard intent")
 
-    def open_dashboard(self, intent: str) -> int:
-        initialized = self.profile_exists()
-        view = self._view(intent, initialized)
+    def _present_dashboard(self, url: str, *, copy_url: bool) -> None:
+        if copy_url:
+            if self.clipboard_copy(url):
+                self.output(
+                    "Dashboard URL copied to the clipboard. Paste it into your browser."
+                )
+            else:
+                self.output(
+                    "Could not copy the dashboard URL. Copy this address into your browser:"
+                )
+            self.output(url)
+        elif not self.browser_open(url):
+            self.output("Could not open a browser. Open this address in your browser:")
+            self.output(url)
+            self.output(
+                "Tip: in another terminal, run arxiv-digest --copy-url "
+                "to copy the dashboard address."
+            )
+
+    def open_dashboard(
+        self,
+        intent: str,
+        *,
+        instance_resolved: Callable[[], None] = lambda: None,
+        copy_url: bool = False,
+    ) -> int:
         self.paths.ensure()
         instances = self.instance_factory()
         claim = instances.acquire()
         if isinstance(claim, ExistingInstance):
+            instance_resolved()
+            view = self._view(intent, self.profile_exists())
             descriptor = claim.descriptor
+            self.application_started()
             url = (
                 f"http://127.0.0.1:{descriptor.port}/"
                 f"#token={descriptor.token}&view={view}"
             )
-            if not self.browser_open(url):
-                self.output(url)
+            self._present_dashboard(url, copy_url=copy_url)
             return 0
         server = None
         database = None
         try:
+            instance_resolved()
             self.resolve_restore_journal()
             initialized = self.profile_exists()
             view = self._view(intent, initialized)
@@ -120,11 +154,11 @@ class Application:
                 startup_nonce=server.startup_nonce,
                 token=server.token,
             )
+            self.application_started()
             if intent == "default" and initialized:
                 self.start_sync()
             url = server.launch_url(view)
-            if not self.browser_open(url):
-                self.output(url)
+            self._present_dashboard(url, copy_url=copy_url)
             self.wait_for_server(server)
             return 0
         finally:
@@ -136,6 +170,7 @@ class Application:
                     close = getattr(database, "close", None)
                     if callable(close):
                         close()
+                    self.application_stopping()
                 finally:
                     instances.release()
 
@@ -258,12 +293,19 @@ class _DefaultRuntime:
         lifecycle: LifecycleController,
         *,
         output: Callable[[str], None],
+        update_running_command: Path | None = None,
     ) -> None:
         self.paths = paths
         self.profiles = profiles
         self.maintenance = maintenance
         self.lifecycle = lifecycle
         self.output = output
+        self._update_running_command = update_running_command
+        self.update_checker = UpdateChecker(
+            detect_installation=self._detect_update_installation,
+        )
+        from arxiv_digest.update_coordinator import UpdateCoordinator
+        self.update_coordinator = UpdateCoordinator(runtime=self, paths=paths, checker=self.update_checker)
         self.store: Any = None
         self.setup: Any = None
         self.review: Any = None
@@ -292,12 +334,26 @@ class _DefaultRuntime:
         self._active_sync_job: str | None = None
         self._sync_follow_up_requested = False
         self._last_sync_report: Any = None
+        self._resume_sync_after_update = False
+        self._sync_resume_after_cancel = False
+        self._runtime_closed = False
         self._category_values: tuple[Any, ...] | None = None
         self._issued_category_pairs: set[tuple[str, str]] = set()
 
-    @staticmethod
-    def _launcher_manager() -> Any | None:
-        from arxiv_digest.desktop_launcher import DesktopLauncherManager
+    def _detect_update_installation(self, *, deadline_at: float, monotonic: Callable[[], float]):
+        from arxiv_digest.update_installation import detect_pipx_installation
+
+        return detect_pipx_installation(
+            paths=self.paths, maintenance=self.maintenance,
+            deadline_at=deadline_at, monotonic=monotonic,
+            running_command=self._update_running_command,
+        )
+
+    def _launcher_manager(self) -> Any | None:
+        from arxiv_digest.desktop_launcher import (
+            DesktopLauncherManager,
+            launcher_operation_guard,
+        )
 
         executable = shutil.which("arxiv-digest")
         if executable is None:
@@ -306,6 +362,8 @@ class _DefaultRuntime:
             platform=sys.platform,
             home=Path.home(),
             executable=Path(executable),
+            recovery_wrapper=self.paths.recovery_wrapper_path,
+            operation_guard=lambda: launcher_operation_guard(self.paths),
         )
 
     def open_database(self) -> Any:
@@ -389,6 +447,17 @@ class _DefaultRuntime:
             candidate.unlink(missing_ok=True)
 
     def _close_runtime(self) -> None:
+        from arxiv_digest.maintenance import MaintenanceTimeoutError
+        from arxiv_digest.update_contract import LOCK_WAIT_TIMEOUT_SECONDS
+        self._runtime_closed = True
+        while True:
+            try:
+                self.maintenance.drain_for_shutdown(timeout=LOCK_WAIT_TIMEOUT_SECONDS)
+                break
+            except MaintenanceTimeoutError:
+                # Keep ordinary ownership while a canceled worker is finishing.
+                # Each wait is finite; elapsed time cannot authorize release.
+                continue
         with self._pending_restores_lock:
             self._restore_shutdown = True
             timer = self._restore_cleanup_timer
@@ -401,6 +470,51 @@ class _DefaultRuntime:
         for _created, inspection in pending:
             inspection.path.unlink(missing_ok=True)
 
+    @contextmanager
+    def begin_update_quiescence(
+        self, *, timeout: float = 45.0,
+    ) -> Iterator[tuple[str, ...]]:
+        """Own the latch and outer lease until verified cleanup or shutdown.
+
+        The dedicated coordinator thread must retain this context through the
+        application's resource-close notification. No helper or installer is
+        started here, and unwinding never authorizes automatic job replay.
+        """
+        with self.maintenance.update_latch():
+            with self._jobs_lock:
+                ordinary_sync = getattr(self, "_active_sync_job", None)
+                self._resume_sync_after_update = ordinary_sync is not None and (
+                    self._jobs.get(ordinary_sync, {}).get("status") == "running"
+                )
+                self._sync_follow_up_requested = False
+                self._sync_resume_after_cancel = False
+            with self.maintenance.exclusive(cancel_active=True, timeout=timeout) as canceled:
+                with self._jobs_lock:
+                    canceled_jobs = tuple(
+                        identifier for identifier in canceled
+                        if self._jobs.get(identifier, {}).get("status") == "canceled"
+                    )
+                yield canceled_jobs
+
+    def resume_after_update_failure(self) -> None:
+        """Resume one interrupted ordinary sync after proven safe cleanup."""
+        if self.maintenance.update_active:
+            raise RuntimeError("update quiescence must be released before scheduling")
+        if self.lifecycle.is_closing or getattr(self, "_runtime_closed", False):
+            return
+        with self._jobs_lock:
+            resume = getattr(self, "_resume_sync_after_update", False)
+            self._resume_sync_after_update = False
+            active = getattr(self, "_active_sync_job", None)
+            if resume and active is not None and self._jobs.get(active, {}).get("status") == "running":
+                # A drain timeout can leave the canceled pass finishing. Keep
+                # cancellation set until that pass returns, then let the
+                # existing bounded follow-up loop run one ordinary pass.
+                self._sync_resume_after_cancel = True
+                return
+        if resume:
+            self.start_sync()
+
     def _require_open(self) -> None:
         if self.store is None:
             raise RuntimeError("application services are not initialized")
@@ -412,6 +526,14 @@ class _DefaultRuntime:
         except KeyError:
             return False
         return True
+
+    def update_status(self, payload: dict[str, Any]) -> dict[str, str]:
+        active = self.update_coordinator.status()
+        if active is not None:
+            return active
+        if not self.maintenance.update_active:
+            self.update_checker.start()
+        return self.update_checker.snapshot()
 
     def status(self, payload: dict[str, Any]) -> dict[str, Any]:
         from arxiv_digest.doctor import _redacted_sync_error_code
@@ -622,25 +744,48 @@ class _DefaultRuntime:
         initial_fields: Mapping[str, Any] | None = None,
     ) -> str:
         job_id = job_id or f"{prefix}_{secrets.token_urlsafe(12)}"
-        with self._jobs_lock:
-            active_jobs = sum(
-                value.get("status") == "running"
-                for value in self._jobs.values()
-            )
-            if active_jobs >= _MAX_ACTIVE_BACKGROUND_JOBS:
-                raise ValueError("too many active background jobs")
-            if job_id in self._jobs:
-                raise ValueError("background job identifier already exists")
-            job = {
-                "job_id": job_id,
-                "status": "running",
-                "complete": False,
-                "failed": False,
-            }
-            job.update(initial_fields or {})
-            self._jobs[job_id] = job
+        canceled_by_update = threading.Event()
 
-        worker_registered = threading.Event()
+        def cancel() -> None:
+            if self.maintenance.update_active and request_cancel is not None:
+                canceled_by_update.set()
+            if request_cancel is not None:
+                request_cancel()
+
+        # Registration is synchronous and atomic with the update latch. A
+        # coordinator can therefore cancel/drain a worker even in the gap
+        # before its thread starts, and rejected work never publishes a job.
+        reservation = self.maintenance.reserve_worker(job_id, cancel)
+        lifecycle_registered = False
+        job = None
+        try:
+            with self._jobs_lock:
+                active_jobs = sum(
+                    value.get("status") == "running"
+                    for value in self._jobs.values()
+                )
+                if active_jobs >= _MAX_ACTIVE_BACKGROUND_JOBS:
+                    raise ValueError("too many active background jobs")
+                if job_id in self._jobs:
+                    raise ValueError("background job identifier already exists")
+                job = {
+                    "job_id": job_id,
+                    "status": "running",
+                    "complete": False,
+                    "failed": False,
+                }
+                job.update(initial_fields or {})
+                self._jobs[job_id] = job
+            self.lifecycle.worker_started(kind, job_id)
+            lifecycle_registered = True
+        except BaseException:
+            reservation.close()
+            with self._jobs_lock:
+                # Do not discard an older record when admission found a
+                # duplicate ID; only remove this invocation's own object.
+                if job is not None and self._jobs.get(job_id) is job:
+                    self._jobs.pop(job_id, None)
+            raise
 
         def prune_terminal_jobs() -> None:
             terminal_ids = [
@@ -651,58 +796,51 @@ class _DefaultRuntime:
             for identifier in terminal_ids[:-_MAX_RETAINED_TERMINAL_JOBS]:
                 self._jobs.pop(identifier, None)
 
-        def record_failure(error: Exception) -> None:
-            code = getattr(error, "code", None)
+        def finish_job(*, result: Any = None, error: BaseException | None = None) -> None:
             with self._jobs_lock:
-                self._jobs[job_id].update(
-                    status="failed",
-                    complete=False,
-                    failed=True,
-                    error_code=(
-                        code if isinstance(code, str) else "job_failed"
-                    ),
-                    message="The background operation did not complete.",
-                )
+                if canceled_by_update.is_set():
+                    self._jobs[job_id].update(
+                        status="canceled", complete=True, failed=False,
+                        error_code="canceled_for_update",
+                        message="The update stopped this job. Retry it manually if needed.",
+                    )
+                elif error is not None:
+                    code = getattr(error, "code", None)
+                    self._jobs[job_id].update(
+                        status="failed", complete=False, failed=True,
+                        error_code=code if isinstance(code, str) else "job_failed",
+                        message="The background operation did not complete.",
+                    )
+                else:
+                    self._jobs[job_id].update(
+                        status="completed", complete=True, failed=False, result=result,
+                    )
                 prune_terminal_jobs()
 
         def run() -> None:
-            try:
-                with self.maintenance.worker(
-                    job_id,
-                    request_cancel or (lambda: None),
-                ):
-                    worker_registered.set()
-                    self.lifecycle.worker_started(kind, job_id)
+            with reservation.activate():
+                try:
                     try:
-                        try:
-                            result = operation()
-                        except Exception as error:
-                            record_failure(error)
-                        else:
-                            with self._jobs_lock:
-                                self._jobs[job_id].update(
-                                    status="completed",
-                                    complete=True,
-                                    failed=False,
-                                    result=result,
-                                )
-                                prune_terminal_jobs()
-                    finally:
-                        self.lifecycle.worker_finished(kind, job_id)
-            except Exception as error:
-                record_failure(error)
-            finally:
-                worker_registered.set()
+                        result = operation()
+                    except BaseException as error:
+                        finish_job(error=error)
+                    else:
+                        finish_job(result=result)
+                finally:
+                    self.lifecycle.worker_finished(kind, job_id)
 
-        threading.Thread(
-            target=run,
-            name=f"arxiv-digest-{prefix}",
-            daemon=True,
-        ).start()
-        # Do not expose a running job ID until it is registered. Otherwise a
-        # restore can acquire exclusive maintenance in the thread-start gap
-        # and let the stale job begin after replacement.
-        worker_registered.wait()
+        try:
+            threading.Thread(
+                target=run,
+                name=f"arxiv-digest-{prefix}",
+                daemon=True,
+            ).start()
+        except BaseException as error:
+            reservation.close()
+            if lifecycle_registered:
+                self.lifecycle.worker_finished(kind, job_id)
+            finish_job(error=error)
+            raise
         return job_id
 
     def _job_status(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1553,6 +1691,10 @@ class _DefaultRuntime:
                     retry_failed_dates=retry_failed_dates,
                 )
                 with self._jobs_lock:
+                    if getattr(self, "_sync_resume_after_cancel", False):
+                        self._sync_resume_after_cancel = False
+                        self._sync_cancel.clear()
+                        self._sync_follow_up_requested = True
                     if not self._sync_follow_up_requested:
                         self._active_sync_job = None
                         return report
@@ -2558,6 +2700,13 @@ class _DefaultRuntime:
         self._require_open()
         return {
             "status": self.status,
+            "update": self.update_status,
+            "update_start": lambda payload: self._update_response(202, self.update_coordinator.start(payload["target_version"])),
+            "update_job": lambda payload: self.update_coordinator.job(payload["job_id"]),
+            "update_commit": lambda payload: self._update_response(202, self.update_coordinator.commit(payload["job_id"])),
+            "update_handoff_ack": lambda payload: self.update_coordinator.handoff_ack(payload["job_id"]),
+            "update_receipt": lambda payload: self.update_coordinator.receipt(),
+            "update_receipt_ack": lambda payload: self.update_coordinator.acknowledge_receipt(payload["receipt_id"]),
             "categories": self._categories,
             "setup_draft_get": lambda payload: self._setup_payload(
                 self.setup.start()
@@ -2616,9 +2765,17 @@ class _DefaultRuntime:
             "backup_export": self._backup_export,
             "backup_inspect": self._backup_inspect,
             "backup_restore": self._backup_restore,
-            "application_quit": lambda payload: self.lifecycle.request_quit()
-            or {"quitting": True},
+            "application_quit": self._application_quit,
         }
+
+    @staticmethod
+    def _update_response(status, data):
+        from arxiv_digest.web.api import JsonPayload
+        return JsonPayload(status, data)
+
+    def _application_quit(self, payload: dict[str, Any]) -> dict[str, bool]:
+        self.lifecycle.request_quit()
+        return {"quitting": True}
 
     def server(self, handlers: Mapping[str, Callable]) -> LoopbackServer:
         return LoopbackServer(
@@ -2626,6 +2783,7 @@ class _DefaultRuntime:
             known_paper=self.known_paper,
             static_assets=_packaged_static_assets(),
             lifecycle=self.lifecycle,
+            maintenance=self.maintenance,
         )
 
     def _sync_configs(self) -> tuple[Any, ...]:
@@ -2698,9 +2856,11 @@ def _standalone_import(
 def create_application(
     *,
     paths: AppPaths | None = None,
-    browser_open: Callable[[str], bool] = webbrowser.open,
+    browser_open: Callable[[str], bool] = open_browser,
     input_text: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
+    application_started: Callable[[], None] = lambda: None,
+    update_running_command: Path | None = None,
 ) -> Application:
     """Compose the installed application without creating persistent state."""
 
@@ -2721,6 +2881,7 @@ def create_application(
         maintenance,
         lifecycle,
         output=output,
+        update_running_command=update_running_command,
     )
 
     def doctor_action() -> int:
@@ -2765,4 +2926,6 @@ def create_application(
             output=output,
         ),
         install_launcher_action=launcher_action,
+        application_stopping=runtime.update_coordinator.application_stopping,
+        application_started=application_started,
     )

@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit
 
-from arxiv_digest.maintenance import MaintenanceTimeoutError, WorkActiveError
+from arxiv_digest.maintenance import (
+    MaintenanceBarrier, MaintenanceTimeoutError, UpdateInProgressError, WorkActiveError,
+)
 from arxiv_digest.sources.xml import parse_arxiv_id
 
 
@@ -23,6 +25,10 @@ JSON_BODY_LIMIT = 64 * 1024
 BACKUP_BODY_LIMIT = 64 * 1024 * 1024
 QUERY_TEXT_LIMIT = 200
 QUERY_STRING_LIMIT = 2048
+_UPDATE_CONTROL_OPERATIONS = frozenset({
+    "status", "update", "update_start", "update_job", "update_commit",
+    "update_handoff_ack", "update_receipt", "update_receipt_ack",
+})
 
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 Handler = Callable[[dict[str, Any]], Any]
@@ -53,6 +59,12 @@ class ApiResponse:
 class BinaryPayload:
     data: bytes
     filename: str = "arxiv-digest-backup.zip"
+
+
+@dataclass(frozen=True, slots=True)
+class JsonPayload:
+    status: int
+    data: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +251,13 @@ def _route(
 _R = _route
 _ROUTES = (
     _R("GET", "/api/v1/status", "status"),
+    _R("GET", "/api/v1/update", "update"),
+    _R("POST", "/api/v1/update/start", "update_start", body_kind="json", required=("target_version",), validators={"target_version": lambda value: isinstance(value, str) and len(value) <= 64 and re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", value) is not None}),
+    _R("GET", "/api/v1/update/jobs/{job_id}", "update_job"),
+    _R("POST", "/api/v1/update/jobs/{job_id}/commit", "update_commit", body_kind="json"),
+    _R("POST", "/api/v1/update/jobs/{job_id}/handoff-ack", "update_handoff_ack", body_kind="json"),
+    _R("GET", "/api/v1/update/receipt", "update_receipt"),
+    _R("POST", "/api/v1/update/receipt/{receipt_id}/ack", "update_receipt_ack", body_kind="json"),
     _R("GET", "/api/v1/categories", "categories", query_optional=("q",), query_validators={"q": _is_optional_text}),
     _R("GET", "/api/v1/setup/draft", "setup_draft_get"),
     _R("PUT", "/api/v1/setup/draft", "setup_draft_put", body_kind="json"),
@@ -299,6 +318,8 @@ API_OPERATIONS = frozenset(route.operation for route in _ROUTES)
 _DYNAMIC_PATTERN = re.compile(
     r"(?P<prefix>/api/v1/(?:setup/jobs|downloads))/(?P<job_id>[A-Za-z0-9_-]{8,128})"
 )
+_UPDATE_JOB_PATTERN = re.compile(r"/api/v1/update/jobs/(?P<job_id>[a-f0-9]{64})(?P<suffix>/(?:commit|handoff-ack))?")
+_UPDATE_RECEIPT_PATTERN = re.compile(r"/api/v1/update/receipt/(?P<receipt_id>[a-f0-9]{64})/ack")
 
 
 _SETUP_DRAFT_FIELDS: dict[
@@ -396,6 +417,16 @@ def project_review_page(payload: ReviewPagePayload) -> dict[str, JsonValue]:
                     "kind": reason.kind,
                     "label": reason.label,
                     "location": reason.location,
+                    **(
+                        {
+                            "reference": {
+                                "arxiv_id": reason.reference.arxiv_id,
+                                "title": reason.reference.title,
+                            }
+                        }
+                        if reason.reference is not None
+                        else {}
+                    ),
                 }
                 for reason in ranked.reasons
             ],
@@ -623,6 +654,15 @@ def _match_route(
     path_routes = tuple(route for route in _ROUTES if route.template == path)
     dynamic = _DYNAMIC_PATTERN.fullmatch(path)
     path_values: dict[str, Any] = {}
+    update_job = _UPDATE_JOB_PATTERN.fullmatch(path)
+    update_receipt = _UPDATE_RECEIPT_PATTERN.fullmatch(path)
+    if update_job is not None:
+        template = "/api/v1/update/jobs/{job_id}" + (update_job.group("suffix") or "")
+        path_routes = tuple(route for route in _ROUTES if route.template == template)
+        path_values = {"job_id": update_job.group("job_id")}
+    elif update_receipt is not None:
+        path_routes = tuple(route for route in _ROUTES if route.operation == "update_receipt_ack")
+        path_values = {"receipt_id": update_receipt.group("receipt_id")}
     if dynamic is not None:
         template = (
             "/api/v1/setup/jobs/{job_id}"
@@ -661,6 +701,8 @@ class ApiRouter:
         host: str,
         handlers: Mapping[str, Handler],
         known_paper: KnownPaper | None = None,
+        maintenance: MaintenanceBarrier | None = None,
+        allow_update_quit: Callable[[], bool] = lambda: False,
     ) -> None:
         if not token:
             raise ValueError("API token must not be blank")
@@ -668,6 +710,15 @@ class ApiRouter:
         self.host = host
         self.handlers = dict(handlers)
         self.known_paper = known_paper or (lambda arxiv_id: True)
+        self.maintenance = maintenance
+        self.allow_update_quit = allow_update_quit
+
+    def _allowed_during_update(self, request: ApiRequest) -> bool:
+        route, _, _ = _match_route(request.method, urlsplit(request.target).path)
+        return route is not None and (
+            route.operation in _UPDATE_CONTROL_OPERATIONS
+            or route.operation == "application_quit" and self.allow_update_quit()
+        )
 
     def preflight(self, request: ApiRequest) -> ApiResponse | None:
         """Validate request authority before an HTTP adapter reads its body."""
@@ -698,6 +749,11 @@ class ApiRouter:
                 "origin_required",
                 "Mutations require the dashboard's exact local origin.",
             )
+        if (
+            self.maintenance is not None and self.maintenance.update_active
+            and not self._allowed_during_update(request)
+        ):
+            return _error(409, "update_in_progress", "An application update is in progress.")
         return None
 
     def _decode_query(
@@ -787,7 +843,7 @@ class ApiRouter:
         request: ApiRequest,
     ) -> tuple[dict[str, Any] | None, ApiResponse | None]:
         if not request.body:
-            if route.required:
+            if route.required or route.operation in {"update_commit", "update_handoff_ack", "update_receipt_ack"}:
                 return None, _error(
                     400, "invalid_request", "A JSON body is required."
                 )
@@ -836,11 +892,22 @@ class ApiRouter:
         return payload, None
 
     def dispatch(self, request: ApiRequest) -> ApiResponse:
-        split = urlsplit(request.target)
-        path = split.path
         preflight_error = self.preflight(request)
         if preflight_error is not None:
             return preflight_error
+        if self.maintenance is None:
+            return self._dispatch_admitted(request)
+        try:
+            with self.maintenance.handler(
+                allow_during_update=self._allowed_during_update(request),
+            ):
+                return self._dispatch_admitted(request)
+        except UpdateInProgressError:
+            return _error(409, "update_in_progress", "An application update is in progress.")
+
+    def _dispatch_admitted(self, request: ApiRequest) -> ApiResponse:
+        split = urlsplit(request.target)
+        path = split.path
         route, path_values, allowed = _match_route(request.method, path)
         if route is None:
             if allowed:
@@ -931,14 +998,21 @@ class ApiRouter:
                     },
                     result.data,
                 )
+            response_status = 200
+            if isinstance(result, JsonPayload):
+                if result.status not in {200, 202}:
+                    raise ValueError("invalid JSON success response status")
+                response_status, result = result.status, result.data
             return _json_response(
-                200,
+                response_status,
                 {
                     "api_version": "v1",
                     "ok": True,
                     "data": _jsonable(result),
                 },
             )
+        except UpdateInProgressError:
+            return _error(409, "update_in_progress", "An application update is in progress.")
         except WorkActiveError:
             return _error(
                 409,
@@ -965,8 +1039,9 @@ class ApiRouter:
                 and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", code)
                 else "domain_error"
             )
+            from arxiv_digest.update_coordinator import UpdateRequestError
             return _error(
-                400,
+                409 if isinstance(error, UpdateRequestError) else 400,
                 safe_code,
                 (
                     str(error)

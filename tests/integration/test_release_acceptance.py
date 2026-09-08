@@ -19,7 +19,11 @@ from arxiv_digest.candidates import (
     candidate_corpus_hash,
     search_candidate_papers,
 )
-from arxiv_digest.desktop_launcher import DesktopLauncherManager, LauncherState
+from arxiv_digest.desktop_launcher import (
+    DesktopLauncherManager,
+    LauncherState,
+    launcher_operation_guard,
+)
 from arxiv_digest.downloads import DownloadManager, safe_pdf_filename
 from arxiv_digest.folders import FolderService
 from arxiv_digest.models import (
@@ -135,10 +139,19 @@ def _complete_setup(
     executable = root / "bin" / "arxiv-digest"
     executable.parent.mkdir()
     executable.write_bytes(b"synthetic installed console entry\n")
+    launcher_paths = resolve_paths(
+        platform="linux",
+        home=root / "home",
+        environ={
+            "ARXIV_DIGEST_TESTING": "1",
+            "ARXIV_DIGEST_TEST_ROOT": str(root / "launcher-coordination"),
+        },
+    )
     launcher = DesktopLauncherManager(
         platform="linux",
         home=root / "home",
         executable=executable,
+        operation_guard=lambda: launcher_operation_guard(launcher_paths),
     )
     service = SetupService(
         database_path,

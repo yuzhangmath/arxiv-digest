@@ -19,6 +19,21 @@ test("library explains that a blank search lists saved papers below", () => {
   assert.match(root.textContent, /Leave the search blank to show all saved papers below\./);
 });
 
+test("library identifies its newest-first paper order", () => {
+  const root = new FakeNode("main");
+  renderLibraryView(new FakeDocument(), root, { query: "", entries: [] });
+
+  const guidance = descendants(root, "p").find((node) =>
+    node.className === "library-order-guidance"
+  );
+  assert.equal(
+    guidance.textContent,
+    "With search blank, saved papers are ordered by original arXiv " +
+      "submission date, newest first. Search results prioritize relevance, " +
+      "then recency.",
+  );
+});
+
 test("library distinguishes an empty collection from a search with no matches", () => {
   const empty = new FakeNode("main");
   const filtered = new FakeNode("main");
@@ -35,6 +50,41 @@ test("library distinguishes an empty collection from a search with no matches", 
   assert.doesNotMatch(empty.textContent, /match this search/);
   assert.match(filtered.textContent, /No saved papers match this search\./);
   assert.doesNotMatch(filtered.textContent, /No saved papers yet/);
+});
+
+test("library links each paper to its latest known arXiv abstract and PDF", () => {
+  const root = new FakeNode("main");
+  renderLibraryView(new FakeDocument(), root, {
+    entries: [{
+      metadata: {
+        arxiv_id: "2608.01234",
+        title: "Linked paper",
+        authors: ["Ada Example"],
+      },
+      saved_version: 1,
+      latest_version: 3,
+      paper_available: true,
+      local_pdf_versions: [],
+    }],
+  });
+
+  const links = descendants(root, "a");
+  assert.deepEqual(
+    links.map((link) => link.textContent),
+    ["Abstract on arXiv", "PDF on arXiv"],
+  );
+  assert.equal(
+    links[0].getAttribute("href"),
+    "https://arxiv.org/abs/2608.01234v3",
+  );
+  assert.equal(
+    links[1].getAttribute("href"),
+    "https://arxiv.org/pdf/2608.01234v3.pdf",
+  );
+  for (const link of links) {
+    assert.equal(link.getAttribute("target"), "_blank");
+    assert.equal(link.getAttribute("rel"), "noopener noreferrer");
+  }
 });
 
 test("library search and pagination are delegated to the local API", async () => {

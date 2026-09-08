@@ -134,6 +134,22 @@ test("aborting during error parsing prevents stale authentication side effects",
   assert.equal(cleared, 0);
 });
 
+test("canceling update observation leaves other API requests intact and rejects late results", async () => {
+  const requests = [];
+  const client = new ApiClient("http://127.0.0.1:8765", TOKEN, (_url, options) =>
+    new Promise((resolve) => requests.push({options, resolve})));
+  const update = client.json("release-update", "/api/v1/update");
+  const review = client.json("review", "/api/v1/review/summary");
+  client.abort("release-update");
+  assert.equal(requests[0].options.signal.aborted, true);
+  assert.equal(requests[1].options.signal.aborted, false);
+  for (const request of requests) {
+    request.resolve(response(200, {api_version: "v1", ok: true, data: {ready: true}}));
+  }
+  await assert.rejects(update, StaleResponseError);
+  assert.deepEqual(await review, {ready: true});
+});
+
 test("401 invokes authentication clearing and exposes a structured redacted error", async () => {
   let cleared = 0;
   const client = new ApiClient(
@@ -174,4 +190,28 @@ test("detached browser fetch is invoked with the global object", async () => {
   assert.deepEqual(await client.json("status", "/api/v1/status"), {
     bound: true,
   });
+});
+
+
+test("an update request gate blocks ordinary network work before fetch", async () => {
+  let calls = 0;
+  const api = new ApiClient("http://127.0.0.1:43123", "synthetic-token", async () => {
+    calls++;
+    return {ok: true, json: async () => ({api_version: "v1", ok: true, data: {}})};
+  });
+  api.requestAllowed = (path) => path.startsWith("/api/v1/update");
+  await assert.rejects(api.json("library", "/api/v1/library"), (error) => error.status === 409 && error.code === "update_in_progress");
+  await api.json("update", "/api/v1/update");
+  assert.equal(calls, 1);
+});
+
+
+test("authoritative update rejection notifies the flow with the structured error", async () => {
+  const errors = [];
+  const api = new ApiClient("http://127.0.0.1:43123", "synthetic-token", async () => ({
+    ok: false, status: 409,
+    json: async () => ({api_version: "v1", ok: false, error: {code: "update_in_progress", message: "Preparing update."}}),
+  }), () => {}, (error) => errors.push(error));
+  await assert.rejects(api.json("ordinary", "/api/v1/settings"));
+  assert.equal(errors[0].code, "update_in_progress");
 });

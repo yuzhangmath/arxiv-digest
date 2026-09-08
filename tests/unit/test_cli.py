@@ -10,8 +10,13 @@ class FakeApplication:
     def __init__(self) -> None:
         self.calls = []
 
-    def open_dashboard(self, intent: str) -> int:
-        self.calls.append(("dashboard", intent))
+    def open_dashboard(
+        self, intent: str, *, instance_resolved=lambda: None, copy_url=False
+    ) -> int:
+        self.calls.append(
+            ("dashboard", intent, "copy") if copy_url else ("dashboard", intent)
+        )
+        instance_resolved()
         return 0
 
     def doctor(self) -> int:
@@ -62,6 +67,161 @@ def test_malformed_and_email_commands_fail_before_application_creation() -> None
         assert raised.value.code != 0
 
     assert created == []
+
+
+@pytest.mark.parametrize(
+    ("arguments", "intent"),
+    [
+        (["--copy-url"], "default"),
+        (["init", "--copy-url"], "init"),
+        (["library", "--copy-url"], "library"),
+        (["config", "--copy-url"], "config"),
+        (["--copy-url", "init"], "init"),
+    ],
+)
+def test_cli_can_copy_each_dashboard_url(arguments, intent) -> None:
+    from arxiv_digest.cli import main
+
+    application = FakeApplication()
+    assert main(arguments, application_factory=lambda: application) == 0
+    assert application.calls == [("dashboard", intent, "copy")]
+
+
+def test_copy_url_rejects_non_dashboard_commands_before_application_creation() -> None:
+    from arxiv_digest.cli import main
+
+    for command in ("doctor", "export", "import", "install-launcher"):
+        arguments = ["--copy-url", command]
+        if command in {"export", "import"}:
+            arguments.append("synthetic-backup.zip")
+        with pytest.raises(SystemExit) as raised:
+            main(
+                arguments,
+                application_factory=lambda: pytest.fail("created application"),
+            )
+        assert raised.value.code == 2
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize(("copy_requested", "copied"), [
+    (True, False), (True, True), (False, False),
+])
+def test_dashboard_url_fallback_preserves_session_and_server_lifetime(
+    existing, copy_requested, copied
+):
+    from types import SimpleNamespace
+
+    from arxiv_digest.application import Application
+    from arxiv_digest.web.lifecycle import ExistingInstance, RuntimeDescriptor
+
+    events = []
+    output = []
+    url = f"http://127.0.0.1:43123/#token={'B' * 43}&view=library"
+    descriptor = RuntimeDescriptor(
+        pid=123,
+        port=43123,
+        startup_nonce="nonce_abcd12345678",
+        token="B" * 43,
+        started_at="2026-08-22T12:00:00Z",
+    )
+    claim = ExistingInstance(descriptor) if existing else SimpleNamespace(
+        publish=lambda **kwargs: events.append("publish")
+    )
+    server = SimpleNamespace(
+        port=43123,
+        token="B" * 43,
+        startup_nonce="nonce_abcd12345678",
+        start=lambda: events.append("start"),
+        stop=lambda: events.append("stop"),
+        launch_url=lambda view: url,
+    )
+
+    def copy(value):
+        assert copy_requested
+        assert value == url
+        events.append("copy")
+        return copied
+
+    def open_browser(value):
+        assert not copy_requested
+        assert value == url
+        events.append("browser")
+        return False
+
+    application = Application(
+        paths=SimpleNamespace(ensure=lambda: None),
+        profile_exists=lambda: True,
+        instance_factory=lambda: SimpleNamespace(
+            acquire=lambda: claim,
+            release=lambda: events.append("release"),
+        ),
+        server_factory=lambda handlers: server,
+        handlers_factory=lambda: {},
+        resolve_restore_journal=lambda: events.append("restore"),
+        open_database=lambda: events.append("database"),
+        start_sync=lambda: pytest.fail("library launch started sync"),
+        browser_open=open_browser,
+        clipboard_copy=copy,
+        wait_for_server=lambda running: events.append("wait"),
+        output=output.append,
+    )
+
+    assert application.open_dashboard("library", copy_url=copy_requested) == 0
+    assert url in output
+    assert ("copied to the clipboard" in "\n".join(output)) is copied
+    if copy_requested and not copied:
+        assert "Could not copy" in "\n".join(output)
+    if not copy_requested:
+        assert "Could not open a browser" in "\n".join(output)
+        assert "arxiv-digest --copy-url" in "\n".join(output)
+    action = "copy" if copy_requested else "browser"
+    assert events == ([action] if existing else [
+        "restore", "database", "start", "publish", action, "wait", "stop", "release"
+    ])
+
+
+def test_cli_preflight_wraps_the_complete_non_dashboard_operation() -> None:
+    from arxiv_digest.cli import PreflightDisposition, main
+
+    events: list[str] = []
+
+    class Paths:
+        update_transition_lock_path = Path("/fixed/update-transition.lock")
+        update_journal_path = Path("/fixed/update-journal.json")
+        recovery_wrapper_path = Path("/fixed/recover-arxiv-digest")
+
+        def ensure_update_coordination(self) -> None:
+            events.append("ensure-coordination")
+
+    class Transition:
+        def release(self) -> None:
+            events.append("release-transition")
+
+    class Application(FakeApplication):
+        def doctor(self) -> int:
+            events.append("action")
+            return 0
+
+    assert main(
+        ["doctor"],
+        application_factory=lambda: events.append("application") or Application(),
+        paths_factory=lambda: events.append("paths") or Paths(),
+        journal_classifier=lambda path: events.append(f"classify:{path}")
+        or PreflightDisposition.ALLOW,
+        transition_acquire=lambda path: events.append(f"acquire:{path}")
+        or Transition(),
+        internal_dispatch=lambda argv: events.append("internal-recognizer"),
+    ) == 0
+    assert events == [
+        "internal-recognizer",
+        "paths",
+        "ensure-coordination",
+        "acquire:/fixed/update-transition.lock",
+        "classify:/fixed/update-journal.json",
+        "application",
+        "action",
+        "release-transition",
+    ]
 
 
 def test_python_module_entrypoint_delegates_to_cli(monkeypatch) -> None:
@@ -198,6 +358,54 @@ def test_second_invocation_opens_verified_instance_without_server_or_mutation() 
         )
 
 
+def test_dashboard_reports_instance_resolution_before_browser_or_data_access() -> None:
+    from arxiv_digest.application import Application
+    from arxiv_digest.web.lifecycle import ExistingInstance, RuntimeDescriptor
+
+    events: list[str] = []
+    descriptor = RuntimeDescriptor(
+        pid=123,
+        port=43123,
+        startup_nonce="nonce_abcd12345678",
+        token="B" * 43,
+        started_at="2026-08-22T12:00:00Z",
+    )
+
+    class Paths:
+        def ensure(self) -> None:
+            events.append("ensure-data")
+
+    class Instances:
+        def acquire(self):
+            events.append("instance-resolved")
+            return ExistingInstance(descriptor)
+
+    application = Application(
+        paths=Paths(),
+        profile_exists=lambda: events.append("profile") or True,
+        instance_factory=Instances,
+        server_factory=lambda handlers: None,
+        handlers_factory=lambda: {},
+        resolve_restore_journal=lambda: events.append("restore"),
+        open_database=lambda: events.append("database"),
+        start_sync=lambda: events.append("sync"),
+        browser_open=lambda url: events.append("browser") or True,
+        wait_for_server=lambda server: None,
+    )
+
+    assert application.open_dashboard(
+        "default",
+        instance_resolved=lambda: events.append("transition-released"),
+    ) == 0
+    assert events == [
+        "ensure-data",
+        "instance-resolved",
+        "transition-released",
+        "profile",
+        "browser",
+    ]
+
+
 def test_standalone_export_refuses_a_running_dashboard_before_snapshot(tmp_path) -> None:
     from arxiv_digest.application import Application
     from arxiv_digest.web.lifecycle import ExistingInstance, RuntimeDescriptor
@@ -239,6 +447,38 @@ def test_standalone_export_refuses_a_running_dashboard_before_snapshot(tmp_path)
     with pytest.raises(RuntimeError, match="Settings"):
         application.export_backup(tmp_path / "backup.zip")
     assert exported == []
+
+
+def test_dashboard_releases_new_instance_when_transition_callback_fails() -> None:
+    from types import SimpleNamespace
+
+    from arxiv_digest.application import Application
+
+    events: list[str] = []
+
+    def callback() -> None:
+        events.append("callback")
+        raise OSError("transition release failed")
+
+    application = Application(
+        paths=SimpleNamespace(ensure=lambda: None),
+        profile_exists=lambda: events.append("profile") or False,
+        instance_factory=lambda: SimpleNamespace(
+            acquire=lambda: object(),
+            release=lambda: events.append("release-instance"),
+        ),
+        server_factory=lambda handlers: events.append("server"),
+        handlers_factory=lambda: {},
+        resolve_restore_journal=lambda: events.append("restore"),
+        open_database=lambda: events.append("database"),
+        start_sync=lambda: None,
+        browser_open=lambda url: True,
+        wait_for_server=lambda server: None,
+    )
+
+    with pytest.raises(OSError, match="transition release failed"):
+        application.open_dashboard("default", instance_resolved=callback)
+    assert events == ["callback", "release-instance"]
 
 
 def test_standalone_import_holds_ownership_across_recovery_and_restore(tmp_path) -> None:

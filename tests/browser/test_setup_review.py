@@ -86,6 +86,13 @@ class FixtureApplication:
         self.sync_status_failures = 0
         self.sync_status_gate: threading.Event | None = None
         self.sync_status_entered = threading.Event()
+        self.update_status: dict[str, object] = {
+            "status": "current",
+            "automatic_update": False,
+            "installed_version": "0.2.1",
+        }
+        self.update_status_sequence: list[dict[str, object]] = []
+        self.update_requests = 0
         self.settings_missing_exact_dates: list[str] = []
         self.settings_failed_daily_list_dates: list[str] = []
         self.settings_retryable_failed_daily_list_dates: list[str] = []
@@ -677,12 +684,12 @@ class FixtureApplication:
     def _set_spec(category: str) -> str:
         return f"arXiv:{category}"
 
-    def review_calendar(self, _payload: dict[str, object]) -> list[dict[str, object]]:
+    def review_calendar(self, payload: dict[str, object]) -> list[dict[str, object]]:
         with self.lock:
             visible = bool(self._active_support("2026-08-03"))
         if not visible:
             return []
-        return [
+        entries = [
             {
                 "day": "2026-08-01",
                 "total_papers": 14,
@@ -704,7 +711,17 @@ class FixtureApplication:
                 "newly_discovered": 1,
                 "finished": False,
             },
+            {
+                "day": "2026-09-01",
+                "total_papers": 5,
+                "unreviewed_papers": 5,
+                "newly_discovered": 0,
+                "finished": False,
+            },
         ]
+        start = str(payload["start"])
+        end = str(payload["end"])
+        return [entry for entry in entries if start <= str(entry["day"]) <= end]
 
     def interests(self, payload: dict[str, object]) -> dict[str, object]:
         with self.lock:
@@ -783,10 +800,18 @@ class FixtureApplication:
             revision = self.review_profile_revision
         return {"revision": revision}
 
+    def release_update(self, _payload: dict[str, object]) -> dict[str, object]:
+        with self.lock:
+            self.update_requests += 1
+            if self.update_status_sequence:
+                return dict(self.update_status_sequence.pop(0))
+            return dict(self.update_status)
+
     def handlers(self) -> dict[str, object]:
         empty = lambda _payload: {}
         return {
             "status": self.status,
+            "update": self.release_update,
             "categories": self.categories,
             "setup_draft_get": self.draft,
             "setup_draft_put": self.update_draft,
@@ -1011,6 +1036,75 @@ def navigate_with_history(page: Page, view: str) -> None:
         """,
         view,
     )
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_startup_shows_a_link_when_a_new_release_is_available(engine: str) -> None:
+    with (
+        running_fixture() as (server, application),
+        browser_page(engine) as page,
+    ):
+        available = {
+            "status": "available_manual",
+            "automatic_update": False,
+            "installed_version": "0.2.1",
+            "available_version": "0.3.0",
+            "release_notes_url": (
+                "https://github.com/yuzhangmath/arxiv-digest/"
+                "releases/tag/v0.3.0"
+            ),
+        }
+        application.update_status = available
+        application.update_status_sequence = [
+            {"status": "checking", "automatic_update": False},
+            available,
+        ]
+
+        page.goto(server.launch_url("setup"))
+
+        link = page.get_by_role("link", name="View update instructions")
+        link.wait_for()
+        assert application.update_requests >= 2
+        assert link.get_attribute("href") == (
+            "https://github.com/yuzhangmath/arxiv-digest/releases/tag/v0.3.0"
+        )
+        assert link.get_attribute("target") == "_blank"
+        assert link.get_attribute("rel") == "noopener noreferrer"
+        assert link.get_attribute("aria-label") == (
+            "View update instructions (opens in a new tab)"
+        )
+
+        for color_scheme in ("light", "dark"):
+            page.emulate_media(color_scheme=color_scheme)
+            link.focus()
+            contrasts = link.evaluate(
+                """element => {
+                  const channel = value => {
+                    const normalized = value / 255;
+                    return normalized <= 0.04045
+                      ? normalized / 12.92
+                      : ((normalized + 0.055) / 1.055) ** 2.4;
+                  };
+                  const luminance = value => {
+                    const channels = value.match(/[0-9.]+/g)
+                      .slice(0, 3).map(Number).map(channel);
+                    return 0.2126 * channels[0] +
+                      0.7152 * channels[1] + 0.0722 * channels[2];
+                  };
+                  const ratio = (first, second) =>
+                    (Math.max(first, second) + 0.05) /
+                    (Math.min(first, second) + 0.05);
+                  const noticeStyle = getComputedStyle(element.closest("aside"));
+                  const linkStyle = getComputedStyle(element);
+                  const background = luminance(noticeStyle.backgroundColor);
+                  return {
+                    text: ratio(luminance(linkStyle.color), background),
+                    focus: ratio(luminance(linkStyle.outlineColor), background),
+                  };
+                }"""
+            )
+            assert contrasts["text"] >= 4.5
+            assert contrasts["focus"] >= 3
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
@@ -2406,6 +2500,7 @@ def test_failed_review_exit_focuses_its_retry() -> None:
 
 def test_review_date_navigation_updates_and_clears_history() -> None:
     with running_fixture() as (server, _application), browser_page("chromium") as page:
+        page.clock.install(time="2026-08-31T12:00:00Z")
         page.goto(server.launch_url("review"))
         page.get_by_role("button", name="Calendar").click()
         page.get_by_role("heading", name="Calendar", exact=True).wait_for()
@@ -2651,6 +2746,7 @@ def test_saving_two_review_cards_does_not_cancel_the_first_save() -> None:
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
 def test_calendar_navigation_opens_and_keeps_the_selected_date(engine: str) -> None:
     with running_fixture() as (server, _application), browser_page(engine) as page:
+        page.clock.install(time="2026-08-31T12:00:00Z")
         page.goto(server.launch_url("review"))
         page.get_by_role("button", name="Calendar").click()
         page.get_by_role("heading", name="Calendar", exact=True).wait_for()
@@ -2679,8 +2775,23 @@ def test_calendar_navigation_opens_and_keeps_the_selected_date(engine: str) -> N
         assert "view=review" in page.url
 
 
+def test_calendar_keeps_recent_dates_visible_across_a_month_boundary() -> None:
+    with running_fixture() as (server, _application), browser_page("chromium") as page:
+        page.clock.install(time="2026-09-01T12:00:00Z")
+        page.goto(server.launch_url("calendar"))
+
+        page.get_by_role("heading", name="Calendar", exact=True).wait_for()
+        page.get_by_role(
+            "button", name="2026-08-03: 4 papers, partial"
+        ).wait_for()
+        page.get_by_role(
+            "button", name="2026-09-01: 5 papers, unreviewed"
+        ).wait_for()
+
+
 def test_calendar_outlines_distinguish_review_states_in_light_and_dark() -> None:
     with running_fixture() as (server, _application), browser_page("chromium") as page:
+        page.clock.install(time="2026-08-31T12:00:00Z")
         page.goto(server.launch_url("calendar"))
         page.get_by_role("heading", name="Calendar", exact=True).wait_for()
         cards = {
@@ -3202,6 +3313,11 @@ def test_webkit_back_forward_cache_restore_reactivates_the_page() -> None:
     with running_fixture() as (server, application), browser_page("webkit") as page:
         page.goto(server.launch_url("setup"))
         initial_draft_requests = application.draft_requests
+        deadline = time.monotonic() + 2
+        while application.update_requests == 0 and time.monotonic() < deadline:
+            page.wait_for_timeout(50)
+        assert application.update_requests > 0
+        initial_update_requests = application.update_requests
 
         page.evaluate(
             """
@@ -3213,11 +3329,15 @@ def test_webkit_back_forward_cache_restore_reactivates_the_page() -> None:
         )
         deadline = time.monotonic() + 2
         while (
-            application.draft_requests <= initial_draft_requests
+            (
+                application.draft_requests <= initial_draft_requests
+                or application.update_requests <= initial_update_requests
+            )
             and time.monotonic() < deadline
         ):
             page.wait_for_timeout(50)
         assert application.draft_requests > initial_draft_requests
+        assert application.update_requests > initial_update_requests
 
         navigate_with_history(page, "settings")
         page.get_by_role("heading", name="Settings", exact=True).wait_for()
@@ -3449,6 +3569,16 @@ def test_shared_application_wires_library_interests_and_settings_actions() -> No
             "Leave the search blank to show all saved papers below.", exact=True
         ).wait_for()
         page.get_by_text("A dashboard library paper", exact=True).wait_for()
+        abstract_link = page.get_by_role(
+            "link", name="Abstract on arXiv", exact=True
+        )
+        pdf_link = page.get_by_role("link", name="PDF on arXiv", exact=True)
+        assert abstract_link.get_attribute("href").endswith(
+            "/abs/2608.01234v2"
+        )
+        assert pdf_link.get_attribute("href").endswith(
+            "/pdf/2608.01234v2.pdf"
+        )
         page.get_by_role("button", name="Download v2 PDF", exact=True).click()
         page.get_by_text("PDF download complete").wait_for()
 

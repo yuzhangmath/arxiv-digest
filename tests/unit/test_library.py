@@ -9,7 +9,14 @@ from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import DownloadFileRecord, Store
 
 
-def seed_article(store: Store, arxiv_id: str, title: str) -> None:
+def seed_article(
+    store: Store,
+    arxiv_id: str,
+    title: str,
+    *,
+    submitted_at: datetime = datetime(2026, 8, 1, tzinfo=timezone.utc),
+    revised_at: datetime = datetime(2026, 8, 20, tzinfo=timezone.utc),
+) -> None:
     store.apply_article_snapshot(
         PaperMetadata(
             arxiv_id=arxiv_id,
@@ -22,11 +29,11 @@ def seed_article(store: Store, arxiv_id: str, title: str) -> None:
         (
             PaperVersion(
                 1,
-                datetime(2026, 8, 1, tzinfo=timezone.utc),
+                submitted_at,
             ),
             PaperVersion(
                 2,
-                datetime(2026, 8, 20, tzinfo=timezone.utc),
+                revised_at,
             ),
         ),
     )
@@ -111,6 +118,70 @@ def test_remove_hides_the_paper_from_the_saved_library(tmp_path: Path) -> None:
     assert service.search("", limit=20, offset=0).entries == ()
 
 
+def test_library_lists_newest_papers_first_by_original_submission(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    open_database(path).close()
+    store = Store(path)
+    service = LibraryService(store)
+    seed_article(
+        store,
+        "2608.31007",
+        "Older paper with a newer revision",
+        submitted_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        revised_at=datetime(2026, 8, 30, tzinfo=timezone.utc),
+    )
+    seed_article(
+        store,
+        "2608.31008",
+        "Newer paper",
+        submitted_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        revised_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
+    )
+    service.save("2608.31007", version=2)
+    service.save("2608.31008", version=2)
+
+    page = service.search("", limit=20, offset=0)
+
+    assert [entry.metadata.arxiv_id for entry in page.entries] == [
+        "2608.31008",
+        "2608.31007",
+    ]
+
+
+def test_library_search_uses_newest_paper_as_the_relevance_tie_breaker(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    open_database(path).close()
+    store = Store(path)
+    service = LibraryService(store)
+    seed_article(
+        store,
+        "2608.31009",
+        "Shared search phrase",
+        submitted_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        revised_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+    )
+    seed_article(
+        store,
+        "2608.31010",
+        "Shared search phrase",
+        submitted_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        revised_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
+    )
+    service.save("2608.31009", version=2)
+    service.save("2608.31010", version=2)
+
+    page = service.search("Shared", limit=20, offset=0)
+
+    assert [entry.metadata.arxiv_id for entry in page.entries] == [
+        "2608.31010",
+        "2608.31009",
+    ]
+
+
 def test_full_last_page_does_not_offer_an_empty_next_page(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     open_database(path).close()
@@ -124,8 +195,8 @@ def test_full_last_page_does_not_offer_an_empty_next_page(tmp_path: Path) -> Non
     page = service.search("", limit=2, offset=0)
 
     assert [entry.metadata.arxiv_id for entry in page.entries] == [
-        "2608.31003",
         "2608.31004",
+        "2608.31003",
     ]
     assert page.next_offset is None
 
@@ -144,7 +215,11 @@ def test_pagination_offers_and_consumes_a_real_next_page(tmp_path: Path) -> None
     second = service.search("", limit=2, offset=first.next_offset or 0)
 
     assert first.next_offset == 2
+    assert [entry.metadata.arxiv_id for entry in first.entries] == [
+        "2608.31007",
+        "2608.31006",
+    ]
     assert [entry.metadata.arxiv_id for entry in second.entries] == [
-        "2608.31007"
+        "2608.31005"
     ]
     assert second.next_offset is None

@@ -6,6 +6,53 @@ from contextlib import ExitStack
 import pytest
 
 
+def test_shutdown_closes_admission_and_waits_for_worker_cleanup_after_timeout():
+    from arxiv_digest.maintenance import MaintenanceBarrier, MaintenanceError, MaintenanceTimeoutError
+    barrier = MaintenanceBarrier()
+    started, canceled, finish = threading.Event(), threading.Event(), threading.Event()
+    cleaned = []
+    def run():
+        with barrier.worker("retained-worker", canceled.set):
+            started.set()
+            assert finish.wait(2)
+            with barrier.operation():
+                cleaned.append(True)
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert started.wait(2)
+    try:
+        with pytest.raises(MaintenanceTimeoutError):
+            barrier.drain_for_shutdown(timeout=0.01)
+        assert canceled.is_set() and barrier.work_active
+        with pytest.raises(MaintenanceError):
+            barrier.reserve_worker("new-worker", lambda: None)
+        finish.set()
+        barrier.drain_for_shutdown(timeout=2)
+        assert cleaned == [True]
+    finally:
+        finish.set()
+        worker.join(2)
+
+
+def test_shutdown_can_observe_an_update_lease_owned_by_the_coordinator():
+    from arxiv_digest.maintenance import MaintenanceBarrier
+    barrier = MaintenanceBarrier()
+    owned, release = threading.Event(), threading.Event()
+    def coordinator():
+        with barrier.update_latch(), barrier.exclusive(cancel_active=True, timeout=1):
+            owned.set()
+            assert release.wait(2)
+    thread = threading.Thread(target=coordinator)
+    thread.start()
+    assert owned.wait(2)
+    try:
+        barrier.drain_for_shutdown(timeout=0.01)
+        assert barrier.update_active
+    finally:
+        release.set()
+        thread.join(2)
+
+
 def test_restore_reports_active_worker_without_requesting_cancellation() -> None:
     from arxiv_digest.maintenance import MaintenanceBarrier, WorkActiveError
 
@@ -168,3 +215,204 @@ def test_store_connections_hold_operation_leases_until_close(tmp_path) -> None:
 
     assert reader_entered.is_set()
     assert not thread.is_alive()
+
+
+def test_update_latch_refuses_unadmitted_work_and_drains_a_complete_handler() -> None:
+    from arxiv_digest.maintenance import MaintenanceBarrier, UpdateInProgressError
+
+    barrier = MaintenanceBarrier()
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    errors = []
+
+    def admitted_handler() -> None:
+        try:
+            with barrier.handler():
+                entered.set()
+                assert release.wait(2)
+                # Admission covers the whole handler, including work after the
+                # latch is set and before its first storage call.
+                with barrier.operation():
+                    finished.set()
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=admitted_handler)
+    thread.start()
+    assert entered.wait(2)
+    with barrier.update_latch():
+        with pytest.raises(UpdateInProgressError):
+            with barrier.handler():
+                pass
+        with pytest.raises(UpdateInProgressError):
+            barrier.reserve_worker("late-worker", lambda: None)
+        release.set()
+        with barrier.exclusive(cancel_active=True, timeout=2) as canceled:
+            assert finished.is_set()
+            assert canceled == ()
+        assert barrier.update_active
+    thread.join(2)
+    assert not thread.is_alive()
+    assert errors == []
+    assert not barrier.update_active
+
+
+def test_reserved_worker_is_canceled_before_its_thread_starts() -> None:
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    barrier = MaintenanceBarrier()
+    canceled = threading.Event()
+    reservation = barrier.reserve_worker("pdf_reserved", canceled.set)
+    with barrier.update_latch():
+        def run() -> None:
+            assert canceled.wait(2)
+            with reservation.activate():
+                with barrier.operation():
+                    pass
+        thread = threading.Thread(target=run)
+        thread.start()
+        with barrier.exclusive(cancel_active=True, timeout=2) as identifiers:
+            assert identifiers == ("pdf_reserved",)
+            assert barrier.canceled_worker_ids == identifiers
+    thread.join(2)
+    assert not thread.is_alive()
+    assert not barrier.work_active
+
+
+def test_baseexception_during_cancel_unwinds_pending_and_update_latch() -> None:
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    barrier = MaintenanceBarrier()
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+    reservation = barrier.reserve_worker("worker-interrupted", interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            with barrier.update_latch():
+                with barrier.exclusive(cancel_active=True, timeout=0):
+                    pass
+        assert not barrier.update_active
+    finally:
+        reservation.close()
+    with barrier.exclusive(timeout=0):
+        pass
+
+
+def test_update_latch_cannot_clear_while_its_exclusive_lease_remains() -> None:
+    from arxiv_digest.maintenance import MaintenanceBarrier, MaintenanceError
+
+    barrier = MaintenanceBarrier()
+    latch = barrier.update_latch()
+    latch.__enter__()
+    exclusive = barrier.exclusive(timeout=0)
+    exclusive.__enter__()
+    try:
+        with pytest.raises(MaintenanceError, match="exclusive"):
+            latch.__exit__(None, None, None)
+        assert barrier.update_active
+    finally:
+        exclusive.__exit__(None, None, None)
+
+
+def test_update_timeout_does_not_keep_latch_for_another_pending_exclusive_owner() -> None:
+    from arxiv_digest.maintenance import MaintenanceBarrier, MaintenanceTimeoutError
+
+    barrier = MaintenanceBarrier()
+    cancel = threading.Event()
+    release = threading.Event()
+    errors = []
+    reservation = barrier.reserve_worker("existing-worker", cancel.set)
+    def ordinary_restore():
+        try:
+            with barrier.exclusive(cancel_active=True, timeout=2):
+                pass
+        except BaseException as error:
+            errors.append(error)
+    thread = threading.Thread(target=ordinary_restore)
+    thread.start()
+    assert cancel.wait(2)
+    with pytest.raises(MaintenanceTimeoutError):
+        with barrier.update_latch():
+            with barrier.exclusive(cancel_active=True, timeout=0):
+                pass
+    assert not barrier.update_active
+    reservation.close()
+    release.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert errors == []
+
+
+def test_exception_cleanup_cannot_clear_a_later_threads_pending_lease() -> None:
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    barrier = MaintenanceBarrier()
+    release_operation = threading.Event()
+    begin_operation = threading.Event()
+    operation_entered = threading.Event()
+    begin_second = threading.Event()
+    second_pending = threading.Event()
+    errors = []
+    main_owner = threading.get_ident()
+
+    class ReleaseBoundary(threading.Condition):
+        after_release = None
+
+        def __exit__(self, *args):
+            result = super().__exit__(*args)
+            if self.after_release is not None and threading.get_ident() == main_owner:
+                callback, self.after_release = self.after_release, None
+                callback()
+            return result
+
+        def wait(self, timeout=None):
+            if barrier._exclusive_pending_owner == threading.get_ident():
+                second_pending.set()
+            return super().wait(timeout)
+
+    condition = ReleaseBoundary()
+    barrier._condition = condition
+
+    def operation():
+        assert begin_operation.wait(2)
+        with barrier.operation():
+            operation_entered.set()
+            assert release_operation.wait(2)
+
+    def second_exclusive():
+        assert begin_second.wait(2)
+        try:
+            with barrier.exclusive(timeout=2):
+                pass
+        except BaseException as error:
+            errors.append(error)
+
+    reader = threading.Thread(target=operation)
+    second = threading.Thread(target=second_exclusive)
+    reader.start()
+    second.start()
+
+    def after_first_release():
+        begin_operation.set()
+        assert operation_entered.wait(2)
+        begin_second.set()
+        assert second_pending.wait(2)
+
+    try:
+        with pytest.raises(RuntimeError, match="first operation failed"):
+            with barrier.exclusive(timeout=0):
+                condition.after_release = after_first_release
+                raise RuntimeError("first operation failed")
+        with condition:
+            assert barrier._exclusive_pending
+            assert barrier._exclusive_pending_owner == second.ident
+    finally:
+        release_operation.set()
+        begin_operation.set()
+        begin_second.set()
+        reader.join(2)
+        second.join(2)
+    assert not reader.is_alive()
+    assert not second.is_alive()
+    assert errors == []

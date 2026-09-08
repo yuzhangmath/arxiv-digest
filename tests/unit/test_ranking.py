@@ -330,6 +330,7 @@ def test_seed_similarity_uses_complete_date_top_tenth_and_top_third() -> None:
         _profile(seed_papers=("2501.00001",)),
         {"2501.00001": {"signal": 1.0}},
         {},
+        reference_titles={"2501.00001": "Signal Seed Paper"},
     )
     by_id = {item.paper.arxiv_id: item for item in ranked}
 
@@ -343,8 +344,31 @@ def test_seed_similarity_uses_complete_date_top_tenth_and_top_third() -> None:
         for reason in by_id["2608.01020"].reasons
         if reason.kind == "seed_similarity"
     )
-    assert "2501.00001" in reason.label
+    assert reason.label == "Related to selected seed paper"
+    assert reason.reference.arxiv_id == "2501.00001"
+    assert reason.reference.title == "Signal Seed Paper"
     assert reason.location is None
+
+
+def test_similarity_reason_hides_an_id_when_reference_metadata_is_unavailable() -> None:
+    from arxiv_digest.ranking import rank_date
+
+    paper = _paper("2608.01025", title="signal", abstract="")
+
+    result = rank_date(
+        (_event(paper.arxiv_id),),
+        (paper,),
+        _profile(seed_papers=("2501.00002",)),
+        {"2501.00002": {"signal": 1.0}},
+        {},
+    )[0]
+
+    reason = next(
+        item for item in result.reasons if item.kind == "seed_similarity"
+    )
+    assert reason.label == "Related to selected seed paper"
+    assert reason.reference is None
+    assert "2501.00002" not in reason.label
 
 
 def test_versions_of_one_paper_have_distinct_stable_similarity_ranks() -> None:
@@ -524,6 +548,7 @@ def test_saved_paper_similarity_is_explained_and_lower_weight_than_seed() -> Non
         _profile(),
         {},
         {"2501.00004": {"signal": 1.0}},
+        reference_titles={"2501.00004": "Saved Signal Paper"},
     )[0]
 
     assert saved_result.tier is RankingTier.POSSIBLE
@@ -531,7 +556,9 @@ def test_saved_paper_similarity_is_explained_and_lower_weight_than_seed() -> Non
     reason = next(
         reason for reason in saved_result.reasons if reason.kind == "saved_similarity"
     )
-    assert "2501.00004" in reason.label
+    assert reason.label == "Similar to saved paper"
+    assert reason.reference.arxiv_id == "2501.00004"
+    assert reason.reference.title == "Saved Signal Paper"
 
 
 def test_equal_scores_sort_by_position_then_id_with_missing_position_last() -> None:

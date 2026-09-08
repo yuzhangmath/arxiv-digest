@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import fcntl
 import sqlite3
 import stat
 import warnings
@@ -1166,3 +1168,303 @@ def test_restore_revalidates_the_archive_digest_after_inspection(
     assert raised.value.code == "archive_changed"
     assert not target.profile_path.exists()
     assert not target.database_path.exists()
+
+
+def test_portable_source_inspection_returns_only_frozen_validated_metadata(tmp_path: Path) -> None:
+    from dataclasses import FrozenInstanceError, fields
+    from arxiv_digest.backup import inspect_portable_backup_source
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    maintenance = MaintenanceBarrier()
+    before = (paths.profile_path.read_bytes(), paths.database_path.read_bytes())
+    result = inspect_portable_backup_source(paths, maintenance=maintenance)
+    assert result.application_generation == 2
+    assert result.database_schema_version == 4
+    assert result.profile_schema_version == 2
+    assert result.profile_revision == 1
+    assert {field.name for field in fields(result)} == {
+        "application_generation", "database_schema_version", "profile_schema_version", "profile_revision",
+    }
+    with pytest.raises(FrozenInstanceError):
+        result.profile_revision = 2
+    assert (paths.profile_path.read_bytes(), paths.database_path.read_bytes()) == before
+    assert maintenance.active_operations == 0
+
+
+@pytest.mark.parametrize("field", ["profile_lock_path", "profile_path", "database_path"])
+@pytest.mark.parametrize("unsafe", ["missing", "mode", "symlink", "hardlink"])
+def test_portable_source_inspection_does_not_create_or_repair_unsafe_sources(
+    tmp_path: Path, field: str, unsafe: str,
+) -> None:
+    from arxiv_digest.backup import BackupError, inspect_portable_backup_source
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    target = getattr(paths, field)
+    original = tmp_path / "original"
+    if unsafe == "missing":
+        target.unlink()
+    elif unsafe == "mode":
+        target.chmod(0o644)
+    elif unsafe == "symlink":
+        target.rename(original)
+        target.symlink_to(original)
+    else:
+        os.link(target, original)
+    before = {path: (path.lstat().st_mode, path.read_bytes()) for path in tmp_path.rglob("*") if path.is_file()}
+    with pytest.raises(BackupError):
+        inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier())
+    after = {path: (path.lstat().st_mode, path.read_bytes()) for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == before
+    if unsafe == "missing":
+        assert not target.exists()
+
+
+def test_portable_source_inspection_lock_wait_is_bounded_and_no_follow(tmp_path: Path) -> None:
+    from arxiv_digest.backup import BackupError, inspect_portable_backup_source
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    descriptor = os.open(paths.profile_lock_path, os.O_RDONLY)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(BackupError) as caught:
+            inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier(), timeout=0.01)
+        assert caught.value.code == "source_busy"
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("statement,code", [
+    ("UPDATE application_generation SET generation=1", "unsupported_schema"),
+    ("DELETE FROM schema_migrations WHERE version=4", "unsupported_schema"),
+    ("UPDATE profile_publication SET status='pending'", "publication_incomplete"),
+    ("DELETE FROM category_sync_state", "cross_record_invalid"),
+    ("DELETE FROM canonical_event_observations WHERE observation_id=51", "cross_record_invalid"),
+    ("DELETE FROM article_versions", "cross_record_invalid"),
+])
+def test_portable_source_and_export_share_rejection_of_invalid_durable_data(
+    tmp_path: Path, statement: str, code: str,
+) -> None:
+    from arxiv_digest.backup import BackupError, export_backup, inspect_portable_backup_source
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    connection = sqlite3.connect(paths.database_path)
+    connection.execute(statement)
+    connection.commit()
+    connection.close()
+    before = (paths.profile_path.read_bytes(), paths.database_path.read_bytes())
+    with pytest.raises(BackupError) as inspection_error:
+        inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier())
+    assert inspection_error.value.code == code
+    with pytest.raises(BackupError) as export_error:
+        export_backup(paths, tmp_path / "invalid.zip", clock=lambda: NOW)
+    assert export_error.value.code == code
+    assert not (tmp_path / "invalid.zip").exists()
+    assert (paths.profile_path.read_bytes(), paths.database_path.read_bytes()) == before
+
+
+def test_portable_source_reads_committed_wal_rows_in_its_read_transaction(tmp_path: Path) -> None:
+    from arxiv_digest.backup import BackupError, inspect_portable_backup_source
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    connection = sqlite3.connect(paths.database_path)
+    connection.execute("PRAGMA wal_autocheckpoint=0")
+    try:
+        connection.execute("DELETE FROM canonical_event_observations WHERE observation_id=51")
+        connection.commit()
+        assert Path(str(paths.database_path) + "-wal").stat().st_size > 0
+        with pytest.raises(BackupError) as caught:
+            inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier())
+        assert caught.value.code == "cross_record_invalid"
+    finally:
+        connection.close()
+
+
+def test_portable_source_uses_operation_lease_and_no_mutating_open_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arxiv_digest.backup as backup
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    maintenance = MaintenanceBarrier()
+    original_connect = sqlite3.connect
+
+    def connect(database, **kwargs):
+        assert maintenance.active_operations == 1
+        assert "mode=ro" in database
+        assert "immutable" not in database
+        return original_connect(database, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("inspection used a mutating or unbounded source helper")
+
+    monkeypatch.setattr(backup.sqlite3, "connect", connect)
+    monkeypatch.setattr(backup, "exclusive_flock", forbidden)
+    monkeypatch.setattr(backup, "open_database", forbidden)
+    backup.inspect_portable_backup_source(paths, maintenance=maintenance)
+
+
+@pytest.mark.parametrize("payload", [
+    b"not JSON", b'{"schema_version":1}', b'[]',
+    b'{"schema_version":2,"schema_version":2}',
+])
+def test_portable_source_rejects_invalid_profiles_without_repair(
+    tmp_path: Path, payload: bytes,
+) -> None:
+    from arxiv_digest.backup import BackupError, inspect_portable_backup_source
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    paths.profile_path.write_bytes(payload)
+    with pytest.raises(BackupError) as caught:
+        inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier())
+    assert caught.value.code == "unsupported_schema"
+    assert paths.profile_path.read_bytes() == payload
+
+
+def test_portable_source_deadline_is_checked_after_maintenance_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+    import arxiv_digest.backup as backup
+
+    paths = initialized_paths(tmp_path)
+    now = 0.0
+
+    class DelayedMaintenance:
+        @contextmanager
+        def operation(self):
+            nonlocal now
+            now = 2.0
+            yield
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("expired inspection touched source files")
+
+    monkeypatch.setattr(backup.os, "open", forbidden)
+    with pytest.raises(backup.BackupError) as caught:
+        backup.inspect_portable_backup_source(
+            paths, maintenance=DelayedMaintenance(), timeout=1.0, monotonic=lambda: now,
+        )
+    assert caught.value.code == "source_timeout"
+
+
+def test_portable_source_repeated_eintr_stops_at_deadline_and_releases_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arxiv_digest.backup as backup
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    maintenance = MaintenanceBarrier()
+    now = 0.0
+    attempted_fds = []
+
+    def interrupt(fd, operation):
+        nonlocal now
+        attempted_fds.append(fd)
+        now += 0.6
+        raise InterruptedError
+
+    monkeypatch.setattr(backup.fcntl, "flock", interrupt)
+    monkeypatch.setattr(backup.time, "sleep", lambda duration: None)
+    with pytest.raises(backup.BackupError) as caught:
+        backup.inspect_portable_backup_source(
+            paths, maintenance=maintenance, timeout=1.0, monotonic=lambda: now,
+        )
+    assert caught.value.code == "source_busy"
+    assert len(attempted_fds) == 2
+    assert maintenance.active_operations == 0
+    with pytest.raises(OSError):
+        os.fstat(attempted_fds[0])
+
+
+@pytest.mark.parametrize("field", ["profile_lock_path", "profile_path", "database_path"])
+def test_portable_source_rejects_path_substitution_at_open_and_closes_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    import arxiv_digest.backup as backup
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    target = getattr(paths, field)
+    original_open = os.open
+    opened = []
+
+    def substitute(path, *args, **kwargs):
+        descriptor = original_open(path, *args, **kwargs)
+        if Path(path) == target:
+            opened.append(descriptor)
+            target.rename(tmp_path / "original")
+            os.close(original_open(target, os.O_CREAT | os.O_RDWR, 0o600))
+        return descriptor
+
+    monkeypatch.setattr(backup.os, "open", substitute)
+    with pytest.raises(backup.BackupError) as caught:
+        backup.inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier())
+    assert caught.value.code == "source_unsafe"
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_portable_source_requires_nofollow_support(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import arxiv_digest.backup as backup
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    monkeypatch.delattr(backup.os, "O_NOFOLLOW")
+    with pytest.raises(backup.BackupError) as caught:
+        backup.inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier())
+    assert caught.value.code == "source_unsafe"
+
+
+def test_portable_source_rejects_foreign_owned_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import arxiv_digest.backup as backup
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    foreign_uid = os.getuid() + 1
+    monkeypatch.setattr(backup.os, "getuid", lambda: foreign_uid)
+    with pytest.raises(backup.BackupError) as caught:
+        backup.inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier())
+    assert caught.value.code == "source_unsafe"
+
+
+def test_portable_source_rejects_profile_change_during_database_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arxiv_digest.backup as backup
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    original_validate = backup._portable_source_payloads
+
+    def substitute(*args, **kwargs):
+        result = original_validate(*args, **kwargs)
+        with paths.profile_path.open("ab") as profile:
+            profile.write(b" ")
+        return result
+
+    monkeypatch.setattr(backup, "_portable_source_payloads", substitute)
+    with pytest.raises(backup.BackupError) as caught:
+        backup.inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier())
+    assert caught.value.code == "source_unsafe"
+
+
+def test_portable_source_malformed_profile_scalar_returns_a_backup_error(tmp_path: Path) -> None:
+    from arxiv_digest.backup import BackupError, inspect_portable_backup_source
+    from arxiv_digest.maintenance import MaintenanceBarrier
+
+    paths = initialized_paths(tmp_path)
+    payload = json.loads(paths.profile_path.read_bytes())
+    payload["pdf_destination"]["kind"] = []
+    paths.profile_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(BackupError) as caught:
+        inspect_portable_backup_source(paths, maintenance=MaintenanceBarrier())
+    assert caught.value.code == "unsupported_schema"

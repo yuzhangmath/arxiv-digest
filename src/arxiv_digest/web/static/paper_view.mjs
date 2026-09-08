@@ -14,16 +14,30 @@ function storedStrings(value) {
     : [];
 }
 
+function normalizedRankingReasons(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((reason) => {
+    const label = typeof reason === "string"
+      ? reason
+      : storedText(reason?.label);
+    if (!label) return [];
+    const rawReference = typeof reason === "string" ? null : reason?.reference;
+    const arxivId = storedText(rawReference?.arxiv_id);
+    const title = storedText(rawReference?.title);
+    const validReference = title.trim() && (
+      MODERN_ID.test(arxivId) || LEGACY_ID.test(arxivId)
+    );
+    return [{
+      label,
+      reference: validReference ? { arxivId, title } : null,
+    }];
+  });
+}
+
 function normalizedPaper(source) {
   const paper = source?.paper ?? source ?? {};
   const event = source?.event ?? {};
-  const reasons = Array.isArray(source?.reasons)
-    ? source.reasons
-        .map((reason) =>
-          typeof reason === "string" ? reason : storedText(reason?.label),
-        )
-        .filter(Boolean)
-    : [];
+  const rankingReasons = normalizedRankingReasons(source?.reasons);
   const subjects = source?.subjects ?? source?.support_categories;
   const rawVersion = source?.resolved_announcement_version ?? null;
   const resolvedVersion = Number.isInteger(rawVersion) && rawVersion > 0
@@ -60,7 +74,8 @@ function normalizedPaper(source) {
     comments: storedText(source?.comments ?? paper.comments),
     journalRef: storedText(source?.journal_ref ?? paper.journal_ref),
     doi: storedText(source?.doi ?? paper.doi),
-    rankingText: storedText(source?.ranking_text) || reasons.join("; "),
+    rankingText: storedText(source?.ranking_text),
+    rankingReasons,
     tier: storedText(source?.tier, "other"),
     subjects: storedStrings(subjects),
     eventLabel: eventLabel === "New submission" ? "" : eventLabel,
@@ -102,6 +117,45 @@ function safeExternalLink(document, label, href) {
   link.setAttribute("target", "_blank");
   link.setAttribute("rel", "noopener noreferrer");
   return link;
+}
+
+export function renderArxivLinks(document, arxivId, version = "") {
+  const links = arxivLinks(arxivId, version);
+  const row = element(document, "p", undefined, "paper-links");
+  row.append(
+    safeExternalLink(document, "Abstract on arXiv", links.abstract),
+    document.createTextNode(" "),
+    safeExternalLink(document, "PDF on arXiv", links.pdf),
+  );
+  return row;
+}
+
+function renderRankingExplanation(document, paper) {
+  const row = element(document, "p");
+  if (paper.rankingText) {
+    row.textContent = paper.rankingText;
+    return row;
+  }
+  if (!paper.rankingReasons.length) {
+    row.textContent = "No selected interest changed this paper's order.";
+    return row;
+  }
+  paper.rankingReasons.forEach((reason, index) => {
+    if (index) row.append(document.createTextNode("; "));
+    row.append(document.createTextNode(reason.label));
+    if (reason.reference !== null) {
+      row.append(
+        document.createTextNode(" “"),
+        safeExternalLink(
+          document,
+          reason.reference.title,
+          arxivLinks(reason.reference.arxivId).abstract,
+        ),
+        document.createTextNode("”"),
+      );
+    }
+  });
+  return row;
 }
 
 function pdfActionButton(
@@ -166,7 +220,6 @@ export function renderPaperCard(document, container, source, actions = {}) {
   const saveVersion = paper.saveVersion;
   const downloadVersion = paper.downloadVersion;
   const unconfirmed = paper.announcedVersion === null;
-  const links = arxivLinks(arxivId, version);
   const card = element(document, "article", undefined, "paper-card");
   if (paper.eventId !== null) card.dataset.eventId = String(paper.eventId);
   card.dataset.arxivId = arxivId;
@@ -204,30 +257,10 @@ export function renderPaperCard(document, container, source, actions = {}) {
 
   const explanation = element(document, "details", undefined, "ranking-explanation");
   explanation.append(element(document, "summary", "Why this ranking"));
-  explanation.append(
-    element(
-      document,
-      "p",
-      paper.rankingText || "No selected interest changed this paper's order.",
-    ),
-  );
+  explanation.append(renderRankingExplanation(document, paper));
   card.append(explanation);
 
-  const linksRow = element(document, "p", undefined, "paper-links");
-  linksRow.append(
-    safeExternalLink(
-      document,
-      "Abstract on arXiv",
-      links.abstract,
-    ),
-    document.createTextNode(" "),
-    safeExternalLink(
-      document,
-      "PDF on arXiv",
-      links.pdf,
-    ),
-  );
-  card.append(linksRow);
+  card.append(renderArxivLinks(document, arxivId, version));
 
   const controls = element(document, "div", undefined, "paper-actions");
   const actionStatus = element(document, "p", "", "paper-action-status");

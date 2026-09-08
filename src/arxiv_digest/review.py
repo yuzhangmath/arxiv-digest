@@ -280,6 +280,10 @@ class ReviewService:
             seed_vectors,
             saved_vectors,
             date_vectors=date_vectors,
+            reference_titles={
+                paper.arxiv_id: paper.title
+                for paper in (*snapshot.seed_papers, *snapshot.saved_papers)
+            },
         )
         ranked = (
             tuple(

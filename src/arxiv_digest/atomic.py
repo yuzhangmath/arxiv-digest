@@ -1,34 +1,22 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import os
 import stat
+import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 
-def ensure_private_directory(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    descriptor = os.open(path, flags)
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise PermissionError("private path must be a directory")
-        if metadata.st_uid != os.getuid():
-            raise PermissionError(
-                "private directory must be owned by the current user"
-            )
-        os.fchmod(descriptor, 0o700)
-    finally:
-        os.close(descriptor)
+from arxiv_digest.update_runtime.protocol import (
+    AtomicRenameUnsupportedError, atomic_rename_noreplace,
+    ensure_private_directory, ensure_private_directory_strict,
+    ensure_private_lock_file, open_private_lock_file,
+)
 
 
 def atomic_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:

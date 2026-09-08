@@ -29,10 +29,13 @@ import {
   clearSession,
   validatedView,
 } from "./state.mjs";
+import { renderUpdateState } from "./update_view.mjs";
+import { UpdateFlow } from "./update_flow.mjs";
 
 const content = document.querySelector("#content");
 const status = document.querySelector("#status");
 const navigation = document.querySelector(".primary-navigation");
+const updateNotice = document.querySelector("#update-notice");
 
 function statusText(message) {
   status.textContent = message;
@@ -57,13 +60,49 @@ try {
 const state = new ViewState(session.view);
 let applicationClosing = false;
 let applicationQuitRequested = false;
+let updateFlow = null;
+let updateBlocksOrdinaryWork = false;
 const api = new ApiClient(location.origin, session.token, fetch, () => {
   clearSession(sessionStorage);
   statusText("Your local session expired. Reopen arXiv Digest to continue.");
-});
+}, (error) => updateFlow?.handleApiError(error));
 const libraryController = new LibraryController(api);
 const interestsController = new InterestsController(api);
 const settingsController = new SettingsController(api);
+
+let updateStorage;
+let updateChannel;
+try { updateStorage = localStorage; } catch { /* Storage is optional. */ }
+try { updateChannel = new BroadcastChannel("arxiv-digest-update"); } catch { /* Broadcast is optional. */ }
+updateFlow = new UpdateFlow({
+  api, storage: updateStorage,
+  broadcast: (message) => updateChannel?.postMessage(message),
+  render: (update) => {
+    renderUpdateState(document, updateNotice, update, (version) => updateFlow.startUpdate(version));
+    const wasBlocked = updateBlocksOrdinaryWork;
+    updateBlocksOrdinaryWork = update.blocked;
+    content.inert = update.blocked;
+    navigation.inert = update.blocked;
+    document.querySelector("#quit").disabled = update.blocked && !update.allowQuit;
+    if (update.blocked && !wasBlocked) {
+      stopHeartbeat();
+      clearSettingsSyncPoll();
+      clearReviewPoll();
+      reviewRequestSequence++;
+      renderCurrentSequence++;
+      invalidateSetupLifecycle();
+      api.abortAll();
+      updateNotice.focus();
+    } else if (wasBlocked && !update.blocked && !applicationClosing) {
+      connectTab();
+      renderCurrent();
+    }
+  },
+});
+if (updateChannel) updateChannel.onmessage = (event) => updateFlow.receive(event.data);
+api.requestAllowed = (path) => !updateFlow.blocksOrdinaryWork ||
+  path === "/api/v1/status" && !updateFlow.handoff || path.startsWith("/api/v1/update") ||
+  path === "/api/v1/application/quit" && updateFlow.allowQuit;
 
 function jsonBody(value) {
   return {
@@ -107,7 +146,8 @@ function clearReviewPoll() {
 }
 
 function reviewRequestIsCurrent(requestSequence) {
-  return requestSequence === reviewRequestSequence && state.snapshot.view === "review";
+  return !applicationClosing && !updateBlocksOrdinaryWork &&
+    requestSequence === reviewRequestSequence && state.snapshot.view === "review";
 }
 
 function reviewPollIsCurrent(requestSequence, pollGeneration) {
@@ -524,8 +564,14 @@ async function requestReview(destination = {}) {
 async function requestCalendar() {
   reviewRequestSequence += 1;
   const now = new Date();
-  const start = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}-01`;
-  const endDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0));
+  const endDate = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+  ));
+  const startDate = new Date(endDate);
+  startDate.setUTCDate(startDate.getUTCDate() - 30);
+  const start = startDate.toISOString().slice(0, 10);
   const end = endDate.toISOString().slice(0, 10);
   const entries = await api.json("calendar", `/api/v1/review/calendar?start=${start}&end=${end}`);
   content.replaceChildren();
@@ -560,10 +606,10 @@ function redrawLibrary() {
 }
 
 async function pollLibraryDownload(jobId) {
-  if (applicationClosing) return;
+  if (applicationClosing || updateBlocksOrdinaryWork) return;
   const arxivId = libraryJobPaper.get(jobId);
   const result = await libraryController.downloadStatus(jobId);
-  if (applicationClosing) return;
+  if (applicationClosing || updateBlocksOrdinaryWork) return;
   if (arxivId) libraryDownloadState.set(arxivId, { ...result, job_id: jobId });
   redrawLibrary();
   if (result.failed || result.status === "failed") {
@@ -579,9 +625,9 @@ async function pollLibraryDownload(jobId) {
 }
 
 async function startLibraryDownload(arxivId, version) {
-  if (applicationClosing) return;
+  if (applicationClosing || updateBlocksOrdinaryWork) return;
   const result = await libraryController.download(arxivId, version);
-  if (applicationClosing) return;
+  if (applicationClosing || updateBlocksOrdinaryWork) return;
   libraryJobPaper.set(result.job_id, arxivId);
   libraryDownloadState.set(arxivId, { job_id: result.job_id, status: "running" });
   redrawLibrary();
@@ -693,7 +739,7 @@ function clearSettingsSyncPoll() {
 function settingsSyncPollIsCurrent(generation) {
   return generation === settingsSyncPollGeneration &&
     state.snapshot.view === "settings" &&
-    !applicationClosing;
+    !applicationClosing && !updateBlocksOrdinaryWork;
 }
 
 function scheduleSettingsSyncPoll(delay = 1_000) {
@@ -1574,7 +1620,7 @@ async function requestSetup(lifecycleGeneration) {
 let renderCurrentSequence = 0;
 
 async function renderCurrent() {
-  if (applicationClosing) return;
+  if (applicationClosing || updateBlocksOrdinaryWork) return;
   const renderSequence = ++renderCurrentSequence;
   const view = state.snapshot.view;
   if (view !== "review") {
@@ -1629,7 +1675,7 @@ async function renderCurrent() {
 }
 
 async function replaceCurrentView(requestedView, values = {}) {
-  if (applicationClosing) return;
+  if (applicationClosing || updateBlocksOrdinaryWork) return;
   const view = validatedView(requestedView);
   state.setView(view, values);
   history.replaceState({ view }, "", tokenFreeViewUrl(view));
@@ -1637,7 +1683,7 @@ async function replaceCurrentView(requestedView, values = {}) {
 }
 
 function navigate(requestedView, values = {}) {
-  if (applicationClosing) return;
+  if (applicationClosing || updateBlocksOrdinaryWork) return;
   const view = requestedView === "calendar" ? "calendar" : validatedView(requestedView);
   const stateValues = view === "calendar" ? { view: "calendar" } : values;
   state.setView(view === "calendar" ? "review" : view, stateValues);
@@ -1660,6 +1706,7 @@ let heartbeat = null;
 let tabDisconnect = Promise.resolve();
 
 function connectTab() {
+  if (applicationClosing || updateBlocksOrdinaryWork) return;
   api.json("tab-connect", "/api/v1/tabs/connect", jsonBody({ tab_id: tabId })).catch(() => {});
   if (heartbeat === null) {
     heartbeat = setInterval(() => {
@@ -1673,13 +1720,16 @@ function stopHeartbeat() {
   heartbeat = null;
 }
 
-connectTab();
-
 async function quitApplication() {
   if (applicationClosing) return;
+  if (updateFlow.busy && !updateFlow.allowQuit) {
+    statusText("Update preparation is in progress. Wait for its result before quitting.");
+    return;
+  }
   applicationClosing = true;
   applicationQuitRequested = true;
   stopHeartbeat();
+  updateFlow.suspend();
   clearSettingsSyncPoll();
   invalidateSetupLifecycle();
   api.abortAll();
@@ -1687,13 +1737,24 @@ async function quitApplication() {
     control.disabled = true;
   }
   statusText("Closing arXiv Digest…");
+  let declined = false;
   try {
-    await api.json(
+    const result = await api.json(
       "application-quit",
       "/api/v1/application/quit",
       { ...jsonBody({}), keepalive: true },
     );
+    if (result?.quitting === false) {
+      declined = true;
+      applicationClosing = false;
+      applicationQuitRequested = false;
+      document.querySelector("#quit").disabled = false;
+      updateFlow.resume();
+      if (!updateFlow.blocksOrdinaryWork) { connectTab(); renderCurrent(); }
+    }
   } finally {
+    if (declined) return;
+    updateFlow.stop();
     api.abortAll();
     invalidateSetupLifecycle();
     clearSession(sessionStorage);
@@ -1709,7 +1770,8 @@ document.querySelector("#quit").addEventListener("click", quitApplication);
 
 addEventListener("pagehide", () => {
   clearSettingsSyncPoll();
-  if (applicationQuitRequested) return;
+  updateFlow.suspend();
+  if (applicationQuitRequested || updateFlow.handoff) return;
   applicationClosing = true;
   stopHeartbeat();
   invalidateSetupLifecycle();
@@ -1724,6 +1786,8 @@ addEventListener("pagehide", () => {
 addEventListener("pageshow", async (event) => {
   if (!event.persisted || applicationQuitRequested) return;
   applicationClosing = false;
+  updateFlow.resume();
+  if (updateFlow.blocksOrdinaryWork) return;
   connectTab();
   renderCurrent();
   await tabDisconnect;
@@ -1748,4 +1812,14 @@ addEventListener("popstate", (event) => {
   renderCurrent();
 });
 
-renderCurrent();
+addEventListener("storage", () => updateFlow.resume());
+addEventListener("focus", () => updateFlow.resume());
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) updateFlow.resume();
+});
+
+await updateFlow.start();
+if (!updateFlow.blocksOrdinaryWork) {
+  connectTab();
+  renderCurrent();
+}

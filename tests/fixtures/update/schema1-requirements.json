@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "valid": [
+    {"values": [], "normalized": ""},
+    {
+      "values": ["beautifulsoup4<5,>=4.12", "packaging<27,>=24"],
+      "normalized": "beautifulsoup4<5,>=4.12\npackaging<27,>=24\n"
+    },
+    {
+      "values": [
+        "demo; python_version >= '3.11'",
+        "demo; python_version >= '3.11'"
+      ],
+      "normalized": "demo; python_version >= '3.11'\ndemo; python_version >= '3.11'\n"
+    }
+  ],
+  "invalid": [
+    "",
+    "bad requirement ???",
+    "name\nInjected: value",
+    "name\u0000"
+  ]
+}

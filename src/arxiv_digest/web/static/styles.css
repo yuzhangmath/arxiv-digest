@@ -6,7 +6,9 @@
   --line: #d7d0c4;
   --accent: #8e2d2d;
   --accent-ink: #fffaf5;
+  --focus: #1769aa;
   --notice: #fff1d6;
+  --notice-ink: #341b14;
   font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif;
   line-height: 1.55;
 }
@@ -38,7 +40,7 @@ button {
 button:disabled { cursor: not-allowed; opacity: 0.5; }
 
 :focus-visible {
-  outline: 0.2rem solid #1769aa;
+  outline: 0.2rem solid var(--focus);
   outline-offset: 0.2rem;
 }
 
@@ -52,7 +54,7 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .skip-link:focus { transform: translateY(0); }
 
-.site-header, .primary-navigation, main, .status {
+.site-header, .primary-navigation, main, .status, .update-notice {
   padding-left: clamp(1rem, 4vw, 3rem);
   padding-right: clamp(1rem, 4vw, 3rem);
 }
@@ -88,6 +90,17 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 
 .status { min-height: 2rem; color: var(--muted); padding-top: 0.6rem; }
+.update-notice {
+  margin: 0;
+}
+.update-notice:not(:empty) {
+  border-bottom: 1px solid var(--line);
+  background: var(--notice);
+  color: var(--notice-ink);
+  padding-top: 0.75rem;
+  padding-bottom: 0.75rem;
+}
+.update-notice a { color: inherit; }
 main { padding-top: 1rem; padding-bottom: 4rem; }
 
 .paper-card {
@@ -108,7 +121,7 @@ main { padding-top: 1rem; padding-bottom: 4rem; }
 .review-finish-all-confirmation p, .finish-confirmation p { flex-basis: 100%; margin: 0; }
 .ranking-tier { margin-top: 2rem; }
 .ranking-tier > h2 { border-bottom: 0.2rem solid var(--accent); padding-bottom: 0.3rem; }
-.error-banner { border-left: 0.35rem solid #aa2020; padding: 0.75rem 1rem; background: var(--notice); color: #341b14; }
+.error-banner { border-left: 0.35rem solid #aa2020; padding: 0.75rem 1rem; background: var(--notice); color: var(--notice-ink); }
 .calendar-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: 0.6rem; }
 .calendar-date-item { min-width: 0; }
 .calendar-date { width: 100%; min-height: 6.5rem; white-space: pre-line; }
@@ -347,5 +360,15 @@ main { padding-top: 1rem; padding-bottom: 4rem; }
 }
 
 @media (prefers-color-scheme: dark) {
-  :root { --paper: #17191d; --ink: #f1eee8; --muted: #b6b0a7; --line: #49453f; --accent: #cf7770; --accent-ink: #17191d; --notice: #493b22; }
+  :root {
+    --paper: #17191d;
+    --ink: #f1eee8;
+    --muted: #b6b0a7;
+    --line: #49453f;
+    --accent: #cf7770;
+    --accent-ink: #17191d;
+    --focus: #8dc8ff;
+    --notice: #493b22;
+    --notice-ink: #fff1d6;
+  }
 }

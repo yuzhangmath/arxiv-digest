@@ -2403,25 +2403,28 @@ class Store:
                     """SELECT a.arxiv_id, s.saved_version, a.is_deleted,
                               (SELECT MAX(version) FROM article_versions
                                WHERE arxiv_id = a.arxiv_id) AS latest_version,
+                              (SELECT MIN(submitted_at) FROM article_versions
+                               WHERE arxiv_id = a.arxiv_id) AS first_submitted_at,
                               bm25(papers_fts, 10.0, 6.0, 5.0, 1.0) AS rank
                        FROM papers_fts
                        JOIN articles AS a ON a.rowid = papers_fts.rowid
                        JOIN saved_papers AS s ON s.arxiv_id = a.arxiv_id
                        WHERE papers_fts MATCH ?
-                       ORDER BY rank, a.arxiv_id
+                       ORDER BY rank, first_submitted_at DESC, a.arxiv_id DESC
                        LIMIT ? OFFSET ?""",
                     (match_query, limit, offset),
                 ).fetchall()
             else:
                 rows = connection.execute(
                     """SELECT a.arxiv_id, s.saved_version, a.is_deleted,
-                              MAX(v.version) AS latest_version
+                              MAX(v.version) AS latest_version,
+                              MIN(v.submitted_at) AS first_submitted_at
                        FROM saved_papers AS s
                        JOIN articles AS a ON a.arxiv_id = s.arxiv_id
                        LEFT JOIN article_versions AS v
                            ON v.arxiv_id = a.arxiv_id
                        GROUP BY a.arxiv_id
-                       ORDER BY a.arxiv_id
+                       ORDER BY first_submitted_at DESC, a.arxiv_id DESC
                        LIMIT ? OFFSET ?""",
                     (limit, offset),
                 ).fetchall()

@@ -1,0 +1,14 @@
+{
+  "application_data_generation": 2,
+  "automatic_update": false,
+  "automatic_update_from": null,
+  "channel": "prerelease",
+  "platforms": [
+    "darwin",
+    "linux"
+  ],
+  "product": "arxiv-digest",
+  "schema_version": 1,
+  "updater_protocol": 1,
+  "version": "0.3.0"
+}

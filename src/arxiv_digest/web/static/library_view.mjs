@@ -1,3 +1,5 @@
+import { renderArxivLinks } from "./paper_view.mjs";
+
 export class LibraryController {
   constructor(api) {
     if (!api || typeof api.json !== "function") {
@@ -127,6 +129,14 @@ export function renderLibraryView(document, container, page, actions = {}) {
     element(
       document,
       "p",
+      "With search blank, saved papers are ordered by original arXiv " +
+        "submission date, newest first. Search results prioritize relevance, " +
+        "then recency.",
+      "library-order-guidance",
+    ),
+    element(
+      document,
+      "p",
       "Leave the search blank to show all saved papers below.",
       "library-search-guidance",
     ),
@@ -199,6 +209,17 @@ export function renderLibraryView(document, container, page, actions = {}) {
         : "No local PDF in the current destination",
       "library-pdf-state",
     ));
+
+    const linkVersion = [entry.latest_version, entry.saved_version].find(
+      (value) => Number.isSafeInteger(value) && value > 0,
+    );
+    card.append(
+      renderArxivLinks(
+        document,
+        arxivId,
+        linkVersion === undefined ? "" : `v${linkVersion}`,
+      ),
+    );
 
     const controls = element(document, "div", undefined, "paper-actions");
     controls.append(

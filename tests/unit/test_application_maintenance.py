@@ -761,16 +761,14 @@ def test_sync_start_does_not_block_restore_from_draining_a_cancelled_worker() ->
     assert old_worker_started.wait(2)
 
     sync_registration_attempted = threading.Event()
-    original_worker = runtime.maintenance.worker
+    original_worker = runtime.maintenance.reserve_worker
 
-    @contextmanager
     def observed_worker(worker_id, request_cancel):
         if worker_id.startswith("sync_"):
             sync_registration_attempted.set()
-        with original_worker(worker_id, request_cancel):
-            yield
+        return original_worker(worker_id, request_cancel)
 
-    runtime.maintenance.worker = observed_worker
+    runtime.maintenance.reserve_worker = observed_worker
     restore_entered = threading.Event()
     release_restore = threading.Event()
     restore_errors: list[Exception] = []
@@ -1369,3 +1367,73 @@ def test_failed_restore_keeps_quota_reserved_against_concurrent_inspection(
         "restore_second",
     }
     runtime._close_runtime()
+
+
+def test_update_latch_rejects_a_job_before_publishing_it() -> None:
+    from arxiv_digest.maintenance import UpdateInProgressError
+
+    runtime = _runtime()
+    with runtime.maintenance.update_latch():
+        with pytest.raises(UpdateInProgressError):
+            runtime._new_job("download", "download", lambda: pytest.fail("late work"))
+    assert runtime._jobs == {}
+
+
+def test_worker_registration_precedes_thread_start_and_unwinds_start_failure(monkeypatch) -> None:
+    import arxiv_digest.application as application
+
+    runtime = _runtime()
+    def fail_start(_thread):
+        assert runtime.maintenance.work_active
+        raise KeyboardInterrupt
+    monkeypatch.setattr(application.threading.Thread, "start", fail_start)
+    with pytest.raises(KeyboardInterrupt):
+        runtime._new_job("download", "download", lambda: None)
+    assert not runtime.maintenance.work_active
+    assert not runtime.lifecycle._has_workers()
+    assert all(job["status"] != "running" for job in runtime._jobs.values())
+
+
+def test_update_quiescence_reports_canceled_pdfs_without_replaying_them() -> None:
+    runtime = _runtime()
+    runtime._active_sync_job = None
+    cancel = threading.Event()
+    started = threading.Event()
+    def download():
+        started.set()
+        assert cancel.wait(2)
+        return "stopped"
+    identifier = runtime._new_job("download", "download", download, request_cancel=cancel.set)
+    assert started.wait(2)
+    with runtime.lifecycle.update_owner("update-job"):
+        with runtime.begin_update_quiescence(timeout=2) as canceled:
+            assert canceled == (identifier,)
+            assert runtime.maintenance.update_active
+            assert not runtime.maintenance.work_active
+        runtime.resume_after_update_failure()
+    job = runtime._job_status({"job_id": identifier})
+    assert job["status"] == "canceled"
+    assert job["error_code"] == "canceled_for_update"
+    assert "retry" in job["message"].lower()
+    assert set(runtime._jobs) == {identifier}
+
+
+def test_safe_update_cleanup_resumes_only_one_existing_ordinary_sync() -> None:
+    runtime = _runtime()
+    runtime._active_sync_job = "sync_existing"
+    cancel = threading.Event()
+    identifier = runtime._new_job(
+        "sync", "sync", lambda: cancel.wait(2),
+        job_id="sync_existing", request_cancel=cancel.set,
+    )
+    resumes = []
+    runtime.start_sync = lambda: resumes.append("ordinary-sync")
+    with runtime.lifecycle.update_owner("update-job"):
+        with runtime.begin_update_quiescence(timeout=2) as canceled:
+            assert canceled == (identifier,)
+            with pytest.raises(RuntimeError, match="quiescence"):
+                runtime.resume_after_update_failure()
+            assert resumes == []
+        runtime.resume_after_update_failure()
+        runtime.resume_after_update_failure()
+    assert resumes == ["ordinary-sync"]

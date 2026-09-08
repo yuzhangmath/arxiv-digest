@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from arxiv_digest import __version__
 from scripts.release_check import (
     ReleaseIdentityError,
     main,
@@ -63,7 +64,7 @@ def test_cli_mismatch_does_not_echo_the_candidate(
 def test_current_release_tag_is_accepted(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert main(["--tag", "v0.2.1"]) == 0
+    assert main(["--tag", f"v{__version__}"]) == 0
     assert capsys.readouterr().out == (
-        "release identity verified: v0.2.1\n"
+        f"release identity verified: v{__version__}\n"
     )

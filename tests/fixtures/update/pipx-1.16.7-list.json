@@ -1,0 +1,53 @@
+{
+  "pipx_spec_version": "0.1",
+  "venvs": {
+    "arxiv-digest": {
+      "metadata": {
+        "backend": "pip",
+        "environment": "arxiv-digest",
+        "exposure_enabled": true,
+        "injected_packages": {},
+        "main_package": {
+          "app_paths": [
+            {
+              "__Path__": "/synthetic/pipx/venvs/arxiv-digest/bin/arxiv-digest",
+              "__type__": "Path"
+            }
+          ],
+          "app_paths_of_dependencies": {},
+          "apps": [
+            "arxiv-digest"
+          ],
+          "apps_of_dependencies": [],
+          "completion_paths": [],
+          "completion_paths_of_dependencies": {},
+          "completions": [],
+          "completions_of_dependencies": [],
+          "cooldown_days": null,
+          "expected_apps": [],
+          "include_apps": true,
+          "include_dependencies": false,
+          "include_resources_from": [],
+          "lock_file": null,
+          "man_pages": [],
+          "man_pages_of_dependencies": [],
+          "man_paths": [],
+          "man_paths_of_dependencies": {},
+          "package": "arxiv-digest",
+          "package_or_url": "git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.0",
+          "package_version": "0.3.0",
+          "pinned": false,
+          "pip_args": [],
+          "suffix": ""
+        },
+        "pipx_metadata_version": "0.12",
+        "python_version": "Python 3.14.7",
+        "source_interpreter": {
+          "__Path__": "/synthetic/python/bin/python3",
+          "__type__": "Path"
+        },
+        "venv_args": []
+      }
+    }
+  }
+}

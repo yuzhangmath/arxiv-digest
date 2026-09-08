@@ -679,9 +679,9 @@ test("setup review shows titled seed-paper rows and a clear PDF folder label", (
     profileSummary: {
       categories: ["math.AT"],
       coverage_start: "2026-07-24",
-      seed_papers: ["2205.13427", "2206.01234"],
+      seed_papers: ["2608.49003", "2206.01234"],
       seed_paper_details: [
-        { arxiv_id: "2205.13427", title: "First title" },
+        { arxiv_id: "2608.49003", title: "First title" },
         {
           arxiv_id: "2206.01234",
           title: "Second <script>not markup</script> title",
@@ -708,7 +708,7 @@ test("setup review shows titled seed-paper rows and a clear PDF folder label", (
   assert.match(root.textContent, /Starts 2026-07-24/);
   const seedRows = descendants(root, "li");
   assert.equal(seedRows.length, 2);
-  assert.match(seedRows[0].textContent, /2205\.13427.*First title/);
+  assert.match(seedRows[0].textContent, /2608\.49003.*First title/);
   assert.match(
     seedRows[1].textContent,
     /2206\.01234.*Second <script>not markup<\/script> title/,

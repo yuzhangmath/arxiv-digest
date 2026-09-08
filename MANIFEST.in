@@ -3,3 +3,5 @@ include THIRD_PARTY_NOTICES.md
 recursive-include src/arxiv_digest/assets *.icns *.svg
 recursive-include src/arxiv_digest/storage/migrations *.sql
 recursive-include src/arxiv_digest/web/static *
+prune docs/local
+prune docs/superpowers

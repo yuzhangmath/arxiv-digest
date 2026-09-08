@@ -869,6 +869,60 @@ def test_ambiguous_single_word_rules_match_only_their_structured_fields(
         scan_tree(author_record, denylist=denylist)
 
 
+@pytest.mark.parametrize("suffix", [".json", ".py", ".toml", ".yaml"])
+@pytest.mark.parametrize("violation", [None, "keyword", "author", "path"])
+def test_scoped_rules_handle_path_records_and_preserve_every_match(
+    tmp_path: Path, suffix: str, violation: str | None,
+) -> None:
+    from scripts.privacy_scan import Denylist, PrivacyViolation, scan_tree
+
+    private_path = "/synthetic/private-destination"
+    denylist = Denylist.from_mapping({
+        "keyword": ["orchard"], "author": ["May"], "path": [private_path],
+    })
+    path = private_path if violation == "path" else "/synthetic/public-runtime"
+    keyword = "orchard" if violation == "keyword" else "harbor"
+    author = "May" if violation == "author" else "Sam"
+    record = {
+        "recovery": {
+            "path": path, "filename": "runtime.py",
+            "environment_path": "/synthetic/environment",
+        },
+        "keywords": [keyword], "authors": [author],
+    }
+    if suffix == ".json":
+        payload = json.dumps(record)
+    elif suffix == ".py":
+        payload = f"INTERESTS = {record!r}\n"
+    elif suffix == ".toml":
+        payload = (
+            f'[recovery]\npath = "{path}"\nfilename = "runtime.py"\n'
+            'environment_path = "/synthetic/environment"\n'
+            f'[profile]\nkeywords = ["{keyword}"]\nauthors = ["{author}"]\n'
+        )
+    else:
+        # The maintained YAML reader accepts only top-level scalars and lists.
+        payload = (
+            f'path: "{path}"\nfilename: "runtime.py"\n'
+            'environment_path: "/synthetic/environment"\n'
+            f'keywords: ["{keyword}"]\nauthors: ["{author}"]\n'
+        )
+    public = tmp_path / "public"
+    public.mkdir()
+    filename = f"fixture{suffix}"
+    (public / filename).write_text(payload, encoding="utf-8")
+
+    if violation is None:
+        scan_tree(public, denylist=denylist)
+    else:
+        with pytest.raises(PrivacyViolation) as caught:
+            scan_tree(public, denylist=denylist)
+        assert caught.value.relative_path == filename
+        assert caught.value.artifact_class == f"denylist-{violation}"
+        for value in denylist.all_values():
+            assert value not in str(caught.value)
+
+
 @pytest.mark.parametrize("kind", ["wheel", "sdist"])
 def test_archive_scan_streams_members_and_applies_path_rules(
     tmp_path: Path,
