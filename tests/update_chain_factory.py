@@ -14,6 +14,7 @@ from pathlib import Path
 
 from arxiv_digest.update_contract import release_urls
 from arxiv_digest.update_manifest import AutomaticUpdateFrom, build_update_manifest, serialize_update_manifest
+from arxiv_digest.update_runtime import protocol
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "src/arxiv_digest"
@@ -21,7 +22,7 @@ API_URL = "https://api.github.com/repos/yuzhangmath/arxiv-digest/releases?per_pa
 BOUNDARY_FUNCTIONS = {
     "update_internal.py": ("_authenticate", "_validate_package", "run_self_check", "run_relaunch"),
     "update_runtime/helper.py": ("validate_prepared_inputs", "run_installer", "internal_operation", "healthy_relaunch",
-        "restore_and_relaunch", "_wait_parent_exit", "_acquire"),
+        "restore_and_relaunch", "_wait_parent_exit", "_acquire", "_recover_or_terminal"),
     "update_runtime/guard.py": ("installer_child", "run_guard"),
 }
 ERROR_CLASSES = frozenset({"EOFError", "TimeoutError", "OSError", "FileNotFoundError", "PermissionError", "ValueError",
@@ -47,18 +48,7 @@ def _install_fixture_exception_observers():
     destination = Path(ROOT_LITERAL, "update-boundary-errors.jsonl")
     allowed_frames = FRAME_LITERAL
     allowed_errors = ERROR_LITERAL
-    def record(boundary, error):
-        frames = []
-        traceback = error.__traceback__
-        while traceback is not None:
-            code = traceback.tb_frame.f_code
-            module = Path(code.co_filename).name
-            if module in allowed_frames and code.co_name in allowed_frames[module]:
-                frames.append({"module": module, "function": code.co_name, "line": traceback.tb_lineno})
-                frames = frames[-8:]
-            traceback = traceback.tb_next
-        event = {"boundary": boundary, "error": type(error).__name__ if type(error).__name__ in allowed_errors else "OtherError",
-                 "frames": frames}
+    def write(event):
         payload = (json.dumps(event, separators=(",", ":")) + "\\n").encode()
         if len(payload) > 4096:
             return
@@ -75,24 +65,54 @@ def _install_fixture_exception_observers():
             os.write(descriptor, payload)
         finally:
             os.close(descriptor)
-    def observe(function):
+    def record(boundary, error):
+        frames = []
+        traceback = error.__traceback__
+        while traceback is not None:
+            code = traceback.tb_frame.f_code
+            module = Path(code.co_filename).name
+            if module in allowed_frames and code.co_name in allowed_frames[module]:
+                frames.append({"module": module, "function": code.co_name, "line": traceback.tb_lineno})
+                frames = frames[-8:]
+            traceback = traceback.tb_next
+        write({"boundary": boundary, "error": type(error).__name__ if type(error).__name__ in allowed_errors else "OtherError",
+               "frames": frames})
+    def observe(function, boundary):
         @functools.wraps(function)
         def observed(*args, **kwargs):
+            if boundary == "_recover_or_terminal":
+                try:
+                    current = args[1].read_snapshot()
+                    state = "absent" if current is None else current.record["state"]
+                    if state in STATE_LITERAL:
+                        write({"boundary": boundary, "journal_state": state})
+                except Exception:
+                    pass
             try:
-                return function(*args, **kwargs)
+                result = function(*args, **kwargs)
             except BaseException as error:
                 try:
-                    record(function.__name__, error)
+                    record(boundary, error)
                 except Exception:
                     pass
                 raise
+            if boundary == "run_installer":
+                try:
+                    if type(result["returncode"]) is int and -255 <= result["returncode"] <= 255 and type(result["timed_out"]) is bool:
+                        write({"boundary": boundary, "returncode": result["returncode"], "timed_out": result["timed_out"]})
+                except Exception:
+                    pass
+            return result
         return observed
     for name in BOUNDARY_LITERAL:
-        globals()[name] = observe(globals()[name])
+        globals()[name] = observe(globals()[name], name)
+    if MODULE_LITERAL == "update_runtime/helper.py":
+        recovery.validate_target_installation = observe(recovery.validate_target_installation, "validate_target_installation")
 _install_fixture_exception_observers()
 del _install_fixture_exception_observers
 '''.replace("ROOT_LITERAL", repr(str(root))).replace("FRAME_LITERAL", repr({key: sorted(value) for key, value in FRAME_FUNCTIONS.items()})).replace(
-        "ERROR_LITERAL", repr(sorted(ERROR_CLASSES))).replace("BOUNDARY_LITERAL", repr(BOUNDARY_FUNCTIONS[module]))
+        "ERROR_LITERAL", repr(sorted(ERROR_CLASSES))).replace("BOUNDARY_LITERAL", repr(BOUNDARY_FUNCTIONS[module])).replace(
+        "STATE_LITERAL", repr(sorted(protocol.STATES | {"absent"}))).replace("MODULE_LITERAL", repr(module))
 
 
 def boundary_error_diagnostics(root: Path):
@@ -105,8 +125,18 @@ def boundary_error_diagnostics(root: Path):
         records = [json.loads(line) for line in payload.splitlines()]
         if len(records) > 64:
             return "over_limit"
-        boundaries = {name for names in BOUNDARY_FUNCTIONS.values() for name in names}
+        boundaries = {name for names in BOUNDARY_FUNCTIONS.values() for name in names} | {"validate_target_installation"}
         for record in records:
+            if type(record) is dict and record.get("boundary") == "run_installer" and "returncode" in record:
+                if (set(record) != {"boundary", "returncode", "timed_out"}
+                        or type(record["returncode"]) is not int or not -255 <= record["returncode"] <= 255
+                        or type(record["timed_out"]) is not bool):
+                    return "unreadable"
+                continue
+            if type(record) is dict and record.get("boundary") == "_recover_or_terminal" and "journal_state" in record:
+                if set(record) != {"boundary", "journal_state"} or record["journal_state"] not in protocol.STATES | {"absent"}:
+                    return "unreadable"
+                continue
             if (type(record) is not dict or set(record) != {"boundary", "error", "frames"}
                     or record["boundary"] not in boundaries or record["error"] not in ERROR_CLASSES
                     or type(record["frames"]) is not list or len(record["frames"]) > 8):

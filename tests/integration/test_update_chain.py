@@ -389,3 +389,45 @@ def test_chain_exception_observers_preserve_behavior_and_bound_structural_logs(t
     (tmp_path / "update-boundary-errors.jsonl").mkdir()
     with pytest.raises(ValueError, match="synthetic-secret"):
         namespace["_validate_package"]("synthetic-secret")
+
+
+@pytest.mark.parametrize("returncode,timed_out", [(0, False), (1, False), (-9, True)])
+def test_chain_observers_capture_returned_installer_failure_and_pre_rollback_state(tmp_path, returncode, timed_out):
+    from types import SimpleNamespace
+    from tests.update_chain_factory import BOUNDARY_FUNCTIONS, _exception_observers
+
+    namespace = {name: lambda *args, **kwargs: None for name in BOUNDARY_FUNCTIONS["update_runtime/helper.py"]}
+    namespace["recovery"] = SimpleNamespace(validate_target_installation=lambda value: value)
+    namespace["protocol"] = protocol
+    result = {"returncode": returncode, "timed_out": timed_out, "private": "synthetic-secret"}
+    namespace["run_installer"] = lambda *_args: result
+    marker = object()
+    namespace["_recover_or_terminal"] = lambda *_args, **_kwargs: marker
+    exec(_exception_observers(tmp_path, "update_runtime/helper.py"), namespace)
+    assert namespace["run_installer"](None, None) is result
+    store = SimpleNamespace(read_snapshot=lambda: SimpleNamespace(record={"state": "installing"}))
+    assert namespace["_recover_or_terminal"](None, store, None, None, None) is marker
+    assert boundary_error_diagnostics(tmp_path) == [
+        {"boundary": "run_installer", "returncode": returncode, "timed_out": timed_out},
+        {"boundary": "_recover_or_terminal", "journal_state": "installing"},
+    ]
+    assert "synthetic-secret" not in (tmp_path / "update-boundary-errors.jsonl").read_text()
+
+
+def test_chain_observers_capture_target_validation_failure_without_changing_exception(tmp_path):
+    from types import SimpleNamespace
+    from tests.update_chain_factory import BOUNDARY_FUNCTIONS, _exception_observers
+
+    namespace = {name: lambda *args, **kwargs: None for name in BOUNDARY_FUNCTIONS["update_runtime/helper.py"]}
+    failure = ValueError("synthetic-secret")
+    def validate_target_installation(_plan):
+        raise failure
+    namespace["recovery"] = SimpleNamespace(validate_target_installation=validate_target_installation)
+    namespace["protocol"] = protocol
+    exec(_exception_observers(tmp_path, "update_runtime/helper.py"), namespace)
+    with pytest.raises(ValueError) as caught:
+        namespace["recovery"].validate_target_installation(None)
+    assert caught.value is failure
+    assert boundary_error_diagnostics(tmp_path) == [
+        {"boundary": "validate_target_installation", "error": "ValueError", "frames": []},
+    ]
