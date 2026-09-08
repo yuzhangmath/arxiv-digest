@@ -35,11 +35,71 @@ FRAME_FUNCTIONS = {
     for name in (*BOUNDARY_FUNCTIONS, "update_runtime/recovery.py", "update_runtime/protocol.py",
         "web/lifecycle.py", "backup.py", "application.py", "atomic.py", "update_locks.py", "maintenance.py", "storage/database.py")
 }
+INVENTORY_LABELS = frozenset({"venv_configuration", "activation", "python_link", "shared_libraries", "dependency", "other"})
+INVENTORY_FIELDS = frozenset({"kind", "mode", "size", "sha256", "target", "presence"})
+CONFIGURATION_FIELDS = frozenset({"home", "include-system-site-packages", "version", "executable", "command", "prompt", "other"})
+
+
+def _fixture_inventory_changes(plan, recovery):
+    """Expose only fixed member categories and changed field names."""
+    old = plan["old_token"]["core"]
+    current = recovery.scan_environment(plan["paths"]["environment"], allowed_external_symlinks=recovery._external_links(old))
+    def retained(inventory):
+        result = {}
+        app_roots = {"arxiv_digest", "arxiv_digest-" + plan["old_version"] + ".dist-info",
+                     "arxiv_digest-" + plan["target_version"] + ".dist-info"}
+        for item in inventory["entries"]:
+            parts = item["path"].split("/")
+            if item["path"] in {"pipx_metadata.json", "bin/arxiv-digest"}:
+                continue
+            if "site-packages" in parts:
+                index = parts.index("site-packages")
+                if len(parts) > index + 1 and parts[index + 1] in app_roots:
+                    continue
+            result[item["path"]] = item
+        return result
+    before, after = retained(old["inventory"]), retained(current)
+    changes = []
+    for name in sorted(before.keys() | after.keys()):
+        left, right = before.get(name), after.get(name)
+        if left == right:
+            continue
+        if name == "pyvenv.cfg":
+            label = "venv_configuration"
+        elif name in {"bin/activate", "bin/activate.csh", "bin/activate.fish", "bin/Activate.ps1"}:
+            label = "activation"
+        elif name == "lib64" or name.startswith("bin/python"):
+            label = "python_link"
+        elif name.endswith("/pipx_shared.pth"):
+            label = "shared_libraries"
+        elif "site-packages" in name.split("/"):
+            label = "dependency"
+        else:
+            label = "other"
+        fields = ["presence"] if left is None or right is None else sorted(
+            key for key in left.keys() | right.keys() if left.get(key) != right.get(key))
+        change = {"member": label, "fields": fields}
+        if label == "venv_configuration" and left is not None and right is not None:
+            configs = []
+            for root in (plan["paths"]["snapshot"], plan["paths"]["environment"]):
+                payload, _ = recovery.read_owned_bytes(Path(root) / "pyvenv.cfg", limit=65536)
+                configs.append(dict(line.partition("=")[::2] for line in payload.decode().splitlines() if "=" in line))
+            change["configuration_fields"] = sorted({
+                key.strip() if key.strip() in CONFIGURATION_FIELDS else "other"
+                for key in configs[0].keys() | configs[1].keys() if configs[0].get(key) != configs[1].get(key)
+            })
+        if change not in changes:
+            changes.append(change)
+        if len(changes) == 8:
+            break
+    return changes
 
 
 def _exception_observers(root: Path, module: str) -> str:
     """Install observers only in synthetic releases, preserving returns/raises."""
-    return '''
+    import inspect
+    support = "\nCONFIGURATION_FIELDS = " + repr(sorted(CONFIGURATION_FIELDS)) + "\n" + inspect.getsource(_fixture_inventory_changes)
+    return support + '''
 
 # Test-only structural exception observations; no exception messages or values.
 def _install_fixture_exception_observers():
@@ -65,7 +125,7 @@ def _install_fixture_exception_observers():
             os.write(descriptor, payload)
         finally:
             os.close(descriptor)
-    def record(boundary, error):
+    def record(boundary, error, args):
         frames = []
         traceback = error.__traceback__
         while traceback is not None:
@@ -75,8 +135,14 @@ def _install_fixture_exception_observers():
                 frames.append({"module": module, "function": code.co_name, "line": traceback.tb_lineno})
                 frames = frames[-8:]
             traceback = traceback.tb_next
-        write({"boundary": boundary, "error": type(error).__name__ if type(error).__name__ in allowed_errors else "OtherError",
-               "frames": frames})
+        event = {"boundary": boundary, "error": type(error).__name__ if type(error).__name__ in allowed_errors else "OtherError",
+                 "frames": frames}
+        if boundary == "validate_target_installation":
+            try:
+                event["inventory_changes"] = _fixture_inventory_changes(args[0], recovery)
+            except Exception:
+                pass
+        write(event)
     def observe(function, boundary):
         @functools.wraps(function)
         def observed(*args, **kwargs):
@@ -92,7 +158,7 @@ def _install_fixture_exception_observers():
                 result = function(*args, **kwargs)
             except BaseException as error:
                 try:
-                    record(boundary, error)
+                    record(boundary, error, args)
                 except Exception:
                     pass
                 raise
@@ -137,7 +203,20 @@ def boundary_error_diagnostics(root: Path):
                 if set(record) != {"boundary", "journal_state"} or record["journal_state"] not in protocol.STATES | {"absent"}:
                     return "unreadable"
                 continue
-            if (type(record) is not dict or set(record) != {"boundary", "error", "frames"}
+            if type(record) is dict and "inventory_changes" in record:
+                if (record.get("boundary") != "validate_target_installation" or type(record["inventory_changes"]) is not list
+                        or len(record["inventory_changes"]) > 8):
+                    return "unreadable"
+                for change in record["inventory_changes"]:
+                    if (type(change) is not dict or set(change) not in ({"member", "fields"}, {"member", "fields", "configuration_fields"})
+                            or change["member"] not in INVENTORY_LABELS or type(change["fields"]) is not list
+                            or not set(change["fields"]) <= INVENTORY_FIELDS):
+                        return "unreadable"
+                    if "configuration_fields" in change and (change["member"] != "venv_configuration"
+                            or type(change["configuration_fields"]) is not list
+                            or not set(change["configuration_fields"]) <= CONFIGURATION_FIELDS):
+                        return "unreadable"
+            if (type(record) is not dict or set(record) - {"inventory_changes"} != {"boundary", "error", "frames"}
                     or record["boundary"] not in boundaries or record["error"] not in ERROR_CLASSES
                     or type(record["frames"]) is not list or len(record["frames"]) > 8):
                 return "unreadable"

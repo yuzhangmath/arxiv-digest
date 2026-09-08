@@ -431,3 +431,39 @@ def test_chain_observers_capture_target_validation_failure_without_changing_exce
     assert boundary_error_diagnostics(tmp_path) == [
         {"boundary": "validate_target_installation", "error": "ValueError", "frames": []},
     ]
+
+
+def test_chain_inventory_differences_expose_categories_without_paths_or_configuration_values(tmp_path):
+    from arxiv_digest.update_runtime import recovery
+    from tests.update_chain_factory import _fixture_inventory_changes
+
+    environment, snapshot = tmp_path / "environment", tmp_path / "snapshot"
+    for root in (environment, snapshot):
+        root.mkdir(mode=0o700)
+        (root / "pyvenv.cfg").write_text("command = /private/synthetic-secret/python -m venv synthetic\n")
+        (root / "pyvenv.cfg").chmod(0o600)
+    old = {"inventory": recovery.scan_environment(environment)}
+    (environment / "pyvenv.cfg").write_text("command = /private/synthetic-secret/python3.11 -m venv synthetic\n")
+    changes = _fixture_inventory_changes({
+        "old_token": {"core": old}, "old_version": "0.3.0", "target_version": "0.3.1",
+        "paths": {"environment": str(environment), "snapshot": str(snapshot)},
+    }, recovery)
+    assert changes == [{"member": "venv_configuration", "fields": ["sha256", "size"], "configuration_fields": ["command"]}]
+    record = {"boundary": "validate_target_installation", "error": "SnapshotError", "frames": [], "inventory_changes": changes}
+    (tmp_path / "update-boundary-errors.jsonl").write_text(json.dumps(record) + "\n")
+    assert boundary_error_diagnostics(tmp_path) == [record]
+    assert "synthetic-secret" not in json.dumps(record) and str(tmp_path) not in json.dumps(record)
+
+
+@pytest.mark.parametrize("record", [
+    {"boundary": "run_installer", "returncode": "synthetic-secret", "timed_out": False},
+    {"boundary": "run_installer", "returncode": 1, "timed_out": "synthetic-secret"},
+    {"boundary": "_recover_or_terminal", "journal_state": "synthetic-secret"},
+    {"boundary": "validate_target_installation", "error": "SnapshotError", "frames": [],
+     "inventory_changes": [{"member": "synthetic-secret", "fields": ["sha256"]}]},
+    {"boundary": "validate_target_installation", "error": "SnapshotError", "frames": [],
+     "inventory_changes": [{"member": "venv_configuration", "fields": ["sha256"], "configuration_fields": ["synthetic-secret"]}]},
+])
+def test_chain_diagnostic_reader_rejects_untrusted_installer_and_inventory_values(tmp_path, record):
+    (tmp_path / "update-boundary-errors.jsonl").write_text(json.dumps(record) + "\n")
+    assert boundary_error_diagnostics(tmp_path) == "unreadable"
