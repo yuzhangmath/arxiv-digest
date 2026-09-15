@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
+from time import monotonic, sleep
 
 import pytest
 
@@ -1181,6 +1182,13 @@ def test_server_quit_requires_authentication_and_idle_policy_is_three_minutes() 
         accepted_status, accepted = quit_request(authenticated=True)
         assert accepted_status == 200
         assert accepted["data"] == {"quitting": True}
-        assert lifecycle.should_stop() is True
+        # The client can receive the body before the request transaction drains.
+        deadline = monotonic() + 2
+        while monotonic() < deadline:
+            if lifecycle.should_stop():
+                break
+            sleep(0.01)
+        else:
+            raise AssertionError("lifecycle did not stop after the quit response")
     finally:
         server.stop()
