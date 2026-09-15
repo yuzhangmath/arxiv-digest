@@ -106,7 +106,7 @@ def test_mutations_require_the_exact_local_origin() -> None:
     assert accepted.status == 200
 
 
-def test_sync_start_accepts_a_scoped_failed_date_retry() -> None:
+def test_sync_start_accepts_scoped_retry_modes_and_requires_booleans() -> None:
     from arxiv_digest.web.api import ApiRouter
 
     seen = []
@@ -119,18 +119,30 @@ def test_sync_start_accepts_a_scoped_failed_date_retry() -> None:
         },
     )
 
-    response = router.dispatch(
-        _request(
-            "POST",
-            "/api/v1/sync/start",
-            origin=ORIGIN,
-            content_type="application/json",
-            body=b'{"retry_failed_dates":true}',
+    for mode in ("retry_failed_dates", "retry_missing_abstracts"):
+        response = router.dispatch(
+            _request(
+                "POST",
+                "/api/v1/sync/start",
+                origin=ORIGIN,
+                content_type="application/json",
+                body=json.dumps({mode: True}).encode(),
+            )
         )
-    )
+        assert response.status == 200
+        for invalid in ("true", 1, None):
+            rejected = router.dispatch(
+                _request(
+                    "POST",
+                    "/api/v1/sync/start",
+                    origin=ORIGIN,
+                    content_type="application/json",
+                    body=json.dumps({mode: invalid}).encode(),
+                )
+            )
+            assert rejected.status == 400
 
-    assert response.status == 200
-    assert seen == [{"retry_failed_dates": True}]
+    assert seen == [{"retry_failed_dates": True}, {"retry_missing_abstracts": True}]
 
 
 def test_settings_coverage_requires_profile_revision() -> None:

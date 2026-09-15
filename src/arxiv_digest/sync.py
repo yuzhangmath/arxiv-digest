@@ -10,6 +10,7 @@ from arxiv_digest.models import (
     CatchupDay,
     CatchupDayStatus,
     EnrichmentStatus,
+    OaiArticle,
 )
 from arxiv_digest.rate_limit import ArxivRequestCancelled
 from arxiv_digest.sources.atom import atom_observations
@@ -328,6 +329,51 @@ class SyncService:
                     network_failures += 1
                 if attempted is not None:
                     attempted(config.category, mailing_date)
+        return self.progress(
+            configs,
+            offline=network_failures > 0 and network_successes == 0,
+        )
+
+    def retry_missing_abstracts(
+        self,
+        configs: tuple[CategoryConfig, ...],
+        *,
+        attempted: Callable[[str], None] | None = None,
+    ) -> SyncReport:
+        """Fetch only missing abstracts for currently unreviewed visible papers."""
+
+        self._check_cancelled()
+        identifiers = self.store.unreviewed_papers_missing_abstracts(
+            active_configs=configs
+        )
+        for config in configs:
+            self.store.ensure_category_state(
+                config.category, config.oai_set_spec, config.coverage_start
+            )
+        network_successes = 0
+        network_failures = 0
+        for arxiv_id in identifiers:
+            self._check_cancelled()
+            try:
+                record = self.oai_source.get_record(
+                    arxiv_id, cancelled=self._cancelled
+                )
+                self._check_cancelled()
+                if (
+                    not isinstance(record, OaiArticle)
+                    or record.metadata.arxiv_id != arxiv_id
+                    or record.oai_identifier != f"oai:arXiv.org:{arxiv_id}"
+                    or not record.metadata.abstract.strip()
+                ):
+                    raise ValueError("OAI record did not provide the requested abstract")
+                self.store.apply_article_snapshot(record.metadata, record.versions)
+                network_successes += 1
+            except Exception as error:
+                self._raise_cancelled(error)
+                network_failures += 1
+            finally:
+                if attempted is not None:
+                    attempted(arxiv_id)
         return self.progress(
             configs,
             offline=network_failures > 0 and network_successes == 0,

@@ -656,6 +656,13 @@ class _DefaultRuntime:
             "initialized": self.profiles.load() is not None,
             "sync": sync_job,
             "daily_list_retry": retry,
+            "abstract_retry": (
+                dict(sync_job["abstract_retry"])
+                if sync_job is not None
+                and sync_job.get("status") == "running"
+                and isinstance(sync_job.get("abstract_retry"), dict)
+                else {"status": "idle", "completed": 0, "total": 0}
+            ),
             "metadata_sync": metadata_sync,
             "daily_list_progress": daily_list_progress,
             "offline": offline,
@@ -1683,12 +1690,50 @@ class _DefaultRuntime:
         self._last_sync_report = report
         return report
 
-    def _run_sync(self, job_id: str, *, retry_failed_dates: bool) -> Any:
+    def _run_abstract_retry(self, job_id: str) -> Any:
+        configs = self._sync_configs()
+        self._set_sync_phase(job_id, "enrichment")
+        identifiers = self.store.unreviewed_papers_missing_abstracts(
+            active_configs=configs,
+        )
+        completed: set[str] = set()
+
+        def record_attempt(arxiv_id: str) -> None:
+            completed.add(arxiv_id)
+            with self._jobs_lock:
+                self._jobs[job_id]["abstract_retry"] = {
+                    "status": "running",
+                    "completed": len(completed),
+                    "total": len(identifiers),
+                }
+
+        with self._jobs_lock:
+            self._jobs[job_id]["abstract_retry"] = {
+                "status": "running", "completed": 0, "total": len(identifiers),
+            }
+        try:
+            report = self.sync.retry_missing_abstracts(
+                configs, attempted=record_attempt,
+            )
+            self._last_sync_report = report
+            return report
+        finally:
+            with self._jobs_lock:
+                self._jobs[job_id].pop("abstract_retry", None)
+
+    def _run_sync(
+        self, job_id: str, *, retry_failed_dates: bool,
+        retry_missing_abstracts: bool = False,
+    ) -> Any:
         try:
             while True:
-                report = self._run_sync_pass(
-                    job_id,
-                    retry_failed_dates=retry_failed_dates,
+                report = (
+                    self._run_abstract_retry(job_id)
+                    if retry_missing_abstracts
+                    else self._run_sync_pass(
+                        job_id,
+                        retry_failed_dates=retry_failed_dates,
+                    )
                 )
                 with self._jobs_lock:
                     if getattr(self, "_sync_resume_after_cancel", False):
@@ -1700,6 +1745,7 @@ class _DefaultRuntime:
                         return report
                     self._sync_follow_up_requested = False
                 retry_failed_dates = False
+                retry_missing_abstracts = False
         finally:
             with self._jobs_lock:
                 if self._active_sync_job == job_id:
@@ -1707,6 +1753,11 @@ class _DefaultRuntime:
                     self._sync_follow_up_requested = False
 
     def _start_sync_job(self, payload: dict[str, Any]) -> dict[str, str]:
+        if (
+            payload.get("retry_failed_dates") is True
+            and payload.get("retry_missing_abstracts") is True
+        ):
+            raise ValueError("choose one synchronization retry mode")
         with self._sync_start_lock:
             with self._jobs_lock:
                 if self._active_sync_job is not None:
@@ -1729,7 +1780,9 @@ class _DefaultRuntime:
                     None,
                 )
                 initial_phase = (
-                    "daily_list"
+                    "enrichment"
+                    if payload.get("retry_missing_abstracts") is True
+                    else "daily_list"
                     if payload.get("retry_failed_dates") is True
                     or not callable(pending_daily_lists)
                     or pending_daily_lists(self._sync_configs())
@@ -1741,6 +1794,7 @@ class _DefaultRuntime:
                     lambda: self._run_sync(
                         job_id,
                         retry_failed_dates=payload.get("retry_failed_dates") is True,
+                        retry_missing_abstracts=payload.get("retry_missing_abstracts") is True,
                     ),
                     job_id=job_id,
                     request_cancel=self._sync_cancel.set,

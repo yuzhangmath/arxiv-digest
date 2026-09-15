@@ -28,8 +28,8 @@ test("library identifies its newest-first paper order", () => {
   );
   assert.equal(
     guidance.textContent,
-    "With search blank, saved papers are ordered by original arXiv " +
-      "submission date, newest first. Search results prioritize relevance, " +
+    "With search blank, saved papers are ordered by the date of their " +
+      "latest arXiv version, newest first. Search results prioritize relevance, " +
       "then recency.",
   );
 });

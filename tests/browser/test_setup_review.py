@@ -80,6 +80,9 @@ class FixtureApplication:
         self.settings_folder_save_failures = 0
         self.library_empty = False
         self.sync_starts_running = False
+        self.sync_start_gate: threading.Event | None = None
+        self.sync_start_entered = threading.Event()
+        self.sync_start_failures = 0
         self.sync_running = False
         self.sync_phase = "daily_list"
         self.sync_status_requests = 0
@@ -98,6 +101,9 @@ class FixtureApplication:
         self.settings_retryable_failed_daily_list_dates: list[str] = []
         self.daily_list_retry_total: int | None = None
         self.daily_list_retry_completed = 0
+        self.abstract_retry_total = 0
+        self.abstract_retry_completed = 0
+        self.abstract_retry_running = False
         self.daily_list_target_dates = 0
         self.daily_list_checked_dates = 0
         self.daily_list_dates_with_papers = 0
@@ -110,6 +116,7 @@ class FixtureApplication:
         self.review_projection_revision = 9
         self.review_support_categories = ("math.AG", "math.CO")
         self.review_unconfirmed_latest_version = 4
+        self.review_missing_abstracts = 0
         self.active_categories = ["math.AG"]
         self.category_coverage_starts = {"math.AG": "2026-01-01"}
         self.review_summary_requests = 0
@@ -292,6 +299,17 @@ class FixtureApplication:
                 else self.daily_list_retry_total
             )
             retry_completed = self.daily_list_retry_completed
+            abstract_retry = {
+                "status": (
+                    "running" if running and self.abstract_retry_running else "idle"
+                ),
+                "completed": self.abstract_retry_completed if running else 0,
+                "total": (
+                    self.abstract_retry_total
+                    if running and self.abstract_retry_running
+                    else self.review_missing_abstracts
+                ),
+            }
             daily_list_progress = {
                 "target_dates": self.daily_list_target_dates,
                 "checked_dates": self.daily_list_checked_dates,
@@ -325,13 +343,20 @@ class FixtureApplication:
                 "total": retry_total if running else len(retryable_dates),
             },
             "daily_list_progress": daily_list_progress,
+            "abstract_retry": abstract_retry,
         }
 
     def start_sync(self, payload: dict[str, object]) -> dict[str, str]:
         self.record_dashboard(
             "sync_start", payload, {"job_id": "sync_initial_1234"}
         )
+        self.sync_start_entered.set()
+        if self.sync_start_gate is not None:
+            assert self.sync_start_gate.wait(timeout=5)
         with self.lock:
+            if self.sync_start_failures > 0:
+                self.sync_start_failures -= 1
+                raise RuntimeError("synthetic synchronization start failure")
             if self.sync_starts_running:
                 self.sync_running = True
                 self.sync_phase = "daily_list"
@@ -340,6 +365,11 @@ class FixtureApplication:
                         set(self.settings_retryable_failed_daily_list_dates)
                     )
                     self.daily_list_retry_completed = 0
+                elif payload.get("retry_missing_abstracts") is True:
+                    self.sync_phase = "metadata"
+                    self.abstract_retry_running = True
+                    self.abstract_retry_total = self.review_missing_abstracts
+                    self.abstract_retry_completed = 0
                 else:
                     self.review_ready = False
         return {"job_id": "sync_initial_1234"}
@@ -472,6 +502,7 @@ class FixtureApplication:
             return {
                 "unreviewed_dates": 0,
                 "unreviewed_papers": 0,
+                "missing_abstracts": 0,
                 "newly_discovered": 0,
                 "oldest_unreviewed_date": None,
                 "snapshot_revision": 77,
@@ -481,6 +512,7 @@ class FixtureApplication:
         return {
             "unreviewed_dates": 10,
             "unreviewed_papers": 200,
+            "missing_abstracts": self.review_missing_abstracts,
             "newly_discovered": 1,
             "oldest_unreviewed_date": "2026-07-31",
             "snapshot_revision": 77,
@@ -606,7 +638,10 @@ class FixtureApplication:
                     ),
                     "title": title,
                     "authors": ["Ada Example"],
-                    "abstract": "An accessible collapsed abstract.",
+                    "abstract": (
+                        "" if event_id <= self.review_missing_abstracts
+                        else "An accessible collapsed abstract."
+                    ),
                     "daily_list_date": day,
                     "support_categories": active_support,
                     "subjects": list(self.review_support_categories),
@@ -2209,6 +2244,167 @@ def test_review_start_is_independent_of_failed_daily_list_retry() -> None:
             "sync_start",
             {"retry_failed_dates": True},
         ) in application.dashboard_calls
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_review_home_retries_missing_abstracts_and_refreshes_papers(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.review_missing_abstracts = 2
+        application.settings_retryable_failed_daily_list_dates = ["2026-08-11"]
+        application.sync_starts_running = True
+        page_errors: list[str] = []
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+        page.goto(server.launch_url("review"))
+        retry = page.get_by_role(
+            "button", name="Retry 2 missing abstracts", exact=True
+        )
+        retry.wait_for(timeout=5_000)
+        page.get_by_role("button", name="Start review", exact=True).click()
+        page.get_by_role("heading", name="Review 2026-07-31", exact=True).wait_for()
+        assert page.locator("article").first.locator(".paper-abstract").text_content() == ""
+        assert not any(
+            operation == "sync_start"
+            for operation, _payload in application.dashboard_calls
+        )
+
+        page.get_by_role("navigation", name="Review dates").get_by_role(
+            "button", name="Back to Review overview", exact=True
+        ).click()
+        retry.wait_for()
+        with page.expect_response(
+            lambda response: response.url.endswith("/api/v1/sync/start")
+        ):
+            retry.evaluate("element => { element.click(); element.click(); }")
+
+        retrying = page.get_by_role(
+            "button", name="Retrying abstracts… 0 of 2 completed", exact=True
+        )
+        retrying.wait_for()
+        assert retrying.is_disabled()
+        assert page.get_by_role("button", name="Start review", exact=True).is_enabled()
+        assert page.get_by_role(
+            "button", name="Retry 1 failed daily-list date", exact=True
+        ).is_disabled()
+        with application.lock:
+            application.abstract_retry_completed = 1
+        page.get_by_role(
+            "button", name="Retrying abstracts… 1 of 2 completed", exact=True
+        ).wait_for(timeout=5_000)
+
+        with application.lock:
+            application.review_missing_abstracts = 0
+            application.sync_running = False
+            application.abstract_retry_running = False
+        page.get_by_role(
+            "button", name="Retrying abstracts… 1 of 2 completed", exact=True
+        ).wait_for(state="detached", timeout=5_000)
+        assert retry.count() == 0
+        assert [
+            call for call in application.dashboard_calls if call[0] == "sync_start"
+        ] == [("sync_start", {"retry_missing_abstracts": True})]
+
+        page.get_by_role("button", name="Start review", exact=True).click()
+        first = page.locator("article").first
+        first.locator("summary", has_text="Read abstract").click()
+        assert first.get_by_text(
+            "An accessible collapsed abstract.", exact=True
+        ).is_visible()
+        assert page_errors == []
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_review_home_keeps_unsuccessful_abstract_fetches_retryable(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.review_missing_abstracts = 1
+        application.sync_starts_running = True
+        page.goto(server.launch_url("review"))
+        retry = page.get_by_role(
+            "button", name="Retry 1 missing abstract", exact=True
+        )
+        retry.wait_for(timeout=5_000)
+        retry.click()
+        page.get_by_role(
+            "button", name="Retrying abstracts… 0 of 1 completed", exact=True
+        ).wait_for()
+
+        with application.lock:
+            application.sync_running = False
+            application.abstract_retry_running = False
+        retry.wait_for(timeout=5_000)
+        assert retry.is_enabled()
+        assert page.get_by_role("button", name="Start review", exact=True).is_enabled()
+        retry.click()
+        page.get_by_role(
+            "button", name="Retrying abstracts… 0 of 1 completed", exact=True
+        ).wait_for()
+        assert [
+            call for call in application.dashboard_calls if call[0] == "sync_start"
+        ] == [("sync_start", {"retry_missing_abstracts": True})] * 2
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_review_home_disables_abstract_retry_during_other_sync(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.review_missing_abstracts = 1
+        application.sync_running = True
+        page.goto(server.launch_url("review"))
+        retry = page.get_by_role(
+            "button", name="Retry 1 missing abstract", exact=True
+        )
+        retry.wait_for(timeout=5_000)
+        assert retry.is_disabled()
+        assert page.get_by_role("button", name="Start review", exact=True).is_enabled()
+        assert not any(
+            operation == "sync_start"
+            for operation, _payload in application.dashboard_calls
+        )
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+@pytest.mark.parametrize("destination", ["review-date", "library"])
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+def test_late_abstract_retry_response_preserves_navigation(
+    engine: str, destination: str, fails: bool
+) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.review_missing_abstracts = 1
+        application.sync_start_gate = threading.Event()
+        application.sync_start_failures = int(fails)
+        page_errors: list[str] = []
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+        try:
+            page.goto(server.launch_url("review"))
+            page.get_by_role(
+                "button", name="Retry 1 missing abstract", exact=True
+            ).click()
+            assert application.sync_start_entered.wait(timeout=5)
+
+            if destination == "review-date":
+                page.get_by_role("button", name="Start review", exact=True).click()
+                heading = page.get_by_role(
+                    "heading", name="Review 2026-07-31", exact=True
+                )
+            else:
+                page.get_by_role("button", name="Library", exact=True).click()
+                heading = page.get_by_role("heading", name="Library", exact=True)
+            heading.wait_for()
+            summary_requests = application.review_summary_requests
+            status = page.locator("#status").inner_text()
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/api/v1/sync/start")
+            ):
+                application.sync_start_gate.set()
+            page.wait_for_timeout(300)
+
+            assert heading.is_visible()
+            assert application.review_summary_requests == summary_requests
+            assert page.locator("#status").inner_text() == status
+            assert page_errors == []
+        finally:
+            application.sync_start_gate.set()
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])

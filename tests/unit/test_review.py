@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from math import isclose
 from pathlib import Path
@@ -145,6 +145,33 @@ def review(tmp_path: Path) -> tuple[Store, Profiles, ReviewService]:
     store.ensure_category_state("cs.SE", "cs:SE", date(2026, 7, 1))
     profiles = Profiles(_profile(tmp_path))
     return store, profiles, ReviewService(store, profiles)
+
+
+def test_summary_counts_missing_abstracts_until_recovered_or_reviewed(review) -> None:
+    store, _profiles, service = review
+    day = date(2026, 8, 3)
+    for number in (1, 2, 3):
+        _add(store, number, day)
+    for arxiv_id in ("2608.00001", "2608.00002"):
+        store.apply_article_snapshot(
+            replace(store.article_metadata(arxiv_id), abstract=" \n\t"),
+            store.article_versions(arxiv_id),
+        )
+    assert service.summary().missing_abstracts == 2
+    store.apply_article_snapshot(
+        replace(store.article_metadata("2608.00001"), abstract="Recovered abstract."),
+        store.article_versions("2608.00001"),
+    )
+    assert service.summary().missing_abstracts == 1
+    page = service.open_date(day)
+    service.finish_date(
+        day,
+        through_revision=page.snapshot_revision,
+        profile_revision=page.profile_revision,
+        projection_revision=page.projection_revision,
+        finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
+    )
+    assert service.summary().missing_abstracts == 0
 
 
 def test_oldest_first_finish_and_later_discovery(

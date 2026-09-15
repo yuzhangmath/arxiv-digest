@@ -29,6 +29,7 @@ class ReviewSummary:
     snapshot_revision: int
     profile_revision: int
     projection_revision: int
+    missing_abstracts: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +210,11 @@ class ReviewService:
             snapshot_revision=snapshot_revision,
             profile_revision=profile.revision,
             projection_revision=projection_revision,
+            missing_abstracts=len(
+                self.store.unreviewed_papers_missing_abstracts(
+                    active_configs=active_configs,
+                )
+            ),
         )
 
     def start(self) -> ReviewPage | None:

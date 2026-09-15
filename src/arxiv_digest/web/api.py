@@ -278,8 +278,11 @@ _ROUTES = (
         "POST",
         "/api/v1/sync/start",
         "sync_start",
-        optional=("retry_failed_dates",),
-        validators={"retry_failed_dates": lambda value: type(value) is bool},
+        optional=("retry_failed_dates", "retry_missing_abstracts"),
+        validators={
+            "retry_failed_dates": lambda value: type(value) is bool,
+            "retry_missing_abstracts": lambda value: type(value) is bool,
+        },
     ),
     _R("POST", "/api/v1/sync/cancel", "sync_cancel", body_kind="json", required=("job_id",), validators={"job_id": _is_id}),
     _R("GET", "/api/v1/review/summary", "review_summary"),

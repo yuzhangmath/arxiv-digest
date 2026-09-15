@@ -245,10 +245,15 @@ their papers stay out of Review and Calendar until recovery succeeds. Coverage
 progress distinguishes checked dates with papers, confirmed empty dates,
 pending dates, retryable failures, and dates that are no longer available.
 
+If a recovered date has papers without abstracts, the Review starting page
+offers **Retry missing abstracts** with the number of affected papers. The
+retry fetches their current metadata and shows progress; papers that still
+lack an abstract remain retryable. You can start reviewing while it runs.
+
 Library is independent of the active Review and Calendar categories. Saving a
 paper does not create daily-list membership, and removing a category does not
 remove saved papers or separately downloaded PDFs. With search blank, Library
-orders saved papers by original arXiv submission date, newest first; searches
+orders saved papers by latest arXiv version date, newest first; searches
 prioritize relevance, then recency. Library cards also link to arXiv.
 
 ## Useful commands

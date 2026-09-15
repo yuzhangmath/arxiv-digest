@@ -37,7 +37,7 @@ function tierOf(card) {
   return typeof tier === "string" ? tier : String(tier?.value ?? "other");
 }
 
-function normalizedDailyListRetry(value) {
+function normalizedRetry(value) {
   const total = Number.isSafeInteger(value?.total) && value.total > 0
     ? value.total
     : 0;
@@ -89,6 +89,21 @@ function updateRetryButton(control, retry, synchronizing) {
   } else {
     const noun = retry.total === 1 ? "date" : "dates";
     control.textContent = `Retry ${retry.total} failed daily-list ${noun}`;
+  }
+}
+
+function updateAbstractRetryButton(control, retry, missing, synchronizing) {
+  const busy = control.dataset.busy === "true";
+  const running = retry.status === "running";
+  control.hidden = missing === 0 && !running && !busy;
+  control.disabled = busy || running || synchronizing;
+  control.setAttribute("aria-busy", busy || running ? "true" : "false");
+  if (running) {
+    control.textContent = `Retrying abstracts… ${retry.completed} of ${retry.total} completed`;
+  } else if (busy) {
+    control.textContent = "Starting abstract retry…";
+  } else {
+    control.textContent = `Retry ${missing} missing ${missing === 1 ? "abstract" : "abstracts"}`;
   }
 }
 
@@ -149,14 +164,19 @@ export function renderReviewHome(
     synchronizationPhase = "daily_list",
     dailyListRetry,
     dailyListProgress,
+    abstractRetry,
     start,
     retryFailed,
+    retryAbstracts,
     finishAll,
     pending,
     failure,
   } = {},
 ) {
-  const retry = normalizedDailyListRetry(dailyListRetry);
+  const retry = normalizedRetry(dailyListRetry);
+  const abstracts = normalizedRetry(abstractRetry);
+  const missingAbstracts = nonnegativeCount(summary?.missing_abstracts);
+  const retryingAbstracts = abstracts.status === "running";
   const enrichment = synchronizing && synchronizationPhase === "enrichment";
   const recovering = synchronizing && !enrichment;
   let view = container.querySelector(".review-home");
@@ -214,9 +234,16 @@ export function renderReviewHome(
   const phaseStatus = activity.querySelector(".review-sync-phase-status");
   const retrying = retry.status === "running";
   const coverageText = dailyListProgressText(dailyListProgress);
-  activity.hidden = !synchronizing && !retrying;
-  view.setAttribute("aria-busy", recovering || retrying ? "true" : "false");
-  if (enrichment) {
+  activity.hidden = !synchronizing && !retrying && !retryingAbstracts;
+  view.setAttribute("aria-busy", recovering || retrying || retryingAbstracts ? "true" : "false");
+  if (retryingAbstracts) {
+    const text = `Retrying abstracts… ${abstracts.completed} of ${abstracts.total} completed`;
+    progress.setAttribute("value", abstracts.completed);
+    progress.setAttribute("max", abstracts.total);
+    progress.setAttribute("aria-label", text);
+    progressText.textContent = "";
+    if (phaseStatus.textContent !== text) phaseStatus.textContent = text;
+  } else if (enrichment) {
     progress.removeAttribute?.("value");
     progress.removeAttribute?.("max");
     progress.setAttribute("aria-label", "Syncing recent paper data…");
@@ -312,6 +339,31 @@ export function renderReviewHome(
     retryButton.className = "review-retry-failed";
     retryButton.setAttribute("aria-busy", "false");
 
+    const abstractButton = button(document, "Retry missing abstracts", async () => {
+      if (abstractButton.disabled || abstractButton.dataset.busy === "true") return;
+      abstractButton.dataset.busy = "true";
+      const update = () => updateAbstractRetryButton(
+        abstractButton,
+        controls.reviewAbstractRetry,
+        controls.reviewMissingAbstracts,
+        controls.reviewSynchronizing,
+      );
+      update();
+      let failed = false;
+      try {
+        await controls.reviewActions?.retryAbstracts?.();
+      } catch (error) {
+        failed = true;
+        controls.reviewActions?.failure?.(error);
+      } finally {
+        abstractButton.dataset.busy = "false";
+        update();
+        if (failed) abstractButton.focus?.();
+      }
+    });
+    abstractButton.className = "review-retry-abstracts";
+    abstractButton.setAttribute("aria-busy", "false");
+
     const markAll = button(document, "Mark all as reviewed", () => {
       const confirmed = controls.reviewSummary;
       controls.confirmedSnapshot = Object.freeze({
@@ -380,13 +432,15 @@ export function renderReviewHome(
       markAll.focus?.();
     });
     confirmation.append(confirm, cancel);
-    controls.append(startButton, retryButton, markAll, confirmation);
+    controls.append(startButton, retryButton, abstractButton, markAll, confirmation);
     view.append(controls);
   }
 
-  controls.reviewActions = { start, retryFailed, finishAll, pending, failure };
+  controls.reviewActions = { start, retryFailed, retryAbstracts, finishAll, pending, failure };
   controls.reviewSummary = summary;
   controls.reviewRetry = retry;
+  controls.reviewAbstractRetry = abstracts;
+  controls.reviewMissingAbstracts = missingAbstracts;
   controls.reviewSynchronizing = synchronizing;
   const startButton = controls.querySelector(".review-start");
   startButton.dataset.date = oldest;
@@ -394,6 +448,12 @@ export function renderReviewHome(
   updateRetryButton(
     controls.querySelector(".review-retry-failed"),
     retry,
+    synchronizing,
+  );
+  updateAbstractRetryButton(
+    controls.querySelector(".review-retry-abstracts"),
+    abstracts,
+    missingAbstracts,
     synchronizing,
   );
   const confirmation = controls.querySelector(

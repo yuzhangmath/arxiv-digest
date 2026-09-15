@@ -378,6 +378,7 @@ async function requestReview(destination = {}) {
       synchronizationPhase,
       dailyListRetry,
       dailyListProgress: serviceStatus?.daily_list_progress,
+      abstractRetry: serviceStatus?.abstract_retry,
       start: (oldest) => navigateReviewDate({ date: oldest }),
       retryFailed: async () => {
         await api.json(
@@ -386,6 +387,25 @@ async function requestReview(destination = {}) {
           jsonBody({ retry_failed_dates: true }),
         );
         statusText("Retrying failed daily-list dates…");
+        return requestReview({});
+      },
+      retryAbstracts: async () => {
+        const retryHome = content.querySelector(".review-home");
+        const retrySequence = reviewRequestSequence;
+        const isCurrent = () => reviewRequestIsCurrent(retrySequence) &&
+          content.querySelector(".review-home") === retryHome;
+        try {
+          await api.json(
+            "review-sync-start",
+            "/api/v1/sync/start",
+            jsonBody({ retry_missing_abstracts: true }),
+          );
+        } catch (error) {
+          if (isCurrent()) throw error;
+          return false;
+        }
+        if (!isCurrent()) return false;
+        statusText("Retrying missing abstracts…");
         return requestReview({});
       },
       pending: () => statusText("Marking all unreviewed papers as reviewed…"),

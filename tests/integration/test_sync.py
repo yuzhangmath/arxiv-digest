@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
@@ -17,6 +18,7 @@ from arxiv_digest.models import (
     CatchupPage,
     EnrichmentStatus,
     OaiArticle,
+    OaiTombstone,
     PaperMetadata,
     PaperVersion,
     VersionResolution,
@@ -99,6 +101,8 @@ class ScriptedOai:
         self.backfill: dict[str, list[object]] = defaultdict(list)
         self.first_calls: list[tuple[str, date]] = []
         self.backfill_calls: list[tuple[str, date, date]] = []
+        self.records: dict[str, list[object]] = defaultdict(list)
+        self.record_calls: list[str] = []
         self.identify_result = OaiIdentify(
             response_date=NOW,
             earliest_datestamp=date(2007, 1, 1),
@@ -135,12 +139,19 @@ class ScriptedOai:
     def identify(self, *, cancelled=None) -> OaiIdentify:
         return self.identify_result
 
+    def get_record(self, arxiv_id: str, *, cancelled=None):
+        self.record_calls.append(arxiv_id)
+        assert callable(cancelled)
+        return self._take(self.records[arxiv_id])
+
 
 class ScriptedAtom:
     def __init__(self) -> None:
         self.values: dict[str, list[object]] = defaultdict(list)
+        self.calls: list[str] = []
 
     def fetch(self, category: str, *, cancelled=None) -> AtomBatch:
+        self.calls.append(category)
         return ScriptedOai._take(self.values[category])  # type: ignore[return-value]
 
 
@@ -1745,3 +1756,212 @@ def test_failed_date_retry_reports_each_attempt_without_running_other_sync_phase
     assert report.checked_dates == 2
     assert report.empty_dates == 2
     assert report.failed_dates == 0
+
+
+def _recover_retry_papers(
+    store: Store,
+    config: CategoryConfig,
+    mailing_date: date,
+    *papers: PaperMetadata,
+) -> None:
+    store.ensure_category_state(
+        config.category, config.oai_set_spec, config.coverage_start
+    )
+    day = CatchupDay(
+        category=config.category,
+        mailing_date=mailing_date,
+        status=EnrichmentStatus.COMPLETE,
+        pages=(
+            CatchupPage(
+                category=config.category,
+                mailing_date=mailing_date,
+                page=1,
+                total_pages=1,
+                entries=tuple(
+                    CatchupEntry(paper, AnnounceType.NEW, mailing_date, index)
+                    for index, paper in enumerate(papers)
+                ),
+                raw_sha256="c" * 64,
+            ),
+        ),
+        error_code=None,
+        error_message=None,
+    )
+    store.apply_catchup_day(day, catchup_observations(day, NOW), NOW)
+
+
+def test_missing_abstract_selection_honors_unreviewed_active_daily_lists(
+    tmp_path: Path,
+) -> None:
+    store, _oai, _atom, _catchup, _service_instance = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 20))
+    inactive = CategoryConfig("cs.AI", "cs:AI", date(2026, 8, 1))
+    blank = replace(_paper(), abstract="")
+    whitespace = replace(_paper("2608.04002"), abstract=" \t\n\u00a0")
+    _recover_retry_papers(
+        store, config, date(2026, 8, 20), blank, whitespace, _paper("2608.04003")
+    )
+    _recover_retry_papers(
+        store, inactive, date(2026, 8, 20), blank,
+        replace(_paper("2608.04004", "cs.AI"), abstract=""),
+    )
+    _recover_retry_papers(
+        store, config, date(2026, 8, 19),
+        replace(_paper("2608.04005"), abstract=""),
+    )
+    _recover_retry_papers(
+        store, config, date(2026, 8, 21), blank,
+        replace(_paper("2608.04006"), abstract=""),
+    )
+    store.finish_date(
+        date(2026, 8, 21), through_revision=store.review_queue_revision(),
+        finished_at=NOW,
+    )
+    deleted = replace(_paper("2608.04007"), abstract="")
+    _recover_retry_papers(store, config, date(2026, 8, 22), blank, deleted)
+    with open_database(tmp_path / "state.sqlite3") as connection:
+        connection.execute(
+            "UPDATE articles SET is_deleted = 1 WHERE arxiv_id = ?",
+            (deleted.arxiv_id,),
+        )
+    metadata_only = replace(_paper("2608.04008"), abstract="")
+    store.apply_article_snapshot(metadata_only, ())
+    store.save_paper(metadata_only.arxiv_id, None)
+
+    assert store.unreviewed_papers_missing_abstracts(
+        active_configs=(config,)
+    ) == (blank.arxiv_id, whitespace.arxiv_id)
+    assert store.unreviewed_papers_missing_abstracts(active_configs=()) == ()
+    assert store.unreviewed_papers_missing_abstracts(
+        active_configs=(replace(config, coverage_start=date(2026, 8, 21)),)
+    ) == (blank.arxiv_id,)
+
+
+def test_missing_abstract_retry_hydrates_once_without_changing_review_or_sync(
+    tmp_path: Path,
+) -> None:
+    store, oai, atom, catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 1))
+    blank = replace(_paper(), abstract="")
+    _recover_retry_papers(store, config, date(2026, 8, 19), blank)
+    store.finish_date(
+        date(2026, 8, 19), through_revision=store.review_queue_revision(),
+        finished_at=NOW,
+    )
+    _recover_retry_papers(store, config, date(2026, 8, 20), blank)
+    _recover_retry_papers(store, config, date(2026, 8, 21), blank)
+    store.save_paper(blank.arxiv_id, None)
+    events_before = tuple(
+        store.events_for_date(day)[0] for day in store.list_review_dates()
+    )
+    state_before = store.category_sync_state(config.category)
+    coverage_before = store.catchup_day_records(config.category)
+    revision_before = store.review_queue_revision()
+    article = _article(versions=(_version(1, 49), _version(2, 50)))
+    oai.records[blank.arxiv_id] = [article]
+    attempts: list[str] = []
+
+    report = service.retry_missing_abstracts((config,), attempted=attempts.append)
+
+    assert report.offline is False
+    assert attempts == oai.record_calls == [blank.arxiv_id]
+    assert store.article_metadata(blank.arxiv_id) == article.metadata
+    assert store.article_versions(blank.arxiv_id) == article.versions
+    assert store.saved_paper_metadata() == (article.metadata,)
+    assert store.unreviewed_papers_missing_abstracts(active_configs=(config,)) == ()
+    assert store.review_queue_revision() == revision_before
+    assert store.category_sync_state(config.category) == state_before
+    assert store.catchup_day_records(config.category) == coverage_before
+    assert oai.first_calls == oai.backfill_calls == atom.calls == catchup.calls == []
+    assert store.latest_sync_run(config.category, "incremental") is None
+    events_after = tuple(
+        store.events_for_date(day)[0] for day in store.list_review_dates()
+    )
+    assert [
+        (event.event_id, event.daily_list_date, event.reviewed_at)
+        for event in events_after
+    ] == [
+        (event.event_id, event.daily_list_date, event.reviewed_at)
+        for event in events_before
+    ]
+    assert service.retry_missing_abstracts((config,)).offline is False
+    assert oai.record_calls == [blank.arxiv_id]
+
+
+@pytest.mark.parametrize(
+    "failed_result",
+    (
+        RuntimeError("synthetic metadata outage"),
+        replace(_article(), metadata=replace(_paper(), abstract=" \t\n")),
+        _article(arxiv_id="2608.04999"),
+        replace(_article(), oai_identifier="oai:arXiv.org:2608.04999"),
+        OaiTombstone("oai:arXiv.org:2608.04001", date(2026, 8, 20), ("cs:SE",)),
+    ),
+    ids=("outage", "blank", "wrong-paper", "wrong-identifier", "tombstone"),
+)
+def test_missing_abstract_retry_keeps_failures_retryable_and_continues(
+    tmp_path: Path, failed_result: object,
+) -> None:
+    store, oai, _atom, _catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 1))
+    first = replace(_paper(), abstract="")
+    second = replace(_paper("2608.04002"), abstract="")
+    _recover_retry_papers(store, config, date(2026, 8, 20), first, second)
+    oai.records[first.arxiv_id] = [failed_result, failed_result]
+    oai.records[second.arxiv_id] = [_article(arxiv_id=second.arxiv_id)]
+    attempts: list[str] = []
+
+    report = service.retry_missing_abstracts((config,), attempted=attempts.append)
+
+    assert report.offline is False
+    assert attempts == [first.arxiv_id, second.arxiv_id]
+    assert store.article_metadata(first.arxiv_id).abstract == ""
+    assert store.article_metadata(second.arxiv_id).abstract == _paper().abstract
+    assert store.unreviewed_papers_missing_abstracts(
+        active_configs=(config,)
+    ) == (first.arxiv_id,)
+    assert store.canonical_event_count() == 2
+    assert service.retry_missing_abstracts((config,)).offline is True
+    assert oai.record_calls == [first.arxiv_id, second.arxiv_id, first.arxiv_id]
+
+
+@pytest.mark.parametrize("cancel_at", ("before", "transport", "after-response"))
+def test_missing_abstract_retry_propagates_cancellation_without_applying_result(
+    tmp_path: Path, cancel_at: str,
+) -> None:
+    from arxiv_digest.rate_limit import ArxivRequestCancelled
+
+    store, _oai, atom, catchup, _service_instance = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 1))
+    first = replace(_paper(), abstract="")
+    second = replace(_paper("2608.04002"), abstract="")
+    _recover_retry_papers(store, config, date(2026, 8, 20), first, second)
+    cancellation = Event()
+    calls: list[str] = []
+    attempts: list[str] = []
+
+    class CancellingOai:
+        def get_record(self, arxiv_id: str, *, cancelled=None):
+            calls.append(arxiv_id)
+            assert callable(cancelled) and not cancelled()
+            if cancel_at == "transport":
+                raise ArxivRequestCancelled("synthetic cancellation")
+            cancellation.set()
+            return _article(arxiv_id=arxiv_id)
+
+    if cancel_at == "before":
+        cancellation.set()
+    service = SyncService(
+        store, CancellingOai(), atom, catchup,
+        clock=lambda: NOW, cancelled=cancellation.is_set,
+    )
+    state_before = store.category_sync_state(config.category)
+
+    with pytest.raises(SyncCancelled):
+        service.retry_missing_abstracts((config,), attempted=attempts.append)
+
+    expected_attempts = [] if cancel_at == "before" else [first.arxiv_id]
+    assert attempts == calls == expected_attempts
+    assert store.article_metadata(first.arxiv_id).abstract == ""
+    assert store.article_metadata(second.arxiv_id).abstract == ""
+    assert store.category_sync_state(config.category) == state_before

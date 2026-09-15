@@ -457,6 +457,74 @@ test("review starts immediately while failed-date retry remains independent", as
   );
 });
 
+test("missing abstracts can be retried independently and retain progress across refreshes", async () => {
+  const document = new FakeDocument();
+  const root = new FakeNode("main");
+  const summary = {
+    unreviewed_papers: 3,
+    unreviewed_dates: 2,
+    oldest_unreviewed_date: "2026-08-01",
+    missing_abstracts: 2,
+  };
+  let retries = 0;
+  let release;
+  renderReviewHome(document, root, summary, {
+    retryAbstracts: () => {
+      retries++;
+      return new Promise((resolve) => { release = resolve; });
+    },
+  });
+  const control = findButton(root, "Retry 2 missing abstracts");
+  control.click();
+  control.click();
+  assert.equal(retries, 1);
+  assert.equal(control.disabled, true);
+  assert.equal(control.getAttribute("aria-busy"), "true");
+  renderReviewHome(document, root, summary, {
+    synchronizing: true,
+    synchronizationPhase: "enrichment",
+    abstractRetry: { status: "running", completed: 1, total: 2 },
+  });
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(control, findButton(root, "Retrying abstracts… 1 of 2 completed"));
+  assert.equal(control.disabled, true);
+  assert.equal(findButton(root, "Start review").disabled, false);
+  const progress = root.querySelector(".review-sync-activity").querySelector("progress");
+  assert.equal(progress.getAttribute("value"), "1");
+  assert.equal(progress.getAttribute("max"), "2");
+  renderReviewHome(document, root, { ...summary, missing_abstracts: 0 });
+  assert.equal(control.hidden, true);
+});
+
+test("missing abstract retry stays disabled during sync and recovers from request failure", async () => {
+  const document = new FakeDocument();
+  const root = new FakeNode("main");
+  const summary = {
+    unreviewed_papers: 1,
+    unreviewed_dates: 1,
+    oldest_unreviewed_date: "2026-08-01",
+    missing_abstracts: 1,
+  };
+  const failures = [];
+  const actions = {
+    retryAbstracts: async () => { throw new Error("Offline"); },
+    failure: (error) => failures.push(error.message),
+  };
+  renderReviewHome(document, root, summary, { ...actions, synchronizing: true });
+  const control = findButton(root, "Retry 1 missing abstract");
+  assert.equal(control.disabled, true);
+  renderReviewHome(document, root, summary, actions);
+  let focused = false;
+  control.focus = () => { focused = true; };
+  control.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(failures, ["Offline"]);
+  assert.equal(focused, true);
+  assert.equal(control.disabled, false);
+  assert.equal(control.textContent, "Retry 1 missing abstract");
+});
+
 test("review page status states how many papers belong to the date", () => {
   const root = new FakeNode("main");
   renderReviewView(new FakeDocument(), root, {

@@ -632,6 +632,58 @@ def test_failed_date_retry_job_reports_completed_dates_while_running() -> None:
     ]
 
 
+def test_missing_abstract_retry_job_reports_progress_without_daily_list_retry() -> None:
+    runtime = _runtime()
+    runtime._sync_cancel = threading.Event()
+    runtime._active_sync_job = None
+    runtime._last_sync_report = None
+    runtime.profiles = SimpleNamespace(load=lambda: None)
+    configs = ("synthetic-config",)
+    runtime._sync_configs = lambda: configs
+    identifiers = ("2608.00001", "2608.00002")
+    runtime.store = SimpleNamespace(
+        unreviewed_papers_missing_abstracts=lambda *, active_configs: identifiers,
+    )
+    observed = []
+    report = SimpleNamespace(offline=False)
+
+    class Sync:
+        def has_pending_daily_list_work(self, configs):
+            return True
+
+        def retry_missing_abstracts(self, selected, *, attempted):
+            assert selected == configs
+            for arxiv_id in identifiers:
+                attempted(arxiv_id)
+                status = runtime.status({})
+                assert status["sync"]["phase"] == "enrichment"
+                assert status["daily_list_retry"]["status"] == "idle"
+                observed.append(status["abstract_retry"])
+            return report
+
+    runtime.sync = Sync()
+
+    def run_inline(_prefix, _kind, operation, *, job_id, initial_fields, **_options):
+        assert initial_fields["phase"] == "enrichment"
+        runtime._jobs[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            **initial_fields,
+        }
+        operation()
+        return job_id
+
+    runtime._new_job = run_inline
+    runtime._start_sync_job({"retry_missing_abstracts": True})
+
+    assert observed == [
+        {"status": "running", "completed": 1, "total": 2},
+        {"status": "running", "completed": 2, "total": 2},
+    ]
+    assert runtime._last_sync_report is report
+    assert runtime.status({})["abstract_retry"]["status"] == "idle"
+
+
 def test_sync_job_publishes_enrichment_phase_when_daily_lists_are_complete() -> None:
     runtime = _runtime()
     runtime._sync_cancel = threading.Event()

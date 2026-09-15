@@ -520,8 +520,11 @@ def test_library_search_covers_id_title_author_abstract_and_safe_punctuation(
         primary_category="cs.SE",
         categories=("cs.SE",),
     )
-    for metadata in (title_match, abstract_match):
-        store.apply_article_snapshot(metadata, (_version(),))
+    for metadata, submitted_at in (
+        (title_match, datetime(2026, 8, 1, tzinfo=timezone.utc)),
+        (abstract_match, datetime(2026, 8, 20, tzinfo=timezone.utc)),
+    ):
+        store.apply_article_snapshot(metadata, (PaperVersion(1, submitted_at),))
         store.save_paper(metadata.arxiv_id, 1)
 
     widget = store.search_library("widget", limit=10, offset=0)

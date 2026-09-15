@@ -2225,6 +2225,40 @@ class Store:
         finally:
             connection.close()
 
+    def unreviewed_papers_missing_abstracts(
+        self,
+        *,
+        active_configs: tuple[CategoryConfig, ...],
+    ) -> tuple[str, ...]:
+        """Return distinct papers needing metadata in the active Review queue."""
+
+        if any(not isinstance(config, CategoryConfig) for config in active_configs):
+            raise TypeError("active configs must be CategoryConfig values")
+        if len({config.category for config in active_configs}) != len(active_configs):
+            raise ValueError("active category configurations must be unique")
+        if not active_configs:
+            return ()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                """SELECT c.event_id, c.arxiv_id, a.abstract
+                   FROM canonical_events AS c
+                   JOIN articles AS a ON a.arxiv_id = c.arxiv_id
+                   WHERE c.reviewed_at IS NULL AND a.is_deleted = 0
+                   ORDER BY c.daily_list_date, c.queue_revision, c.event_id"""
+            ).fetchall()
+            missing: dict[str, None] = {}
+            for row in rows:
+                if row["abstract"].strip() or row["arxiv_id"] in missing:
+                    continue
+                event = self._event_from_connection(connection, int(row["event_id"]))
+                if self._project_event(event, active_configs) is not None:
+                    missing[row["arxiv_id"]] = None
+            return tuple(missing)
+        finally:
+            connection.close()
+
     def review_date_links(
         self,
         day: date,
@@ -2401,30 +2435,37 @@ class Store:
                 )
                 rows = connection.execute(
                     """SELECT a.arxiv_id, s.saved_version, a.is_deleted,
-                              (SELECT MAX(version) FROM article_versions
-                               WHERE arxiv_id = a.arxiv_id) AS latest_version,
-                              (SELECT MIN(submitted_at) FROM article_versions
-                               WHERE arxiv_id = a.arxiv_id) AS first_submitted_at,
+                              v.version AS latest_version,
+                              v.submitted_at AS latest_submitted_at,
                               bm25(papers_fts, 10.0, 6.0, 5.0, 1.0) AS rank
                        FROM papers_fts
                        JOIN articles AS a ON a.rowid = papers_fts.rowid
                        JOIN saved_papers AS s ON s.arxiv_id = a.arxiv_id
+                       LEFT JOIN article_versions AS v
+                           ON v.arxiv_id = a.arxiv_id
+                          AND v.version = (
+                              SELECT MAX(version) FROM article_versions
+                              WHERE arxiv_id = a.arxiv_id
+                          )
                        WHERE papers_fts MATCH ?
-                       ORDER BY rank, first_submitted_at DESC, a.arxiv_id DESC
+                       ORDER BY rank, latest_submitted_at DESC, a.arxiv_id DESC
                        LIMIT ? OFFSET ?""",
                     (match_query, limit, offset),
                 ).fetchall()
             else:
                 rows = connection.execute(
                     """SELECT a.arxiv_id, s.saved_version, a.is_deleted,
-                              MAX(v.version) AS latest_version,
-                              MIN(v.submitted_at) AS first_submitted_at
+                              v.version AS latest_version,
+                              v.submitted_at AS latest_submitted_at
                        FROM saved_papers AS s
                        JOIN articles AS a ON a.arxiv_id = s.arxiv_id
                        LEFT JOIN article_versions AS v
                            ON v.arxiv_id = a.arxiv_id
-                       GROUP BY a.arxiv_id
-                       ORDER BY first_submitted_at DESC, a.arxiv_id DESC
+                          AND v.version = (
+                              SELECT MAX(version) FROM article_versions
+                              WHERE arxiv_id = a.arxiv_id
+                          )
+                       ORDER BY latest_submitted_at DESC, a.arxiv_id DESC
                        LIMIT ? OFFSET ?""",
                     (limit, offset),
                 ).fetchall()

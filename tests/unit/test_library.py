@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from arxiv_digest.library import LibraryService
 from arxiv_digest.models import OaiTombstone, PaperMetadata, PaperVersion
 from arxiv_digest.storage.database import open_database
@@ -118,7 +120,7 @@ def test_remove_hides_the_paper_from_the_saved_library(tmp_path: Path) -> None:
     assert service.search("", limit=20, offset=0).entries == ()
 
 
-def test_library_lists_newest_papers_first_by_original_submission(
+def test_library_lists_newest_papers_first_by_latest_version_date(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "state.sqlite3"
@@ -139,18 +141,18 @@ def test_library_lists_newest_papers_first_by_original_submission(
         submitted_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
         revised_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
     )
-    service.save("2608.31007", version=2)
+    service.save("2608.31007", version=1)
     service.save("2608.31008", version=2)
 
     page = service.search("", limit=20, offset=0)
 
     assert [entry.metadata.arxiv_id for entry in page.entries] == [
-        "2608.31008",
         "2608.31007",
+        "2608.31008",
     ]
 
 
-def test_library_search_uses_newest_paper_as_the_relevance_tie_breaker(
+def test_library_search_uses_latest_version_date_as_the_relevance_tie_breaker(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "state.sqlite3"
@@ -162,7 +164,7 @@ def test_library_search_uses_newest_paper_as_the_relevance_tie_breaker(
         "2608.31009",
         "Shared search phrase",
         submitted_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
-        revised_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        revised_at=datetime(2026, 8, 30, tzinfo=timezone.utc),
     )
     seed_article(
         store,
@@ -171,15 +173,55 @@ def test_library_search_uses_newest_paper_as_the_relevance_tie_breaker(
         submitted_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
         revised_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
     )
-    service.save("2608.31009", version=2)
+    service.save("2608.31009", version=1)
     service.save("2608.31010", version=2)
 
     page = service.search("Shared", limit=20, offset=0)
 
     assert [entry.metadata.arxiv_id for entry in page.entries] == [
-        "2608.31010",
         "2608.31009",
+        "2608.31010",
     ]
+
+
+@pytest.mark.parametrize("query", ("", "Shared"))
+def test_library_orders_equal_dates_stably_and_missing_dates_last(
+    tmp_path: Path, query: str
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    open_database(path).close()
+    store = Store(path)
+    service = LibraryService(store)
+    for arxiv_id in ("2608.31012", "2608.31013", "2608.31011"):
+        metadata = PaperMetadata(
+            arxiv_id=arxiv_id,
+            title="Shared search phrase",
+            authors=("Aster Example",),
+            abstract="A fictional library-search abstract.",
+            primary_category="cs.SE",
+            categories=("cs.SE",),
+        )
+        versions = (
+            ()
+            if arxiv_id == "2608.31013"
+            else (PaperVersion(1, datetime(2026, 8, 20, tzinfo=timezone.utc)),)
+        )
+        store.apply_article_snapshot(metadata, versions)
+        service.save(arxiv_id, version=None)
+
+    first = service.search(query, limit=2, offset=0)
+    second = service.search(query, limit=2, offset=first.next_offset or 0)
+
+    assert [entry.metadata.arxiv_id for entry in first.entries] == [
+        "2608.31012",
+        "2608.31011",
+    ]
+    assert first.next_offset == 2
+    assert [entry.metadata.arxiv_id for entry in second.entries] == [
+        "2608.31013"
+    ]
+    assert second.entries[0].latest_version is None
+    assert second.next_offset is None
 
 
 def test_full_last_page_does_not_offer_an_empty_next_page(tmp_path: Path) -> None:

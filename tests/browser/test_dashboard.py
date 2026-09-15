@@ -459,15 +459,22 @@ def test_mixed_math_and_malicious_paper_text_under_final_csp(engine: str) -> Non
         )
 
 
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
 @pytest.mark.parametrize("width", [360, 1280])
-def test_dashboard_views_are_accessible_and_responsive(width: int) -> None:
+def test_dashboard_views_are_accessible_and_responsive(engine: str, width: int) -> None:
     with running_dashboard() as (server, _fixture), browser_page(
-        "chromium", width=width
+        engine, width=width
     ) as page:
         _open(page, server)
         page.emulate_media(reduced_motion="reduce")
 
         assert page.get_by_role("heading", name="Library", exact=True).is_visible()
+        assert page.get_by_text(
+            "With search blank, saved papers are ordered by the date of their "
+            "latest arXiv version, newest first. Search results prioritize "
+            "relevance, then recency.",
+            exact=True,
+        ).is_visible()
         assert page.get_by_role("heading", name="Interests", exact=True).is_visible()
         assert page.get_by_role("heading", name="Settings", exact=True).is_visible()
         assert page.get_by_text(
