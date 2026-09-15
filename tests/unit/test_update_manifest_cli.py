@@ -5,40 +5,100 @@ from pathlib import Path
 
 import pytest
 
+from arxiv_digest import __version__
 from tests.update_wheel_factory import write_valid_wheel
 
 
 @pytest.fixture
-def synthetic_030_wheel(tmp_path: Path) -> Path:
+def synthetic_release_wheel(tmp_path: Path) -> Path:
     return write_valid_wheel(
-        tmp_path / "arxiv_digest-0.3.0-py3-none-any.whl",
-        version="0.3.0",
+        tmp_path / f"arxiv_digest-{__version__}-py3-none-any.whl",
+        version=__version__,
     )
 
 
-def test_release_policy_exactly_matches_the_immutable_bootstrap_policy() -> None:
+@pytest.fixture
+def bootstrap_policy(tmp_path: Path) -> Path:
     from arxiv_digest.update_contract import BOOTSTRAP_POLICY
 
-    expected = dict(BOOTSTRAP_POLICY)
-    expected["platforms"] = list(expected["platforms"])
+    policy = tmp_path / "bootstrap-policy.json"
+    policy.write_text(json.dumps(dict(BOOTSTRAP_POLICY)), encoding="utf-8")
+    return policy
+
+
+def test_release_policy_explicitly_allows_updates_from_030() -> None:
+    expected = {
+        "application_data_generation": 2,
+        "automatic_update": True,
+        "automatic_update_from": {
+            "excluded": [],
+            "maximum_exclusive": "0.3.1",
+            "minimum": "0.3.0",
+        },
+        "channel": "prerelease",
+        "platforms": ["darwin", "linux"],
+        "product": "arxiv-digest",
+        "schema_version": 1,
+        "updater_protocol": 1,
+        "version": __version__,
+    }
 
     assert json.loads(Path("release/update-policy.json").read_bytes()) == expected
 
 
-def test_cli_generates_and_rereads_bootstrap_manifest(
-    synthetic_030_wheel: Path,
+def test_cli_generates_current_manifest_with_closed_source_eligibility(
+    synthetic_release_wheel: Path,
     tmp_path: Path,
 ) -> None:
-    from arxiv_digest.update_manifest import parse_update_manifest
+    from arxiv_digest.update_discovery import _source_version_allowed
+    from arxiv_digest.update_manifest import AutomaticUpdateFrom, parse_update_manifest
     from scripts.update_manifest import main
 
     output = tmp_path / "UPDATE_MANIFEST.json"
     assert main(
         [
             "--wheel",
-            str(synthetic_030_wheel),
+            str(synthetic_release_wheel),
             "--policy",
             "release/update-policy.json",
+            "--output",
+            str(output),
+        ]
+    ) == 0
+    manifest = parse_update_manifest(output.read_bytes())
+    assert manifest.version == __version__
+    assert manifest.automatic_update is True
+    assert manifest.automatic_update_from == AutomaticUpdateFrom("0.3.0", "0.3.1", ())
+    assert {
+        version: _source_version_allowed(version, manifest)
+        for version in ("0.2.1", "0.2.99", "0.3.0", "0.3.1", "0.3.2")
+    } == {
+        "0.2.1": False,
+        "0.2.99": False,
+        "0.3.0": True,
+        "0.3.1": False,
+        "0.3.2": False,
+    }
+
+
+def test_cli_generates_and_rereads_historical_bootstrap_manifest(
+    bootstrap_policy: Path,
+    tmp_path: Path,
+) -> None:
+    from arxiv_digest.update_manifest import parse_update_manifest
+    from scripts.update_manifest import main
+
+    wheel = write_valid_wheel(
+        tmp_path / "arxiv_digest-0.3.0-py3-none-any.whl",
+        version="0.3.0",
+    )
+    output = tmp_path / "UPDATE_MANIFEST.json"
+    assert main(
+        [
+            "--wheel",
+            str(wheel),
+            "--policy",
+            str(bootstrap_policy),
             "--output",
             str(output),
         ]
@@ -50,7 +110,7 @@ def test_cli_generates_and_rereads_bootstrap_manifest(
 
 
 def test_cli_never_overwrites_an_existing_regular_file(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
 ) -> None:
     from scripts.update_manifest import main
@@ -62,7 +122,7 @@ def test_cli_never_overwrites_an_existing_regular_file(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 "release/update-policy.json",
                 "--output",
@@ -74,7 +134,7 @@ def test_cli_never_overwrites_an_existing_regular_file(
 
 
 def test_cli_never_follows_or_replaces_an_existing_symlink(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
 ) -> None:
     from scripts.update_manifest import main
@@ -88,7 +148,7 @@ def test_cli_never_follows_or_replaces_an_existing_symlink(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 "release/update-policy.json",
                 "--output",
@@ -101,7 +161,7 @@ def test_cli_never_follows_or_replaces_an_existing_symlink(
 
 
 def test_cli_rejects_unknown_release_policy_keys(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
 ) -> None:
     from scripts.update_manifest import main
@@ -115,7 +175,7 @@ def test_cli_rejects_unknown_release_policy_keys(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -125,7 +185,7 @@ def test_cli_rejects_unknown_release_policy_keys(
 
 
 def test_cli_rejects_duplicate_release_policy_keys(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
 ) -> None:
     from scripts.update_manifest import main
@@ -141,7 +201,7 @@ def test_cli_rejects_duplicate_release_policy_keys(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -162,7 +222,7 @@ def test_cli_rejects_duplicate_release_policy_keys(
     ],
 )
 def test_cli_rejects_policy_fixed_contract_mismatch(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
     field: str,
     invalid: object,
@@ -178,7 +238,7 @@ def test_cli_rejects_policy_fixed_contract_mismatch(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -196,7 +256,7 @@ def test_cli_rejects_policy_fixed_contract_mismatch(
     ],
 )
 def test_cli_normalizes_invalid_policy_json(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
     policy_payload: bytes,
 ) -> None:
@@ -209,7 +269,7 @@ def test_cli_normalizes_invalid_policy_json(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -219,7 +279,7 @@ def test_cli_normalizes_invalid_policy_json(
 
 
 def test_cli_rejects_non_utf8_policy_encoding(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
 ) -> None:
     from scripts.update_manifest import main
@@ -232,7 +292,7 @@ def test_cli_rejects_non_utf8_policy_encoding(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -242,7 +302,7 @@ def test_cli_rejects_non_utf8_policy_encoding(
 
 
 def test_cli_rejects_wrongly_typed_policy_values(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
 ) -> None:
     from scripts.update_manifest import main
@@ -256,7 +316,7 @@ def test_cli_rejects_wrongly_typed_policy_values(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -266,7 +326,7 @@ def test_cli_rejects_wrongly_typed_policy_values(
 
 
 def test_cli_rejects_malformed_automatic_update_source(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
 ) -> None:
     from scripts.update_manifest import main
@@ -281,7 +341,7 @@ def test_cli_rejects_malformed_automatic_update_source(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -291,7 +351,7 @@ def test_cli_rejects_malformed_automatic_update_source(
 
 
 def test_cli_accepts_a_closed_automatic_update_source(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
 ) -> None:
     from arxiv_digest.update_manifest import (
@@ -315,7 +375,7 @@ def test_cli_accepts_a_closed_automatic_update_source(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -330,7 +390,7 @@ def test_cli_accepts_a_closed_automatic_update_source(
 
 
 def test_cli_bounds_policy_bytes_before_json_decode(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -349,7 +409,7 @@ def test_cli_bounds_policy_bytes_before_json_decode(
         update_manifest.main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -360,7 +420,7 @@ def test_cli_bounds_policy_bytes_before_json_decode(
 
 @pytest.mark.parametrize("kind", ["symlink", "directory"])
 def test_cli_requires_a_nonsymlink_regular_policy_file(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
     kind: str,
 ) -> None:
@@ -376,7 +436,7 @@ def test_cli_requires_a_nonsymlink_regular_policy_file(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",
@@ -386,7 +446,7 @@ def test_cli_requires_a_nonsymlink_regular_policy_file(
 
 
 def test_cli_reads_policy_through_a_stable_descriptor(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -401,7 +461,7 @@ def test_cli_reads_policy_through_a_stable_descriptor(
         main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 "release/update-policy.json",
                 "--output",
@@ -413,7 +473,7 @@ def test_cli_reads_policy_through_a_stable_descriptor(
 
 
 def test_cli_opens_the_policy_without_blocking_on_a_replaced_special_file(
-    synthetic_030_wheel: Path,
+    synthetic_release_wheel: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -443,7 +503,7 @@ def test_cli_opens_the_policy_without_blocking_on_a_replaced_special_file(
         update_manifest.main(
             [
                 "--wheel",
-                str(synthetic_030_wheel),
+                str(synthetic_release_wheel),
                 "--policy",
                 str(policy),
                 "--output",

@@ -78,9 +78,12 @@ omit it and use `dist`. Rebuild only when candidate source changes invalidate
 the artifact evidence, and validate wheel, sdist, exact package resources,
 manifest, checksums, notes, and commit identity against the same candidate.
 
-The 0.3.0 release is a manual bootstrap: its manifest has updater protocol 1,
+The 0.3.0 release remains the manual bootstrap: its manifest has updater protocol 1,
 application-data generation 2, `automatic_update: false`, and
-`automatic_update_from: null`. Verify the actual 0.2.1 manual upgrade separately
+`automatic_update_from: null`. The 0.3.1 policy retains protocol 1 and generation
+2, enables automatic installation from 0.3.0 inclusive to 0.3.1 exclusive, and
+keeps the prerelease channel. Preserve the published bootstrap policy when
+checking historical artifacts. Verify the actual 0.2.1 manual upgrade separately
 from clean-wheel and public-CLI smoke. Synthetic consecutive
 0.3.0 → 0.3.1 → 0.3.2 coverage must use real canonical-tag bootstrap metadata,
 production discovery/coordinator/helper/recovery, and protected provenance; a

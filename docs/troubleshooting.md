@@ -135,8 +135,11 @@ There is no scheduled background startup.
 
 ## An update or restart did not finish
 
-A manual link is expected for the 0.3.0 bootstrap, unsupported pipx versions or
-installation layouts, changed dependencies, and unverified local provenance.
+A manual link is expected when installing the 0.3.0 bootstrap from an older
+version, or for unsupported pipx versions or installation layouts, changed
+dependencies, and unverified local provenance. Eligible 0.3.0 installations
+can update automatically to 0.3.1 once that release is published; quit and
+relaunch the app to run a new check.
 Use the [manual upgrade instructions](installation.md#upgrade-within-application-data-generation-2).
 Do not change installation metadata to make the automatic-update check pass.
 

@@ -1,7 +1,11 @@
 {
   "application_data_generation": 2,
-  "automatic_update": false,
-  "automatic_update_from": null,
+  "automatic_update": true,
+  "automatic_update_from": {
+    "excluded": [],
+    "maximum_exclusive": "0.3.1",
+    "minimum": "0.3.0"
+  },
   "channel": "prerelease",
   "platforms": [
     "darwin",
@@ -10,5 +14,5 @@
   "product": "arxiv-digest",
   "schema_version": 1,
   "updater_protocol": 1,
-  "version": "0.3.0"
+  "version": "0.3.1"
 }

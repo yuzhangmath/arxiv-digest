@@ -17,8 +17,8 @@ macOS or Linux.
 - [Uninstall](#uninstall)
 - [HTTPS and maintainer SSH](#https-and-maintainer-ssh)
 
-This guide covers version 0.3.0.
-The tagged commands require a published `v0.3.0` release. Existing users
+This guide covers version 0.3.1.
+The tagged commands require a published `v0.3.1` release. Existing users
 should start with [the upgrade instructions](#upgrade-within-application-data-generation-2).
 
 ## Requirements
@@ -100,7 +100,7 @@ After `pipx ensurepath`, open a new terminal. In that terminal, install arXiv
 Digest from the canonical public HTTPS address:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.0
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
 ```
 
 The official [pipx CLI reference](https://pipx.pypa.io/stable/reference/cli.html)
@@ -108,11 +108,12 @@ documents VCS URLs as supported package specifications.
 
 ## Upgrade within application-data generation 2
 
-Version 0.3.0 is a manual-bootstrap release. It uses the same application-data
-generation, profile schema, and portable backup format as versions 0.2.0 and
-0.2.1. Earlier clients cannot install this bootstrap automatically.
+Version 0.3.1 uses the same application-data generation, profile schema, and
+portable backup format as versions 0.2.0, 0.2.1, and 0.3.0. Eligible 0.3.0
+installations can use **Update and restart**; older clients require a manual
+upgrade.
 
-Confirm that `v0.3.0` appears on the
+Confirm that `v0.3.1` appears on the
 [releases page](https://github.com/yuzhangmath/arxiv-digest/releases) before
 using the tagged install or upgrade commands in this guide.
 
@@ -127,8 +128,9 @@ pipx list
 
 | Existing installation | Upgrade route |
 | --- | --- |
-| 0.2.0 or 0.2.1 listed as `arxiv-digest` in `pipx list` | Follow the steps below, including installations originally made from a downloaded wheel or source folder |
-| 0.2.0 or 0.2.1 installed with `pip` in a virtual environment | Follow the virtual-environment instructions below |
+| 0.3.0 with **Update and restart** in the dashboard | Follow [Automatic updates](#automatic-updates) |
+| 0.2.0, 0.2.1, or 0.3.0 requiring manual update, listed as `arxiv-digest` in `pipx list` | Follow the steps below, including installations originally made from a downloaded wheel or source folder |
+| 0.2.0, 0.2.1, or 0.3.0 installed with `pip` in a virtual environment | Follow the virtual-environment instructions below |
 | 0.1.x or an application reporting an incompatible data generation | Use [Clean reset with recovery copy](#clean-reset-with-recovery-copy); generation-1 data cannot be migrated or imported |
 
 If a diagnostic reports unfinished update recovery, complete the
@@ -144,7 +146,7 @@ environment's executable.
 2. Export your current state with the old version before installing the new one:
 
    ```bash
-   arxiv-digest export arxiv-digest-before-0.3.0.zip
+   arxiv-digest export arxiv-digest-before-0.3.1.zip
    ```
 
    Run this in a private folder where you want to keep the backup. Wait for a
@@ -159,12 +161,12 @@ environment's executable.
 3. Replace the installed program using the explicit new tag:
 
    ```bash
-   pipx install --force git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.0
+   pipx install --force git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
    ```
 
    This requires Git and internet access. Use the same user and pipx environment
    as before. A plain `pipx upgrade arxiv-digest` can reuse the old pinned tag;
-   use the command above to select 0.3.0 explicitly.
+   use the command above to select 0.3.1 explicitly.
 4. Verify the version, then reopen the app:
 
    ```bash
@@ -172,7 +174,7 @@ environment's executable.
    arxiv-digest
    ```
 
-   The first line of `doctor` output should be `arXiv Digest 0.3.0`. In the
+   The first line of `doctor` output should be `arXiv Digest 0.3.1`. In the
    dashboard, check your interests, Library, review progress, and PDF folder.
    Users who completed setup should return to their dashboard without repeating it.
    If setup unexpectedly appears, quit and check the user account and data
@@ -202,7 +204,7 @@ that environment's `arxiv-digest` first. Then, using that same environment
 (shown here as `.venv`), run:
 
 ```bash
-.venv/bin/python -m pip install --upgrade git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.0
+.venv/bin/python -m pip install --upgrade git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
 .venv/bin/arxiv-digest doctor
 .venv/bin/arxiv-digest
 ```
@@ -216,8 +218,10 @@ installations. Contributor setup is documented in
 
 ## Automatic updates
 
-After the manual 0.3.0 bootstrap, a later eligible release can offer **Update
-and restart**. This requires macOS or Linux, pipx exactly 1.16.7 using its `pip`
+Version 0.3.0 introduced the manual bootstrap. The 0.3.1 release enables
+**Update and restart** from eligible 0.3.0 installations. After publication,
+quit and relaunch the app to check for the new release. This requires macOS or
+Linux, pipx exactly 1.16.7 using its `pip`
 backend, an unsuffixed per-user `arxiv-digest` environment, its original Python
 interpreter, no injected or system-site packages, and completed setup. The
 release must preserve the running Python policy, updater protocol,

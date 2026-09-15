@@ -5,7 +5,7 @@ and Linux, keeps its durable state on your computer, and opens a loopback-only
 dashboard in your browser. There is no cloud account, telemetry, or API key.
 It is an independent project and is not affiliated with or endorsed by arXiv.
 
-This guide covers version 0.3.0. The `@v0.3.0` commands below require that tag on the
+This guide covers version 0.3.1. The `@v0.3.1` commands below require that tag on the
 [releases page](https://github.com/yuzhangmath/arxiv-digest/releases).
 Already using an earlier version? Follow the
 [upgrade guide](docs/installation.md#upgrade-within-application-data-generation-2)
@@ -15,7 +15,7 @@ Already have Python 3.11+, Git, and `pipx`? Open a terminal and run these
 commands one at a time:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.0
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
 arxiv-digest init
 ```
 
@@ -71,7 +71,7 @@ name and link the seed or saved paper that contributed the match.
 
 You need:
 
-- macOS or Linux; Windows is not supported in version 0.3.0
+- macOS or Linux; Windows is not supported in version 0.3.1
 - Python 3.11 or newer
 - Git
 - a current `pipx`
@@ -148,7 +148,7 @@ pipx --version
 In that terminal, install from the public HTTPS repository:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.0
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
 ```
 
 When installation finishes, verify that the installed command works:
@@ -157,7 +157,7 @@ When installation finishes, verify that the installed command works:
 arxiv-digest doctor
 ```
 
-On a fresh installation, `doctor` should report version `0.3.0`, a missing
+On a fresh installation, `doctor` should report version `0.3.1`, a missing
 profile and database, and `arxiv-digest init` as the next step. If your shell
 cannot find `arxiv-digest`, open a new terminal after `pipx ensurepath` and try
 again.
@@ -318,7 +318,7 @@ transfer backups only through trusted channels.
 This release uses application-data generation 2, profile schema 2, and
 portable backup format 2. Earlier databases, profiles, and portable backups
 from application-data generation 1 are rejected without modification; they
-are not converted or imported. Generation-2 data from 0.2.0 and 0.2.1 remains
+are not converted or imported. Generation-2 data from 0.2.0, 0.2.1, and 0.3.0 remains
 compatible.
 
 `arxiv-digest doctor` prints read-only, redacted diagnostics. If update recovery
@@ -331,12 +331,14 @@ session token.
 
 ## Updates and recovery
 
-Version 0.3.0 is the manual bootstrap for one-click updates. Upgrade 0.2.0 or
-0.2.1 using the [manual installation instructions](docs/installation.md#upgrade-within-application-data-generation-2).
-It keeps application-data generation 2 and your existing profile, Library,
-review progress, and downloaded PDFs.
+Version 0.3.1 offers **Update and restart** to eligible 0.3.0 installations
+after its GitHub release is published. Version 0.3.0 introduced the manual
+bootstrap for one-click updates. Upgrade 0.2.0 or 0.2.1 using the
+[manual installation instructions](docs/installation.md#upgrade-within-application-data-generation-2).
+These upgrades keep application-data generation 2 and your existing profile,
+Library, review progress, and downloaded PDFs.
 
-For a later compatible release, **Update and restart** downloads and verifies
+For a compatible release, **Update and restart** downloads and verifies
 the release wheel, saves the complete installed environment and a private data
 backup, finishes background work, then reopens the dashboard. One click starts
 the whole process. Wait for the new tab before closing the old one; the new tab
@@ -382,6 +384,7 @@ PDF, launcher, backup, and recovery guidance.
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
+- [v0.3.1 review and Library notes](docs/releases/v0.3.1.md)
 - [v0.3.0 update-bootstrap notes](docs/releases/v0.3.0.md)
 - [v0.2.1 technical-beta notes](docs/releases/v0.2.1.md)
 

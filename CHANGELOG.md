@@ -4,8 +4,25 @@ This file records notable user-visible changes to arXiv Digest.
 
 ## Contents
 
+- [0.3.1](#031---2026-09-15)
 - [0.3.0](#030---2026-09-08)
 - [0.2.1](#021---2026-08-25)
+
+## [0.3.1] - 2026-09-15
+
+### Added
+
+- **Retry missing abstracts** on the Review starting page retries metadata for
+  papers with blank abstracts across unreviewed dates. It shows progress and
+  leaves remaining failures retryable while review stays available.
+
+### Changed
+
+- Library orders saved papers by latest arXiv version date, newest first.
+  Searches keep relevance first and use latest-version recency to break ties.
+- The release policy enables one-click updates from eligible 0.3.0
+  installations while retaining updater protocol 1, application-data generation
+  2, and the prerelease channel.
 
 ## [0.3.0] - 2026-09-08
 
@@ -93,3 +110,5 @@ Full technical-beta notes are available in the
 [0.2.1]: https://github.com/yuzhangmath/arxiv-digest/compare/v0.2.0...v0.2.1
 
 [0.3.0]: https://github.com/yuzhangmath/arxiv-digest/compare/v0.2.1...v0.3.0
+
+[0.3.1]: https://github.com/yuzhangmath/arxiv-digest/compare/v0.3.0...v0.3.1
