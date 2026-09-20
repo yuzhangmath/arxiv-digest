@@ -99,11 +99,23 @@ class FixtureApplication:
         self.settings_missing_exact_dates: list[str] = []
         self.settings_failed_daily_list_dates: list[str] = []
         self.settings_retryable_failed_daily_list_dates: list[str] = []
+        self.settings_failed_date_errors: list[dict[str, str]] = []
+        self.settings_online = False
+        self.settings_metadata_categories: list[dict[str, object]] = [
+            {
+                "category": "math.AG",
+                "synchronized_through": "2026-08-21",
+                "error_codes": ["offline"],
+            }
+        ]
+        self.arxiv_access: dict[str, object] = {"paused": False, "retry_at": None}
         self.daily_list_retry_total: int | None = None
         self.daily_list_retry_completed = 0
         self.abstract_retry_total = 0
         self.abstract_retry_completed = 0
         self.abstract_retry_running = False
+        self.abstract_retry_date: str | None = None
+        self.abstract_retry_error_codes: list[str] = []
         self.daily_list_target_dates = 0
         self.daily_list_checked_dates = 0
         self.daily_list_dates_with_papers = 0
@@ -112,11 +124,15 @@ class FixtureApplication:
         self.daily_list_pending_dates = 0
         self.daily_list_unavailable_dates = 0
         self.review_ready = True
+        self.review_oldest_ready_date = "2026-07-31"
+        self.review_waiting_abstract_day = "2026-08-04"
+        self.review_waiting_abstract_papers = 3
         self.review_profile_revision = 5
         self.review_projection_revision = 9
         self.review_support_categories = ("math.AG", "math.CO")
         self.review_unconfirmed_latest_version = 4
         self.review_missing_abstracts = 0
+        self.calendar_entries: list[dict[str, object]] | None = None
         self.active_categories = ["math.AG"]
         self.category_coverage_starts = {"math.AG": "2026-01-01"}
         self.review_summary_requests = 0
@@ -301,9 +317,14 @@ class FixtureApplication:
             retry_completed = self.daily_list_retry_completed
             abstract_retry = {
                 "status": (
-                    "running" if running and self.abstract_retry_running else "idle"
+                    "running" if running and self.abstract_retry_running
+                    else "completed" if self.abstract_retry_date else "idle"
                 ),
-                "completed": self.abstract_retry_completed if running else 0,
+                "completed": self.abstract_retry_completed,
+                "retry_date": self.abstract_retry_date,
+                "recovered": max(0, self.abstract_retry_total - self.review_missing_abstracts),
+                "remaining": self.review_missing_abstracts,
+                "error_codes": list(self.abstract_retry_error_codes),
                 "total": (
                     self.abstract_retry_total
                     if running and self.abstract_retry_running
@@ -344,6 +365,7 @@ class FixtureApplication:
             },
             "daily_list_progress": daily_list_progress,
             "abstract_retry": abstract_retry,
+            "arxiv_access": dict(self.arxiv_access),
         }
 
     def start_sync(self, payload: dict[str, object]) -> dict[str, str]:
@@ -361,13 +383,15 @@ class FixtureApplication:
                 self.sync_running = True
                 self.sync_phase = "daily_list"
                 if payload.get("retry_failed_dates") is True:
-                    self.daily_list_retry_total = len(
+                    self.daily_list_retry_total = 1 if payload.get("retry_date") else len(
                         set(self.settings_retryable_failed_daily_list_dates)
                     )
                     self.daily_list_retry_completed = 0
                 elif payload.get("retry_missing_abstracts") is True:
-                    self.sync_phase = "metadata"
+                    self.sync_phase = "enrichment"
                     self.abstract_retry_running = True
+                    self.abstract_retry_date = str(payload["retry_date"])
+                    self.abstract_retry_error_codes = []
                     self.abstract_retry_total = self.review_missing_abstracts
                     self.abstract_retry_completed = 0
                 else:
@@ -378,6 +402,8 @@ class FixtureApplication:
         with self.lock:
             self.dashboard_calls.append(("settings_get", dict(payload)))
             synchronizing = self.sync_running
+            online = self.settings_online
+            metadata_categories = [dict(category) for category in self.settings_metadata_categories]
             failed_dates = list(self.settings_failed_daily_list_dates)
             retryable_failed_dates = list(
                 self.settings_retryable_failed_daily_list_dates
@@ -396,8 +422,9 @@ class FixtureApplication:
             )
         return {
             "revision": 3,
-            "online": False,
+            "online": online,
             "synchronizing": synchronizing,
+            "arxiv_access": dict(self.arxiv_access),
             "daily_list_retry": {
                 "status": (
                     "running"
@@ -418,13 +445,7 @@ class FixtureApplication:
             "coverage_max": "2026-08-24",
             "metadata_sync": {
                 "checkpoint_count": 1,
-                "categories": [
-                    {
-                        "category": "math.AG",
-                        "synchronized_through": "2026-08-21",
-                        "error_codes": ["offline"],
-                    }
-                ],
+                "categories": metadata_categories,
             },
             "daily_list_coverage": {
                 "target": target,
@@ -449,6 +470,7 @@ class FixtureApplication:
                             ["catchup_fetch_failed"] if failed else []
                         ),
                         "retryable_failed_dates": retryable_failed_dates,
+                        "failed_date_errors": list(self.settings_failed_date_errors),
                     }
                 ],
             },
@@ -503,6 +525,8 @@ class FixtureApplication:
                 "unreviewed_dates": 0,
                 "unreviewed_papers": 0,
                 "missing_abstracts": 0,
+                "waiting_abstract_dates": 0,
+                "waiting_abstract_papers": 0,
                 "newly_discovered": 0,
                 "oldest_unreviewed_date": None,
                 "snapshot_revision": 77,
@@ -513,8 +537,12 @@ class FixtureApplication:
             "unreviewed_dates": 10,
             "unreviewed_papers": 200,
             "missing_abstracts": self.review_missing_abstracts,
+            "waiting_abstract_dates": int(self.review_missing_abstracts > 0),
+            "waiting_abstract_papers": (
+                self.review_waiting_abstract_papers if self.review_missing_abstracts else 0
+            ),
             "newly_discovered": 1,
-            "oldest_unreviewed_date": "2026-07-31",
+            "oldest_unreviewed_date": self.review_oldest_ready_date,
             "snapshot_revision": 77,
             "profile_revision": self.review_profile_revision,
             "projection_revision": self.review_projection_revision,
@@ -589,6 +617,9 @@ class FixtureApplication:
             assert self.review_date_gate.wait(timeout=5)
         if day in self.missing_review_dates:
             raise KeyError(day)
+        optional_abstract_date = day == self.review_waiting_abstract_day
+        total_cards = self.review_waiting_abstract_papers if optional_abstract_date else 200
+        missing_abstracts = self.review_missing_abstracts if optional_abstract_date else 0
         active_support = self._active_support(day)
         if not active_support:
             raise KeyError(day)
@@ -602,7 +633,7 @@ class FixtureApplication:
         page_number = min(10, max(1, (anchor - 1) // 20 + 1))
         start = (page_number - 1) * 20 + 1
         cards = []
-        for event_id in range(start, start + 20):
+        for event_id in range(start, min(start + 20, total_cards + 1)):
             tier = "top" if event_id == start else "possible" if event_id == start + 1 else "other"
             title = f"Paper {event_id} <script>not markup</script>"
             is_carlsson = event_id == start + 1
@@ -638,10 +669,7 @@ class FixtureApplication:
                     ),
                     "title": title,
                     "authors": ["Ada Example"],
-                    "abstract": (
-                        "" if event_id <= self.review_missing_abstracts
-                        else "An accessible collapsed abstract."
-                    ),
+                    "abstract": "" if event_id <= missing_abstracts else "An accessible collapsed abstract.",
                     "daily_list_date": day,
                     "support_categories": active_support,
                     "subjects": list(self.review_support_categories),
@@ -668,12 +696,14 @@ class FixtureApplication:
             "projection_revision": self.review_projection_revision,
             "anchor_event_id": start,
             "previous_anchor_event_id": None if page_number == 1 else start - 20,
-            "next_anchor_event_id": None if page_number == 10 else start + 20,
+            "next_anchor_event_id": None if start + 20 > total_cards else start + 20,
             "previous_date": "2026-06-30",
             "next_date": "2026-08-31",
             "page_number": page_number,
-            "page_count": 10,
-            "total_cards": 200,
+            "page_count": 1 if optional_abstract_date else 10,
+            "total_cards": total_cards,
+            "abstracts_ready": total_cards - missing_abstracts,
+            "missing_abstracts": missing_abstracts,
         }
 
     def record_position(self, payload: dict[str, object]) -> dict[str, object]:
@@ -754,6 +784,9 @@ class FixtureApplication:
                 "finished": False,
             },
         ]
+        with self.lock:
+            if self.calendar_entries is not None:
+                entries = [dict(entry) for entry in self.calendar_entries]
         start = str(payload["start"])
         end = str(payload["end"])
         return [entry for entry in entries if start <= str(entry["day"]) <= end]
@@ -1723,7 +1756,7 @@ def test_review_reports_initial_sync_and_refreshes_when_papers_arrive() -> None:
         page.get_by_role("button", name="Finish setup", exact=True).click()
 
         page.get_by_text(
-            "Historical daily-list recovery is in progress. Confirmed daily-list announcements will appear as dates are recovered, and this page will update automatically.",
+            "Historical daily-list recovery is in progress. Dates will appear as their daily lists are recovered, and this page will update automatically.",
             exact=True,
         ).wait_for()
         progress_text = (
@@ -1829,6 +1862,37 @@ def test_review_can_mark_the_whole_current_backlog_reviewed(engine: str) -> None
         assert page.locator("#content").evaluate(
             "element => document.activeElement === element"
         )
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_bulk_review_sends_the_cutoff_from_the_opened_confirmation(
+    engine: str, monkeypatch,
+) -> None:
+    original_summary = FixtureApplication.review_summary
+    cutoff = "2026-08-19"
+    monkeypatch.setattr(
+        FixtureApplication, "review_summary",
+        lambda application, payload: {
+            **original_summary(application, payload), "through_date": cutoff,
+        },
+    )
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        page.goto(server.launch_url("review"))
+        page.get_by_role("button", name="Mark all as reviewed").click()
+        cutoff = "2026-08-20"
+
+        with page.expect_response(
+            lambda response: response.url.endswith("/api/v1/review/finish")
+        ) as response_info:
+            page.get_by_role("button", name="Confirm mark all as reviewed").click()
+
+        assert response_info.value.status == 200
+        assert application.review_finish_all_requests == 1
+        submitted = next(
+            payload for action, payload in application.dashboard_calls
+            if action == "review_finish_all"
+        )
+        assert submitted["through_date"] == "2026-08-19"
 
 
 def test_successful_bulk_review_is_not_retried_when_refresh_fails() -> None:
@@ -2247,118 +2311,152 @@ def test_review_start_is_independent_of_failed_daily_list_retry() -> None:
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_review_home_retries_missing_abstracts_and_refreshes_papers(engine: str) -> None:
+def test_empty_review_can_retry_failed_daily_lists(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.review_ready = False
+        application.settings_retryable_failed_daily_list_dates = [
+            "2026-08-11",
+            "2026-08-12",
+        ]
+        application.daily_list_target_dates = 2
+        application.daily_list_checked_dates = 2
+        application.daily_list_failed_dates = 2
+        application.sync_starts_running = True
+
+        page.goto(server.launch_url("review"))
+        retry = page.get_by_role(
+            "button", name="Retry 2 failed daily-list dates", exact=True
+        )
+        retry.wait_for(timeout=5_000)
+        assert retry.is_enabled()
+        assert page.get_by_role("button", name="Start review", exact=True).count() == 0
+        assert page.get_by_role("button", name="Mark all as reviewed", exact=True).count() == 0
+        assert page.get_by_text("coverage is incomplete", exact=False).is_visible()
+
+        retry.click()
+        running = page.get_by_role(
+            "button",
+            name="Retrying failed daily-list dates… 0 of 2 completed",
+            exact=True,
+        )
+        running.wait_for(timeout=5_000)
+        assert running.is_disabled()
+        with application.lock:
+            application.daily_list_retry_completed = 1
+        page.get_by_role(
+            "button",
+            name="Retrying failed daily-list dates… 1 of 2 completed",
+            exact=True,
+        ).wait_for(timeout=5_000)
+
+        with application.lock:
+            application.sync_running = False
+            application.review_ready = True
+            application.settings_retryable_failed_daily_list_dates = []
+            application.daily_list_failed_dates = 0
+            application.daily_list_dates_with_papers = 2
+        page.get_by_role("button", name="Start review", exact=True).wait_for(
+            timeout=5_000
+        )
+        assert page.get_by_role("button", name="Mark all as reviewed", exact=True).is_visible()
+        assert page.locator(".review-retry-failed").is_hidden()
+        assert [
+            call for call in application.dashboard_calls if call[0] == "sync_start"
+        ] == [("sync_start", {"retry_failed_dates": True})]
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_review_date_retries_missing_abstracts_and_refreshes_papers(engine: str) -> None:
     with running_fixture() as (server, application), browser_page(engine) as page:
         application.review_missing_abstracts = 2
-        application.settings_retryable_failed_daily_list_dates = ["2026-08-11"]
+        application.review_oldest_ready_date = "2026-08-04"
         application.sync_starts_running = True
         page_errors: list[str] = []
         page.on("pageerror", lambda error: page_errors.append(str(error)))
 
         page.goto(server.launch_url("review"))
-        retry = page.get_by_role(
-            "button", name="Retry 2 missing abstracts", exact=True
-        )
-        retry.wait_for(timeout=5_000)
+        page.get_by_role("button", name="Start review", exact=True).wait_for()
+        assert page.locator(".review-retry-abstracts").count() == 0
+        page.get_by_role("button", name="Mark all as reviewed", exact=True).wait_for()
         page.get_by_role("button", name="Start review", exact=True).click()
-        page.get_by_role("heading", name="Review 2026-07-31", exact=True).wait_for()
-        assert page.locator("article").first.locator(".paper-abstract").text_content() == ""
-        assert not any(
-            operation == "sync_start"
-            for operation, _payload in application.dashboard_calls
-        )
+        page.get_by_role("heading", name="Review 2026-08-04", exact=True).wait_for()
+        retry = page.get_by_role("button", name="Retry missing abstracts", exact=True)
+        assert "1 of 3 abstracts available" in page.locator(".review-abstract-notice").inner_text()
+        assert page.get_by_role("button", name="Finish date", exact=True).is_enabled()
+        assert not any(call[0] == "sync_start" for call in application.dashboard_calls)
 
-        page.get_by_role("navigation", name="Review dates").get_by_role(
-            "button", name="Back to Review overview", exact=True
-        ).click()
-        retry.wait_for()
-        with page.expect_response(
-            lambda response: response.url.endswith("/api/v1/sync/start")
-        ):
+        with page.expect_response(lambda response: response.url.endswith("/api/v1/sync/start")):
             retry.evaluate("element => { element.click(); element.click(); }")
-
-        retrying = page.get_by_role(
-            "button", name="Retrying abstracts… 0 of 2 completed", exact=True
-        )
+        retrying = page.get_by_role("button", name="Retrying abstracts… 0 of 2 checked", exact=True)
         retrying.wait_for()
         assert retrying.is_disabled()
-        assert page.get_by_role("button", name="Start review", exact=True).is_enabled()
-        assert page.get_by_role(
-            "button", name="Retry 1 failed daily-list date", exact=True
-        ).is_disabled()
+        assert page.get_by_role("button", name="Finish date", exact=True).is_enabled()
         with application.lock:
             application.abstract_retry_completed = 1
-        page.get_by_role(
-            "button", name="Retrying abstracts… 1 of 2 completed", exact=True
-        ).wait_for(timeout=5_000)
-
+        page.get_by_role("button", name="Retrying abstracts… 1 of 2 checked", exact=True).wait_for(timeout=5_000)
         with application.lock:
             application.review_missing_abstracts = 0
+            application.abstract_retry_completed = 2
             application.sync_running = False
             application.abstract_retry_running = False
-        page.get_by_role(
-            "button", name="Retrying abstracts… 1 of 2 completed", exact=True
-        ).wait_for(state="detached", timeout=5_000)
+        page.get_by_text("Recovered 2 abstracts; 0 still unavailable.", exact=True).wait_for(timeout=5_000)
         assert retry.count() == 0
-        assert [
-            call for call in application.dashboard_calls if call[0] == "sync_start"
-        ] == [("sync_start", {"retry_missing_abstracts": True})]
-
-        page.get_by_role("button", name="Start review", exact=True).click()
+        assert [call for call in application.dashboard_calls if call[0] == "sync_start"] == [
+            ("sync_start", {"retry_missing_abstracts": True, "retry_date": "2026-08-04"}),
+        ]
         first = page.locator("article").first
         first.locator("summary", has_text="Read abstract").click()
-        assert first.get_by_text(
-            "An accessible collapsed abstract.", exact=True
-        ).is_visible()
+        assert first.get_by_text("An accessible collapsed abstract.", exact=True).is_visible()
         assert page_errors == []
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_review_home_keeps_unsuccessful_abstract_fetches_retryable(engine: str) -> None:
+def test_review_date_keeps_unsuccessful_abstract_fetches_retryable(engine: str) -> None:
     with running_fixture() as (server, application), browser_page(engine) as page:
-        application.review_missing_abstracts = 1
+        application.review_missing_abstracts = 2
+        application.review_oldest_ready_date = "2026-08-04"
         application.sync_starts_running = True
         page.goto(server.launch_url("review"))
-        retry = page.get_by_role(
-            "button", name="Retry 1 missing abstract", exact=True
-        )
-        retry.wait_for(timeout=5_000)
+        page.get_by_role("button", name="Start review", exact=True).click()
+        retry = page.get_by_role("button", name="Retry missing abstracts", exact=True)
         retry.click()
-        page.get_by_role(
-            "button", name="Retrying abstracts… 0 of 1 completed", exact=True
-        ).wait_for()
-
+        page.get_by_role("button", name="Retrying abstracts… 0 of 2 checked", exact=True).wait_for()
         with application.lock:
+            application.review_missing_abstracts = 1
+            application.abstract_retry_completed = 2
+            application.abstract_retry_error_codes = ["arxiv_http_406"]
             application.sync_running = False
             application.abstract_retry_running = False
-        retry.wait_for(timeout=5_000)
+        page.get_by_text("Recovered 1 abstract; 1 still unavailable. arXiv requests failed (HTTP 406).", exact=True).wait_for(timeout=5_000)
         assert retry.is_enabled()
-        assert page.get_by_role("button", name="Start review", exact=True).is_enabled()
+        assert page.get_by_role("button", name="Finish date", exact=True).is_enabled()
         retry.click()
-        page.get_by_role(
-            "button", name="Retrying abstracts… 0 of 1 completed", exact=True
-        ).wait_for()
-        assert [
-            call for call in application.dashboard_calls if call[0] == "sync_start"
-        ] == [("sync_start", {"retry_missing_abstracts": True})] * 2
+        page.get_by_role("button", name="Retrying abstracts… 0 of 1 checked", exact=True).wait_for()
+        with application.lock:
+            application.abstract_retry_completed = 1
+            application.abstract_retry_error_codes = ["arxiv_http_406"]
+            application.sync_running = False
+            application.abstract_retry_running = False
+        page.get_by_text("Recovered 0 abstracts; 1 still unavailable. arXiv requests failed (HTTP 406).", exact=True).wait_for(timeout=5_000)
+        assert retry.is_enabled()
+        assert [call for call in application.dashboard_calls if call[0] == "sync_start"] == [
+            ("sync_start", {"retry_missing_abstracts": True, "retry_date": "2026-08-04"}),
+        ] * 2
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_review_home_disables_abstract_retry_during_other_sync(engine: str) -> None:
+def test_review_date_disables_abstract_retry_during_other_sync(engine: str) -> None:
     with running_fixture() as (server, application), browser_page(engine) as page:
         application.review_missing_abstracts = 1
+        application.review_oldest_ready_date = "2026-08-04"
         application.sync_running = True
         page.goto(server.launch_url("review"))
-        retry = page.get_by_role(
-            "button", name="Retry 1 missing abstract", exact=True
-        )
+        page.get_by_role("button", name="Start review", exact=True).click()
+        retry = page.get_by_role("button", name="Retry missing abstracts", exact=True)
         retry.wait_for(timeout=5_000)
         assert retry.is_disabled()
-        assert page.get_by_role("button", name="Start review", exact=True).is_enabled()
-        assert not any(
-            operation == "sync_start"
-            for operation, _payload in application.dashboard_calls
-        )
+        assert page.get_by_role("button", name="Finish date", exact=True).is_enabled()
+        assert not any(call[0] == "sync_start" for call in application.dashboard_calls)
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
@@ -2369,36 +2467,28 @@ def test_late_abstract_retry_response_preserves_navigation(
 ) -> None:
     with running_fixture() as (server, application), browser_page(engine) as page:
         application.review_missing_abstracts = 1
+        application.review_oldest_ready_date = "2026-08-04"
         application.sync_start_gate = threading.Event()
         application.sync_start_failures = int(fails)
         page_errors: list[str] = []
         page.on("pageerror", lambda error: page_errors.append(str(error)))
-
         try:
             page.goto(server.launch_url("review"))
-            page.get_by_role(
-                "button", name="Retry 1 missing abstract", exact=True
-            ).click()
+            page.get_by_role("button", name="Start review", exact=True).click()
+            page.get_by_role("button", name="Retry missing abstracts", exact=True).click()
             assert application.sync_start_entered.wait(timeout=5)
-
             if destination == "review-date":
-                page.get_by_role("button", name="Start review", exact=True).click()
-                heading = page.get_by_role(
-                    "heading", name="Review 2026-07-31", exact=True
-                )
+                page.get_by_role("button", name="Next date", exact=True).click()
+                heading = page.get_by_role("heading", name="Review 2026-08-31", exact=True)
             else:
                 page.get_by_role("button", name="Library", exact=True).click()
                 heading = page.get_by_role("heading", name="Library", exact=True)
             heading.wait_for()
             summary_requests = application.review_summary_requests
             status = page.locator("#status").inner_text()
-
-            with page.expect_response(
-                lambda response: response.url.endswith("/api/v1/sync/start")
-            ):
+            with page.expect_response(lambda response: response.url.endswith("/api/v1/sync/start")):
                 application.sync_start_gate.set()
             page.wait_for_timeout(300)
-
             assert heading.is_visible()
             assert application.review_summary_requests == summary_requests
             assert page.locator("#status").inner_text() == status
@@ -2969,6 +3059,227 @@ def test_calendar_navigation_opens_and_keeps_the_selected_date(engine: str) -> N
             "heading", name="Review 2026-08-03"
         ).is_visible()
         assert "view=review" in page.url
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_calendar_hides_saved_unfinalized_failures_until_cutoff(
+    engine: str, tmp_path: Path, monkeypatch,
+) -> None:
+    from datetime import date, datetime, timezone
+    from types import SimpleNamespace
+
+    from arxiv_digest.models import EnrichmentStatus
+    from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
+    from arxiv_digest.review import ReviewService
+    from arxiv_digest.storage.database import open_database
+    from arxiv_digest.storage.store import EnrichmentDayRecord, Store
+    from arxiv_digest.sync import daily_list_coverage_bounds
+
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    store = Store(database_path)
+    previous, current = date(2026, 8, 19), date(2026, 8, 20)
+    observed_at = datetime(2026, 8, 20, 23, 59, 59, tzinfo=timezone.utc)
+    store.ensure_category_state("math.AG", "math:AG", previous)
+    for day in (previous, current):
+        store.record_enrichment_day(EnrichmentDayRecord(
+            category="math.AG", mailing_date=day, source="catchup",
+            status=EnrichmentStatus.FAILED, fetched_at=observed_at,
+            error_code="catchup_http_406",
+            error_message="Daily-list retrieval failed.",
+        ))
+    profile = Profile(
+        schema_version=2, revision=1,
+        category_coverage=(ProfileCategory("math.AG", previous),),
+        keywords=(), phrases=(), authors=(), seed_papers=(),
+        pdf_destination=PdfDestination("downloads", tmp_path / "pdfs"),
+    )
+    review = ReviewService(
+        store, SimpleNamespace(load=lambda: profile),
+        latest_finalized_date=lambda: daily_list_coverage_bounds(observed_at)[1],
+    )
+    monkeypatch.setattr(
+        FixtureApplication, "review_calendar",
+        lambda _self, payload: review.calendar(
+            date.fromisoformat(str(payload["start"])),
+            date.fromisoformat(str(payload["end"])),
+        ),
+    )
+    records_before = store.catchup_day_records("math.AG")
+    with running_fixture() as (server, _application), browser_page(engine) as page:
+        page.clock.install(time="2026-08-20T23:59:59Z")
+        page.goto(server.launch_url("calendar"))
+        page.get_by_role("listitem", name="2026-08-19: Retrieval failed").wait_for()
+        assert page.locator(".calendar-date").filter(has_text="2026-08-20").count() == 0
+
+        observed_at = datetime(2026, 8, 21, 0, 0, tzinfo=timezone.utc)
+        page.reload()
+        page.get_by_role("listitem", name="2026-08-20: Retrieval failed").wait_for()
+    assert store.catchup_day_records("math.AG") == records_before
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_calendar_shows_failed_dates_and_refreshes_after_recovery(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        failed_day = {
+            "day": "2026-08-04",
+            "total_papers": None,
+            "unreviewed_papers": None,
+            "newly_discovered": None,
+            "finished": None,
+            "retrieval_failed": True,
+        }
+        mixed_day = {
+            "day": "2026-08-03",
+            "total_papers": 4,
+            "unreviewed_papers": 2,
+            "newly_discovered": 1,
+            "finished": False,
+            "retrieval_failed": True,
+        }
+        application.calendar_entries = [mixed_day, failed_day]
+        page.clock.install(time="2026-08-31T12:00:00Z")
+        page.goto(server.launch_url("calendar"))
+
+        gap = page.get_by_role("listitem", name="2026-08-04: Retrieval failed")
+        gap.wait_for()
+        assert gap.inner_text() == "2026-08-04\nRetrieval failed"
+        assert gap.locator("button, a, [tabindex]").count() == 0
+        assert gap.locator("[data-status]").count() == 0
+        guidance = page.get_by_text("See Settings for recovery status.", exact=False)
+        guidance.wait_for()
+        for width in (1280, 720, 360):
+            page.set_viewport_size({"width": width, "height": 900})
+            guidance_box = guidance.bounding_box()
+            grid_box = page.locator(".calendar-grid").bounding_box()
+            assert guidance_box is not None
+            assert grid_box is not None
+            assert abs(guidance_box["x"] - grid_box["x"]) < 1
+            assert abs(guidance_box["width"] - grid_box["width"]) < 1
+            assert guidance_box["y"] + guidance_box["height"] <= grid_box["y"]
+            assert page.evaluate(
+                "document.documentElement.scrollWidth <= "
+                "document.documentElement.clientWidth"
+            )
+        for color_scheme in ("light", "dark"):
+            page.emulate_media(color_scheme=color_scheme)
+            assert gap.locator(".calendar-date").evaluate(
+                "element => getComputedStyle(element).borderTopStyle"
+            ) == "dotted"
+        gap.click()
+        assert "view=calendar" in page.url
+        assert application.review_date_requests == 0
+        assert not any(call[0] == "sync_start" for call in application.dashboard_calls)
+
+        confirmed = page.get_by_role(
+            "button",
+            name="2026-08-03: 4 confirmed papers, partial, some retrievals failed",
+            exact=True,
+        )
+        assert "Some retrievals failed" in confirmed.inner_text()
+        confirmed.focus()
+        page.keyboard.press("Enter")
+        page.get_by_role("heading", name="Review 2026-08-03").wait_for()
+
+        with application.lock:
+            application.calendar_entries = [
+                {**mixed_day, "retrieval_failed": False},
+                {
+                    **failed_day,
+                    "total_papers": 3,
+                    "unreviewed_papers": 3,
+                    "newly_discovered": 3,
+                    "finished": False,
+                    "retrieval_failed": False,
+                },
+            ]
+        page.get_by_role("button", name="Calendar", exact=True).click()
+        page.get_by_role(
+            "button", name="2026-08-04: 3 papers, unreviewed", exact=True
+        ).wait_for()
+        assert page.get_by_role(
+            "button", name="2026-08-03: 4 papers, partial", exact=True
+        ).is_visible()
+        assert page.locator(".calendar-date-unavailable").count() == 0
+        assert page.get_by_text("Some retrievals failed", exact=False).count() == 0
+        assert page.get_by_text("See Settings for recovery status.", exact=False).count() == 0
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_calendar_opens_and_finishes_dates_with_missing_abstracts(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.review_oldest_ready_date = "2026-08-04"
+        application.review_missing_abstracts = 2
+        application.review_finish_gate = threading.Event()
+        application.calendar_entries = [{
+            "day": "2026-08-04", "total_papers": 3,
+            "unreviewed_papers": 3, "newly_discovered": 0, "finished": False,
+            "abstracts_pending": True, "abstracts_ready": 1, "missing_abstracts": 2,
+            "retrieval_failed": True,
+        }]
+        page.clock.install(time="2026-08-31T12:00:00Z")
+        page.goto(server.launch_url("calendar"))
+        control = page.get_by_role("button", name=(
+            "2026-08-04: 3 confirmed papers, unreviewed, 1 of 3 abstracts available, some retrievals failed"
+        ), exact=True)
+        control.wait_for()
+        control.focus()
+        page.keyboard.press("Enter")
+        page.get_by_role("heading", name="Review 2026-08-04", exact=True).wait_for()
+        assert page.locator("article").count() == 3
+        page.locator("article").first.get_by_role("button", name="Save", exact=True).click()
+        page.locator("article").first.get_by_role("button", name="Saved", exact=True).wait_for()
+        assert application.library_save_requests == 1
+        page.get_by_role("button", name="Finish date", exact=True).click()
+        page.get_by_role("button", name="Confirm finish", exact=True).click()
+        assert application.review_finish_entered.wait(timeout=5)
+        with application.lock:
+            application.review_ready = False
+        application.review_finish_gate.set()
+        page.locator(".review-home").wait_for()
+        assert application.review_missing_abstracts == 2
+        assert "You are caught up." in page.locator(".review-home").inner_text()
+        assert "abstract" not in page.locator(".review-home").inner_text()
+        assert page.locator(".review-retry-abstracts").count() == 0
+        assert not any(call[0] == "sync_start" for call in application.dashboard_calls)
+
+        with application.lock:
+            application.calendar_entries[0].update(
+                finished=True, unreviewed_papers=0,
+            )
+        page.get_by_role("button", name="Calendar", exact=True).click()
+        reviewed = page.get_by_role("button", name=(
+            "2026-08-04: 3 confirmed papers, reviewed, some retrievals failed"
+        ), exact=True)
+        reviewed.wait_for()
+        assert reviewed.inner_text() == (
+            "2026-08-04\n3 confirmed papers\n✓ Reviewed\nSome retrievals failed"
+        )
+        reviewed.click()
+        page.get_by_role("heading", name="Review 2026-08-04", exact=True).wait_for()
+        assert "1 of 3 abstracts available" in page.locator(".review-abstract-availability").inner_text()
+        retry = page.get_by_role("button", name="Retry missing abstracts", exact=True)
+        assert retry.is_visible()
+        assert retry.is_enabled()
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_review_date_optional_abstract_retry_respects_persisted_pause(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.review_oldest_ready_date = "2026-08-04"
+        application.review_missing_abstracts = 1
+        application.arxiv_access = {
+            "paused": True, "retry_at": "2099-08-25T12:30:00Z", "http_status": 429,
+            "message": "arXiv rate limit reached (HTTP 429). Requests are paused.",
+        }
+        page.goto(server.launch_url("review"))
+        page.get_by_role("button", name="Start review", exact=True).click()
+        retry = page.get_by_role("button", name="Retry missing abstracts", exact=True)
+        retry.wait_for()
+        assert retry.is_disabled()
+        assert page.get_by_role("button", name="Finish date", exact=True).is_enabled()
+        assert "Retry available after" in page.locator(".arxiv-access-status").inner_text()
+        assert not any(call[0] == "sync_start" for call in application.dashboard_calls)
 
 
 def test_calendar_keeps_recent_dates_visible_across_a_month_boundary() -> None:
@@ -3884,6 +4195,50 @@ def test_settings_uses_fallback_only_when_the_native_picker_is_unavailable() -> 
         ) in application.dashboard_calls
 
 
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_settings_reports_persisted_metadata_failure_while_online(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.settings_online = True
+        application.settings_metadata_categories = [
+            {
+                "category": "math.AT",
+                "status": "failed",
+                "synchronized_through": "2026-09-09",
+                "error_codes": ["arxiv_http_406"],
+            }
+        ]
+        page.goto(server.launch_url("settings"))
+        for reload in (False, True):
+            if reload:
+                page.reload()
+            page.get_by_text(
+                "Metadata synchronization is incomplete.", exact=True
+            ).wait_for()
+            page.get_by_text("Metadata checkpoints: 1.", exact=True).wait_for()
+            page.get_by_text(
+                "Metadata synchronized through 2026-09-09.", exact=True
+            ).wait_for()
+            page.get_by_text(
+                "arXiv refused the metadata request (HTTP 406). "
+                "Error codes: arxiv_http_406.",
+                exact=True,
+            ).wait_for()
+            settings_text = page.locator("#content").inner_text()
+            assert "Metadata synchronization is online." not in settings_text
+            assert "Rate exceeded" not in settings_text
+            assert "rate limit" not in settings_text
+
+        with application.lock:
+            application.settings_metadata_categories[0].update(
+                status="idle", error_codes=[]
+            )
+        page.reload()
+        page.get_by_text("Metadata synchronization is online.", exact=True).wait_for()
+        assert page.get_by_text("Metadata synchronization is incomplete.", exact=True).count() == 0
+        assert "arxiv_http_406" not in page.locator("#content").inner_text()
+        assert not any(operation == "sync_start" for operation, _ in application.dashboard_calls)
+
+
 def test_settings_retries_failed_daily_list_dates_and_refreshes_when_complete() -> None:
     with running_fixture() as (server, application), browser_page("chromium") as page:
         application.settings_missing_exact_dates = [
@@ -3952,6 +4307,106 @@ def test_settings_retries_failed_daily_list_dates_and_refreshes_when_complete() 
         assert [
             operation for operation, _payload in application.dashboard_calls
         ].count("settings_get") >= 2
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_settings_retries_only_one_failed_category_date(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.settings_failed_daily_list_dates = ["2026-08-11", "2026-08-12"]
+        application.settings_retryable_failed_daily_list_dates = ["2026-08-11", "2026-08-12"]
+        application.settings_failed_date_errors = [
+            {"date": "2026-08-11", "error_code": "catchup_http_406"},
+            {"date": "2026-08-12", "error_code": "arxiv_rate_limited"},
+        ]
+        application.sync_starts_running = True
+        page.goto(server.launch_url("settings"))
+        first = page.get_by_role("button", name="Retry math.AG 2026-08-11", exact=True)
+        second = page.get_by_role("button", name="Retry math.AG 2026-08-12", exact=True)
+        first.wait_for()
+        first_row = page.locator(".failed-daily-list-dates li").filter(has=first)
+        assert "HTTP 406" in first_row.inner_text()
+        assert "rate" not in first_row.inner_text().lower()
+        assert "Rate exceeded" in page.locator(".failed-daily-list-dates li").filter(has=second).inner_text()
+        first.click()
+        page.get_by_role("button", name="Retrying failed daily-list dates… 0 of 1 completed", exact=True).wait_for()
+        assert first.is_disabled()
+        assert second.is_disabled()
+        assert [call for call in application.dashboard_calls if call[0] == "sync_start"] == [
+            ("sync_start", {
+                "retry_failed_dates": True,
+                "retry_category": "math.AG",
+                "retry_date": "2026-08-11",
+            })
+        ]
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_arxiv_pause_survives_navigation_and_keeps_review_usable(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.settings_failed_daily_list_dates = ["2026-08-11"]
+        application.settings_retryable_failed_daily_list_dates = ["2026-08-11"]
+        application.settings_failed_date_errors = [
+            {"date": "2026-08-11", "error_code": "arxiv_rate_limited"},
+        ]
+        application.review_missing_abstracts = 1
+        application.arxiv_access = {
+            "paused": True,
+            "retry_at": "2099-08-25T12:30:00Z",
+            "http_status": 406,
+            "message": "arXiv returned Rate exceeded (HTTP 406). Requests are paused.",
+        }
+        page.goto(server.launch_url("review"))
+        dates = page.get_by_role("button", name="Retry 1 failed daily-list date", exact=True)
+        dates.wait_for()
+        assert dates.is_disabled()
+        assert page.locator(".review-retry-abstracts").count() == 0
+        notice = page.locator(".arxiv-access-status")
+        assert "Rate exceeded (HTTP 406)" in notice.inner_text()
+        assert "Retry available after" in notice.inner_text()
+        assert "2099" in notice.inner_text()
+        page.get_by_role("button", name="Start review", exact=True).click()
+        page.get_by_role("heading", name="Review 2026-07-31", exact=True).wait_for()
+        page.get_by_role("button", name="Settings", exact=True).click()
+        single = page.get_by_role("button", name="Retry math.AG 2026-08-11", exact=True)
+        single.wait_for()
+        assert single.is_disabled()
+        assert dates.is_disabled()
+        assert "Rate exceeded (HTTP 406)" in notice.inner_text()
+        page.reload()
+        single.wait_for()
+        assert single.is_disabled()
+        assert not any(operation == "sync_start" for operation, _ in application.dashboard_calls)
+        with application.lock:
+            application.arxiv_access = {"paused": False, "retry_at": None}
+        page.get_by_role("button", name="Review", exact=True).click()
+        page.locator(".review-home").wait_for()
+        dates.wait_for()
+        assert dates.is_enabled()
+        assert page.locator(".review-retry-abstracts").count() == 0
+        assert notice.is_hidden()
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+@pytest.mark.parametrize("view", ["review", "settings"])
+def test_arxiv_pause_expiry_refreshes_controls_without_starting_sync(engine: str, view: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.settings_failed_daily_list_dates = ["2026-08-11"]
+        application.settings_retryable_failed_daily_list_dates = ["2026-08-11"]
+        application.arxiv_access = {
+            "paused": True, "retry_at": "2026-08-25T12:00:02Z", "http_status": 429,
+            "message": "arXiv rate limit reached (HTTP 429). Requests are paused.",
+        }
+        page.clock.install(time="2026-08-25T12:00:00Z")
+        page.goto(server.launch_url(view))
+        retry = page.get_by_role("button", name="Retry 1 failed daily-list date", exact=True)
+        retry.wait_for()
+        assert retry.is_disabled()
+        with application.lock:
+            application.arxiv_access = {"paused": False, "retry_at": None}
+        page.clock.fast_forward(3_000)
+        page.locator(".arxiv-access-status").wait_for(state="hidden", timeout=5_000)
+        assert retry.is_enabled()
+        assert not any(operation == "sync_start" for operation, _ in application.dashboard_calls)
 
 
 def test_settings_refreshes_after_a_stale_folder_save_and_requires_a_new_pick() -> None:

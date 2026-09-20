@@ -61,6 +61,27 @@ test("Settings retry starts synchronization through the scoped API", async () =>
   }]);
 });
 
+test("Settings retries one category/date pair and rejects invalid date input", async () => {
+  const calls = [];
+  const controller = new SettingsController({
+    async json(key, path, options) {
+      calls.push({ key, path, options });
+      return { job_id: "sync_retry_one_1234" };
+    },
+  });
+  await controller.retryFailedDate("math.AG", "2026-08-11");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, "/api/v1/sync/start");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    retry_failed_dates: true,
+    retry_date: "2026-08-11",
+    retry_category: "math.AG",
+  });
+  assert.throws(() => controller.retryFailedDate("math.AG", "2026-02-30"), TypeError);
+  assert.throws(() => controller.retryFailedDate("", "2026-08-11"), TypeError);
+  assert.equal(calls.length, 1);
+});
+
 test("browser backup export uses authenticated fetch and a Blob download without an output path", async () => {
   const fetchCalls = [];
   const anchors = [];
@@ -617,6 +638,71 @@ test("settings identifies pending confirmed daily-list work as still running", (
   assert.doesNotMatch(root.textContent, /submission date|inferred|fallback/i);
 });
 
+test("settings reports persisted metadata failures as incomplete while online", () => {
+  const root = new FakeNode("main");
+  renderSettingsView(new FakeDocument(), root, {
+    online: true,
+    synchronizing: false,
+    metadata_sync: {
+      checkpoint_count: 1,
+      categories: [{
+        category: "math.AT",
+        status: "failed",
+        synchronized_through: "2026-09-09",
+        error_codes: ["arxiv_http_406", "/private/synthetic-diagnostic"],
+      }],
+    },
+  });
+
+  assert.match(root.textContent, /Metadata synchronization is incomplete\./);
+  assert.doesNotMatch(root.textContent, /Metadata synchronization is online/);
+  assert.match(root.textContent, /Metadata checkpoints: 1\./);
+  assert.match(root.textContent, /Metadata synchronized through 2026-09-09\./);
+  assert.match(root.textContent, /arXiv refused the metadata request \(HTTP 406\)\./);
+  assert.match(root.textContent, /Error codes: arxiv_http_406\./);
+  assert.doesNotMatch(root.textContent, /Rate exceeded|rate limit|synthetic-diagnostic/i);
+});
+
+test("settings derives metadata failure status independently of current connectivity", () => {
+  const cases = [
+    { category: { status: "failed", error_codes: [] }, expected: "incomplete" },
+    { category: { status: "idle", error_codes: ["sync_error"] }, expected: "incomplete" },
+    { category: { status: "idle", error_codes: [] }, expected: "online" },
+    {
+      category: { status: "failed", error_codes: ["arxiv_http_406"] },
+      model: { synchronizing: true },
+      expected: "running",
+    },
+    {
+      category: { status: "failed", error_codes: ["arxiv_http_406"] },
+      model: { synchronizing: true, arxiv_access: { paused: true } },
+      expected: "paused",
+    },
+    {
+      category: { status: "failed", error_codes: ["arxiv_http_406"] },
+      model: { online: false },
+      expected: "offline",
+    },
+  ];
+  for (const { category, model, expected } of cases) {
+    const root = new FakeNode("main");
+    renderSettingsView(new FakeDocument(), root, {
+      online: true,
+      synchronizing: false,
+      ...model,
+      metadata_sync: { categories: [{ category: "math.AT", ...category }] },
+    });
+    const metadata = descendants(root, "section").find((section) =>
+      section.textContent.startsWith("Metadata synchronization"));
+    const summary = descendants(metadata, "p")[0];
+    assert.equal(summary.textContent, expected === "paused"
+      ? "Requests to arXiv are paused."
+      : expected === "offline"
+      ? "Synchronization offline. Cached Review and Library remain available."
+      : `Metadata synchronization is ${expected}.`);
+  }
+});
+
 test("settings keeps permanently unavailable daily-list gaps explicit", () => {
   const root = new FakeNode("main");
   renderSettingsView(new FakeDocument(), root, {
@@ -665,9 +751,58 @@ test("settings counts failed daily-list dates and offers an idle retry", () => {
 
   assert.match(root.textContent, /3 failed/);
   assert.match(root.textContent, /1 unavailable/);
-  assert.doesNotMatch(root.textContent, /2026-08-01/);
+  assert.match(root.textContent, /2026-08-01/);
   findButton(root, "Retry 2 failed daily-list dates").click();
   assert.equal(retries, 1);
+});
+
+test("settings lists failed dates with accurate errors and bounded retry controls", () => {
+  const root = new FakeNode("main");
+  const calls = [];
+  const document = new FakeDocument();
+  const model = {
+    daily_list_coverage: {
+      categories: [{
+        category: "math.AG", coverage_start: "2026-07-01",
+        retryable_failed_dates: ["2026-08-11", "2026-08-12"],
+        failed_date_errors: [
+          { date: "2026-08-11", error_code: "catchup_http_406" },
+          { date: "2026-08-12", error_code: "arxiv_rate_limited" },
+          { date: "2026-08-10", error_code: "catchup_fetch_failed" },
+        ],
+      }],
+    },
+  };
+  const actions = { retryFailedDate: (...values) => calls.push(values) };
+  renderSettingsView(document, root, model, actions);
+  const rows = descendants(root, "li");
+  const refused = rows.find((row) => row.textContent.includes("2026-08-11"));
+  assert.match(refused.textContent, /HTTP 406/);
+  assert.doesNotMatch(refused.textContent, /rate|limit/i);
+  assert.match(rows.find((row) => row.textContent.includes("2026-08-12")).textContent, /Rate exceeded/);
+  const single = descendants(root, "button").find(
+    (control) => control.getAttribute("aria-label") === "Retry math.AG 2026-08-11",
+  );
+  assert.ok(single);
+  single.click();
+  assert.deepEqual(calls, [["math.AG", "2026-08-11"]]);
+  assert.equal(rows.find((row) => row.textContent.includes("2026-08-10")).querySelector("button"), null);
+
+  renderSettingsView(document, root, {
+    ...model,
+    arxiv_access: {
+      paused: true, retry_at: "2026-08-25T12:30:00Z", http_status: 429,
+      message: "arXiv rate limit reached (HTTP 429).",
+    },
+  }, actions);
+  assert.match(root.textContent, /arXiv rate limit reached \(HTTP 429\)/);
+  assert.match(root.textContent, /Retry available after/);
+  assert.match(root.textContent, /Cached Review and Library remain available/);
+  assert.doesNotMatch(root.textContent, /Metadata synchronization is online/);
+  const retries = descendants(root, "button").filter((control) =>
+    control.textContent.startsWith("Retry"));
+  assert.equal(retries.length, 3);
+  assert.equal(retries.every((control) => control.disabled), true);
 });
 
 test("settings reports completed failed-date retries while syncing", () => {

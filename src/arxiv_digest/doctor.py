@@ -5,19 +5,21 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
 
 from arxiv_digest import __version__
 from arxiv_digest.paths import AppPaths
 from arxiv_digest.profile import decode_profile
 from arxiv_digest.sources.oai import DURABLE_PROTOCOL_ERROR_CODES
+from arxiv_digest.sync import daily_list_coverage_bounds
 
 
 _SAFE_SYNC_ERROR_CODES = frozenset(
     {
+        "arxiv_rate_limited",
+        "arxiv_cooldown_unavailable",
         "cancelled",
         "catchup_fetch_failed",
         "catchup_layout_changed",
@@ -25,7 +27,11 @@ _SAFE_SYNC_ERROR_CODES = frozenset(
         "sync_error",
         "version_evidence_conflict",
     }
-) | DURABLE_PROTOCOL_ERROR_CODES
+) | DURABLE_PROTOCOL_ERROR_CODES | frozenset(
+    f"{prefix}_http_{status}"
+    for prefix in ("catchup", "arxiv")
+    for status in range(100, 600)
+)
 
 
 def _redacted_sync_error_code(value: object) -> str:
@@ -132,10 +138,9 @@ def inspect_doctor(
     today: date | None = None,
 ) -> DoctorReport:
     del platform
-    observed_date = today or datetime.now(timezone.utc).astimezone(
-        ZoneInfo("America/New_York")
-    ).date()
-    coverage_min = observed_date - timedelta(days=89)
+    coverage_min, coverage_max = daily_list_coverage_bounds(
+        datetime.now(timezone.utc), mailing_today=today
+    )
     profile = None
     profile_status = "missing"
     if paths.profile_path.is_file() and not paths.profile_path.is_symlink():
@@ -214,7 +219,7 @@ def inspect_doctor(
                     if category not in active_coverage:
                         continue
                     day = date.fromisoformat(row["daily_list_date"])
-                    if day < active_coverage[category]:
+                    if not active_coverage[category] <= day <= coverage_max:
                         continue
                     statuses_by_category.setdefault(category, {})[day] = row[
                         "status"

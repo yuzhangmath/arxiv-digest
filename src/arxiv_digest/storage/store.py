@@ -114,6 +114,14 @@ class ReviewSnapshotConflict(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class StoreReviewDateReadiness:
+    day: date
+    total_papers: int
+    abstracts_ready: int
+    missing_abstracts: int
+
+
+@dataclass(frozen=True, slots=True)
 class StoredArticleSnapshot:
     category: str
     metadata: PaperMetadata
@@ -145,6 +153,8 @@ class StoreReviewSnapshot:
     papers: tuple[PaperMetadata, ...]
     seed_papers: tuple[PaperMetadata, ...]
     saved_papers: tuple[PaperMetadata, ...]
+    abstracts_ready: int = 0
+    missing_abstracts: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -932,6 +942,27 @@ class Store:
     def _upsert_article(
         connection: sqlite3.Connection, metadata: PaperMetadata
     ) -> None:
+        prior = connection.execute(
+            "SELECT abstract FROM articles WHERE arxiv_id = ?",
+            (metadata.arxiv_id,),
+        ).fetchone()
+        if prior is not None:
+            had_abstract = bool(prior["abstract"].strip())
+            if had_abstract and not metadata.abstract.strip():
+                # Sparse daily lists cannot erase metadata already recovered.
+                metadata = replace(metadata, abstract=prior["abstract"])
+            elif not had_abstract and metadata.abstract.strip():
+                if connection.execute(
+                    "SELECT 1 FROM canonical_events WHERE arxiv_id = ? LIMIT 1",
+                    (metadata.arxiv_id,),
+                ).fetchone() is not None:
+                    # Recovered text can change ranking without a new
+                    # announcement. Invalidate stale review confirmations.
+                    connection.execute(
+                        """UPDATE state_meta
+                           SET projection_revision = projection_revision + 1
+                           WHERE singleton = 1"""
+                    )
         connection.execute(
             """INSERT INTO articles(
                    arxiv_id, title, abstract, primary_category, comments,
@@ -1435,6 +1466,33 @@ class Store:
         finally:
             connection.close()
 
+    @classmethod
+    def _canonical_projection_signature(
+        cls,
+        connection: sqlite3.Connection,
+        arxiv_ids: set[str],
+    ) -> dict[int, tuple[date, frozenset[str]]]:
+        """Capture existing membership before catchup support is corrected."""
+
+        signature: dict[int, tuple[date, frozenset[str]]] = {}
+        for arxiv_id in sorted(arxiv_ids):
+            for row in connection.execute(
+                "SELECT event_id FROM canonical_events WHERE arxiv_id = ?",
+                (arxiv_id,),
+            ).fetchall():
+                event = cls._event_from_connection(connection, int(row[0]))
+                signature[event.event_id] = (
+                    event.daily_list_date,
+                    frozenset(
+                        observation.category
+                        for observation in event.observations
+                        if observation.source is EvidenceSource.CATCHUP
+                        and observation.daily_list_date == event.daily_list_date
+                        and observation.category is not None
+                    ),
+                )
+        return signature
+
     def apply_catchup_day(
         self,
         result: CatchupDay,
@@ -1548,6 +1606,9 @@ class Store:
             affected_ids = {
                 row["arxiv_id"] for row in prior_rows
             } | {item.arxiv_id for item in observations}
+            prior_projection = self._canonical_projection_signature(
+                connection, affected_ids,
+            )
             if stale_rows:
                 stale_ids = tuple(int(row["observation_id"]) for row in stale_rows)
                 placeholders = ",".join("?" for _ in stale_ids)
@@ -1585,6 +1646,21 @@ class Store:
             event_ids = self._reconcile_affected_papers(
                 connection, affected_ids
             )
+            current_projection = self._canonical_projection_signature(
+                connection, affected_ids,
+            )
+            if any(
+                current_projection.get(event_id) != membership
+                for event_id, membership in prior_projection.items()
+            ):
+                # Removing/moving a missing paper or changing category support
+                # can expose old events excluded by a prior review confirmation.
+                # Brand-new events remain governed by their queue revision.
+                connection.execute(
+                    """UPDATE state_meta
+                       SET projection_revision = projection_revision + 1
+                       WHERE singleton = 1"""
+                )
             events = tuple(
                 self._event_from_connection(connection, event_id)
                 for event_id in event_ids
@@ -2107,6 +2183,9 @@ class Store:
                 raise ValueError("snapshot revision is from the future")
             else:
                 snapshot_revision = through_revision
+            readiness = self._review_date_readiness_from_connection(
+                connection, day=day, active_configs=active_configs,
+            )
             event_rows = connection.execute(
                 """SELECT event_id FROM canonical_events
                    WHERE daily_list_date = ? AND queue_revision <= ?
@@ -2181,10 +2260,89 @@ class Store:
                 papers=papers,
                 seed_papers=seed_papers,
                 saved_papers=saved_papers,
+                abstracts_ready=readiness[0].abstracts_ready if readiness else 0,
+                missing_abstracts=readiness[0].missing_abstracts if readiness else 0,
             )
         except Exception:
             connection.rollback()
             raise
+        finally:
+            connection.close()
+
+    @classmethod
+    def _review_date_readiness_from_connection(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        active_configs: tuple[CategoryConfig, ...] | None,
+        through_revision: int | None = None,
+        day: date | None = None,
+        through_date: date | None = None,
+    ) -> tuple[StoreReviewDateReadiness, ...]:
+        """Keep metadata readiness separate from confirmed event membership."""
+
+        if active_configs is not None:
+            if any(not isinstance(config, CategoryConfig) for config in active_configs):
+                raise TypeError("active configs must be CategoryConfig values")
+            if len({config.category for config in active_configs}) != len(active_configs):
+                raise ValueError("active category configurations must be unique")
+        parameters = () if day is None else (_date_text(day),)
+        where = "" if day is None else " WHERE c.daily_list_date = ?"
+        if through_date is not None:
+            where += (" AND" if where else " WHERE") + " c.daily_list_date <= ?"
+            parameters += (_date_text(through_date),)
+        rows = connection.execute(
+            """SELECT c.event_id, c.arxiv_id, c.daily_list_date,
+                      c.queue_revision, a.abstract
+               FROM canonical_events AS c
+               JOIN articles AS a ON a.arxiv_id = c.arxiv_id"""
+            + where + " ORDER BY c.daily_list_date, c.queue_revision, c.event_id",
+            parameters,
+        ).fetchall()
+        papers_by_date: dict[date, dict[str, bool]] = {}
+        included_dates: set[date] = set()
+        for row in rows:
+            event = cls._event_from_connection(connection, int(row["event_id"]))
+            if cls._project_event(event, active_configs) is None:
+                continue
+            event_day = event.daily_list_date
+            papers_by_date.setdefault(event_day, {})[row["arxiv_id"]] = bool(
+                row["abstract"].strip()
+            )
+            if through_revision is None or event.queue_revision <= through_revision:
+                included_dates.add(event_day)
+        return tuple(
+            StoreReviewDateReadiness(
+                day=event_day,
+                total_papers=len(papers),
+                abstracts_ready=sum(papers.values()),
+                missing_abstracts=sum(not present for present in papers.values()),
+            )
+            for event_day, papers in papers_by_date.items()
+            if event_day in included_dates
+        )
+
+    def review_date_readiness(
+        self,
+        *,
+        through_revision: int | None = None,
+        active_configs: tuple[CategoryConfig, ...] | None = None,
+        through_date: date | None = None,
+    ) -> tuple[StoreReviewDateReadiness, ...]:
+        """Read all current papers for each date included in the snapshot."""
+
+        if through_revision is not None and (
+            type(through_revision) is not int or through_revision < 0
+        ):
+            raise ValueError("snapshot revision must be nonnegative")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            return self._review_date_readiness_from_connection(
+                connection, active_configs=active_configs,
+                through_revision=through_revision,
+                through_date=through_date,
+            )
         finally:
             connection.close()
 
@@ -2193,44 +2351,27 @@ class Store:
         *,
         through_revision: int | None = None,
         active_configs: tuple[CategoryConfig, ...] | None = None,
+        through_date: date | None = None,
     ) -> tuple[date, ...]:
-        if through_revision is not None and (
-            type(through_revision) is not int or through_revision < 0
-        ):
-            raise ValueError("snapshot revision must be nonnegative")
-        connection = self._connect()
-        try:
-            if through_revision is None:
-                rows = connection.execute(
-                    """SELECT event_id, daily_list_date
-                       FROM canonical_events
-                       ORDER BY daily_list_date, queue_revision, event_id"""
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    """SELECT event_id, daily_list_date
-                       FROM canonical_events
-                       WHERE queue_revision <= ?
-                       ORDER BY daily_list_date, queue_revision, event_id""",
-                    (through_revision,),
-                ).fetchall()
-            dates: dict[date, None] = {}
-            for row in rows:
-                event = self._event_from_connection(
-                    connection, int(row["event_id"])
-                )
-                if self._project_event(event, active_configs) is not None:
-                    dates.setdefault(_parse_date(row["daily_list_date"]), None)
-            return tuple(dates)
-        finally:
-            connection.close()
+        return tuple(
+            readiness.day
+            for readiness in self.review_date_readiness(
+                through_revision=through_revision, active_configs=active_configs,
+                through_date=through_date,
+            )
+        )
 
     def unreviewed_papers_missing_abstracts(
         self,
         *,
         active_configs: tuple[CategoryConfig, ...],
+        through_date: date | None = None,
     ) -> tuple[str, ...]:
-        """Return distinct papers needing metadata in the active Review queue."""
+        """Return recoverable missing abstracts for all active confirmed papers.
+
+        The method name is retained for callers; previously reviewed papers can
+        also benefit from optional abstract recovery.
+        """
 
         if any(not isinstance(config, CategoryConfig) for config in active_configs):
             raise TypeError("active configs must be CategoryConfig values")
@@ -2241,12 +2382,15 @@ class Store:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
+            date_filter = "" if through_date is None else " AND c.daily_list_date <= ?"
             rows = connection.execute(
                 """SELECT c.event_id, c.arxiv_id, a.abstract
                    FROM canonical_events AS c
                    JOIN articles AS a ON a.arxiv_id = c.arxiv_id
-                   WHERE c.reviewed_at IS NULL AND a.is_deleted = 0
-                   ORDER BY c.daily_list_date, c.queue_revision, c.event_id"""
+                   WHERE a.is_deleted = 0"""
+                + date_filter
+                + " ORDER BY c.daily_list_date, c.queue_revision, c.event_id",
+                () if through_date is None else (_date_text(through_date),),
             ).fetchall()
             missing: dict[str, None] = {}
             for row in rows:
@@ -2264,8 +2408,11 @@ class Store:
         day: date,
         *,
         active_configs: tuple[CategoryConfig, ...] | None = None,
+        through_date: date | None = None,
     ) -> ReviewDateLinks:
-        dates = self.list_review_dates(active_configs=active_configs)
+        dates = self.list_review_dates(
+            active_configs=active_configs, through_date=through_date,
+        )
         previous = tuple(value for value in dates if value < day)
         following = tuple(value for value in dates if value > day)
         return ReviewDateLinks(
@@ -2613,6 +2760,7 @@ class Store:
         profile_revision: int | None = None,
         projection_revision: int | None = None,
         active_configs: tuple[CategoryConfig, ...] | None = None,
+        through_date: date | None = None,
     ) -> FinishResult:
         if type(through_revision) is not int or through_revision < 0:
             raise ValueError("through_revision must be nonnegative")
@@ -2647,11 +2795,14 @@ class Store:
                 raise ReviewSnapshotConflict(
                     "active profile changed; reopen Review"
                 )
+            date_filter = "" if through_date is None else " AND daily_list_date <= ?"
             rows = connection.execute(
                 """SELECT event_id, daily_list_date FROM canonical_events
-                   WHERE queue_revision <= ?
-                   ORDER BY daily_list_date, event_id""",
-                (through_revision,),
+                   WHERE queue_revision <= ?"""
+                + date_filter + " ORDER BY daily_list_date, event_id",
+                (through_revision,)
+                if through_date is None
+                else (through_revision, _date_text(through_date)),
             ).fetchall()
             selected = tuple(
                 (int(row["event_id"]), row["daily_list_date"])

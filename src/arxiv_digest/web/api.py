@@ -278,15 +278,17 @@ _ROUTES = (
         "POST",
         "/api/v1/sync/start",
         "sync_start",
-        optional=("retry_failed_dates", "retry_missing_abstracts"),
+        optional=("retry_failed_dates", "retry_missing_abstracts", "retry_date", "retry_category"),
         validators={
             "retry_failed_dates": lambda value: type(value) is bool,
             "retry_missing_abstracts": lambda value: type(value) is bool,
+            "retry_date": _is_iso_date,
+            "retry_category": lambda value: _is_text(value) and len(value) <= 64,
         },
     ),
     _R("POST", "/api/v1/sync/cancel", "sync_cancel", body_kind="json", required=("job_id",), validators={"job_id": _is_id}),
     _R("GET", "/api/v1/review/summary", "review_summary"),
-    _R("POST", "/api/v1/review/finish", "review_finish_all", body_kind="json", required=("snapshot_revision", "profile_revision", "projection_revision"), validators={"snapshot_revision": _is_int, "profile_revision": _is_positive_int, "projection_revision": _is_int}),
+    _R("POST", "/api/v1/review/finish", "review_finish_all", body_kind="json", required=("snapshot_revision", "profile_revision", "projection_revision"), optional=("through_date",), validators={"snapshot_revision": _is_int, "profile_revision": _is_positive_int, "projection_revision": _is_int, "through_date": _is_iso_date}),
     _R("GET", "/api/v1/review/calendar", "review_calendar", query_required=("start", "end"), query_validators={"start": _is_iso_date, "end": _is_iso_date}),
     _R("GET", "/api/v1/review/date", "review_date", query_required=("date",), query_optional=("anchor_event_id", "from_start"), query_validators={"date": _is_iso_date, "anchor_event_id": _is_offset_text, "from_start": lambda value: value in {"true", "false"}}),
     _R("PUT", "/api/v1/review/date/position", "review_position", body_kind="json", required=("date", "snapshot_revision", "profile_revision", "projection_revision", "anchor_event_id"), validators={"date": _is_iso_date, "snapshot_revision": _is_int, "profile_revision": _is_positive_int, "projection_revision": _is_int, "anchor_event_id": _is_positive_int}),
@@ -453,6 +455,8 @@ def project_review_page(payload: ReviewPagePayload) -> dict[str, JsonValue]:
         "page_number": page.page_number,
         "page_count": page.page_count,
         "total_cards": page.total_cards,
+        "abstracts_ready": page.abstracts_ready,
+        "missing_abstracts": page.missing_abstracts,
         "cards": cards,
     }
 

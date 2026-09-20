@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
 from arxiv_digest.review import ReviewService
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import Store
+from arxiv_digest.web.api import ApiRequest, ApiRouter
 
 
 @dataclass
@@ -28,13 +30,16 @@ class Profiles:
         return self.value
 
 
-def _populate_day(store: Store, numbers: range, day: date) -> set[int]:
+def _populate_day(
+    store: Store, numbers: range, day: date, *,
+    abstract: str = "A deterministic paper in the two-hundred-card backlog.",
+) -> set[int]:
     metadata = tuple(
         PaperMetadata(
             arxiv_id=f"2608.{number:05d}",
             title=f"Backlog fixture {number}",
             authors=(f"Synthetic Author {number % 11}",),
-            abstract="A deterministic paper in the two-hundred-card backlog.",
+            abstract=abstract,
             primary_category="cs.SE",
             categories=("cs.SE",),
         )
@@ -106,6 +111,98 @@ def _walk_date(
         page = service.open_date(
             day, anchor_event_id=page.next_anchor_event_id
         )
+
+
+def test_calendar_api_distinguishes_failed_retrieval_from_confirmed_papers(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    store = Store(database_path)
+    store.ensure_category_state("cs.SE", "cs:SE", date(2026, 8, 1))
+    profile = Profile(
+        schema_version=2,
+        revision=1,
+        category_coverage=(ProfileCategory("cs.SE", date(2026, 8, 1)),),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=PdfDestination("downloads", tmp_path / "pdfs"),
+    )
+    service = ReviewService(store, Profiles(profile))
+    failed_day = date(2026, 8, 3)
+    store.apply_catchup_day(
+        CatchupDay(
+            category="cs.SE",
+            mailing_date=failed_day,
+            status=EnrichmentStatus.FAILED,
+            pages=(),
+            error_code="catchup_fetch_failed",
+            error_message="The daily list could not be retrieved.",
+        ),
+        (),
+        datetime(2026, 8, 22, tzinfo=timezone.utc),
+    )
+    _populate_day(store, range(1, 3), date(2026, 8, 4))
+    waiting_day = date(2026, 8, 5)
+    _populate_day(store, range(3, 5), waiting_day, abstract="")
+    summary_before = service.summary()
+    token = "A" * 43
+    host = "127.0.0.1:43123"
+    router = ApiRouter(
+        token=token,
+        host=host,
+        handlers={
+            "review_date": lambda payload: service.open_date(
+                date.fromisoformat(payload["date"])
+            ),
+            "review_calendar": lambda payload: service.calendar(
+                date.fromisoformat(payload["start"]),
+                date.fromisoformat(payload["end"]),
+            ),
+        },
+    )
+    response = router.dispatch(
+        ApiRequest(
+            method="GET",
+            target="/api/v1/review/calendar?start=2026-08-01&end=2026-08-05",
+            headers={"Host": host, "Authorization": f"Bearer {token}"},
+        )
+    )
+
+    assert response.status == 200
+    entries = json.loads(response.body)["data"]
+    assert [entry["day"] for entry in entries] == [
+        "2026-08-03", "2026-08-04", "2026-08-05",
+    ]
+    assert entries[0]["retrieval_failed"] is True
+    assert all(
+        entries[0][field] is None
+        for field in ("total_papers", "unreviewed_papers", "newly_discovered", "finished")
+    )
+    assert entries[1]["retrieval_failed"] is False
+    assert entries[1]["total_papers"] == 2
+    assert entries[1]["unreviewed_papers"] == 2
+    assert entries[1]["finished"] is False
+    assert entries[1]["abstracts_pending"] is False
+    assert entries[1]["abstracts_ready"] == 2
+    assert entries[2]["abstracts_pending"] is True
+    assert entries[2]["total_papers"] == 2
+    assert entries[2]["abstracts_ready"] == 0
+    assert entries[2]["missing_abstracts"] == 2
+    assert entries[2]["unreviewed_papers"] == 2
+    assert entries[2]["finished"] is False
+    available = router.dispatch(ApiRequest(
+        method="GET", target="/api/v1/review/date?date=2026-08-05",
+        headers={"Host": host, "Authorization": f"Bearer {token}"},
+    ))
+    assert available.status == 200
+    page = json.loads(available.body)["data"]
+    assert page["total_cards"] == page["missing_abstracts"] == 2
+    assert page["abstracts_ready"] == 0
+    assert service.summary() == summary_before
+    assert service.start().day == date(2026, 8, 4)
 
 
 def test_two_hundred_papers_remain_reachable_across_review_navigation(

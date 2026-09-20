@@ -40,8 +40,9 @@ arxiv-digest init
 arXiv Digest retrieves paper metadata for the categories you choose, builds a
 review queue using interests you explicitly select, and explains why each
 paper was ranked. Review and Calendar show a paper only after the app has
-recovered its daily-list membership for that category and date. You can save
-papers to a local library and optionally download PDFs to a folder you choose.
+recovered its daily-list membership for that category and date. Missing abstracts
+do not prevent reading or finishing a confirmed date. You can save papers to a
+local library and optionally download PDFs to a folder you choose.
 
 The application does not run a scheduled or background service. It runs only
 while you have started it from a terminal or the optional desktop launcher.
@@ -237,18 +238,52 @@ at most 20 paper cards; date navigation and paging do not change your
 interests. Use **Finish date** explicitly when you are done with a date, and
 use **Quit** when you want to stop the local application.
 
-Review and Calendar require recovered daily-list membership. The app uses Atom
-and OAI as hidden support for current metadata and version resolution; neither
-source creates a visible review date by itself. If daily-list recovery fails,
-the affected category and date remain a visible coverage gap in Settings and
-their papers stay out of Review and Calendar until recovery succeeds. Coverage
+Daily-list dates become eligible at 20:00 America/New_York on that date,
+following the app's finalization policy. Before then, the date is excluded from
+retrieval, Review, Calendar, and coverage counts, including any failure saved by
+an earlier version. The cutoff follows New York daylight saving time.
+
+Review dates require recovered daily-list membership. A category/date is checked
+successfully only after the app verifies the complete daily list, or confirms
+that it is empty. Daily-list requests include abstracts so both can be recovered
+together, but missing abstracts do not make a checked date incomplete. The app
+also uses Atom and OAI as hidden support for current metadata and version
+resolution; neither source creates a visible review date by itself. If daily-list
+recovery fails, Calendar shows a **Retrieval failed** placeholder for a date with
+no confirmed announcements, without a paper count or review status. A date with confirmed
+papers and a failed category remains available with **Some retrievals failed**
+and a count of confirmed papers. Finishing those papers does not clear that
+category's coverage gap. Settings shows the coverage gaps and retry
+controls; unrecovered papers stay out of Review and Calendar. Coverage
 progress distinguishes checked dates with papers, confirmed empty dates,
 pending dates, retryable failures, and dates that are no longer available.
 
-If a recovered date has papers without abstracts, the Review starting page
-offers **Retry missing abstracts** with the number of affected papers. The
-retry fetches their current metadata and shows progress; papers that still
-lack an abstract remain retryable. You can start reviewing while it runs.
+Settings offers a retry for each failed category/date, so you can test one daily
+list before retrying the remaining gaps. For a plain HTTP 406, daily-list requests,
+OAI metadata synchronization pages, and individual abstract lookups can make one
+paced fallback request using the system `curl` executable, when available. The app
+verifies the response through its normal parser before saving it. If the first
+daily-list page still returns 406, it also retains the compatibility attempt
+without inline abstracts. These
+attempts may recover membership or metadata, but do not guarantee that arXiv
+will accept the request. HTTP errors retain their status code; HTTP 406 alone
+does not establish rate limiting.
+When arXiv returns HTTP 429 or an explicit “Rate exceeded” response, the app
+stops the batch and pauses arXiv
+requests until the supplied retry time, or for one hour when no usable time is
+supplied. The pause survives app restarts. Review and Library remain available,
+and unattempted dates retain their previous state. After the pause expires,
+choose a retry in Settings; expiry itself does not launch a background retry.
+
+Dates with missing abstracts remain available in Review, Calendar, date
+navigation, **Finish date**, and **Finish all**. Ranking uses the metadata
+available locally and may change when more abstracts arrive. Open a date to
+optionally choose **Retry missing abstracts** for that date's confirmed papers,
+including previously reviewed papers. Each recovered abstract is saved as it
+arrives; later retries request only those still missing. The date shows the
+retry's recovered and remaining counts and any reported errors during the
+current app session. You can continue reading and saving papers while it runs.
+Repeated daily-list retrieval preserves abstracts already stored locally.
 
 Library is independent of the active Review and Calendar categories. Saving a
 paper does not create daily-list membership, and removing a category does not

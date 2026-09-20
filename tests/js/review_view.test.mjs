@@ -64,7 +64,7 @@ test("coverage gaps never describe an empty queue as caught up", () => {
       },
       { coverageIncomplete: true },
     ),
-    "Historical daily-list coverage is incomplete. Confirmed announcements from recovered dates remain available; unresolved gaps may hide additional paper announcements.",
+    "Historical daily-list coverage is incomplete. Dates with recovered announcements remain available; unresolved gaps may hide additional paper announcements.",
   );
 });
 
@@ -107,7 +107,7 @@ test("an empty review stays in loading state while synchronization is active", (
       },
       { synchronizing: true },
     ),
-    "Historical daily-list recovery is in progress. Confirmed daily-list announcements will appear as dates are recovered, and this page will update automatically.",
+    "Historical daily-list recovery is in progress. Dates will appear as their daily lists are recovered, and this page will update automatically.",
   );
 });
 
@@ -258,7 +258,7 @@ test("enrichment uses one persistent polite phase announcement", () => {
   assert.equal(phaseStatus.textContent, "Syncing recent paper data…");
   assert.equal(
     descendants(enriching, "p").filter(
-      (node) => node.getAttribute("role") === "status",
+      (node) => node.getAttribute("role") === "status" && !node.hidden,
     ).length,
     1,
   );
@@ -326,7 +326,44 @@ test("review home requires confirmation before marking the whole backlog reviewe
   );
   confirm.click();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(finishes, [[8, 4, 9]]);
+  assert.deepEqual(finishes, [[8, 4, 9, undefined]]);
+});
+
+test("finish all retains the confirmed date cutoff when a later summary arrives", async () => {
+  const document = new FakeDocument();
+  const root = new FakeNode("main");
+  const finishes = [];
+  const actions = { finishAll: async (...snapshot) => finishes.push(snapshot) };
+  const summary = {
+    unreviewed_papers: 3,
+    unreviewed_dates: 2,
+    oldest_unreviewed_date: "2026-09-18",
+    snapshot_revision: 8,
+    profile_revision: 4,
+    projection_revision: 9,
+    through_date: "2026-09-19",
+  };
+  renderReviewHome(document, root, summary, actions);
+  findButton(root, "Mark all as reviewed").click();
+  const confirm = findButton(root, "Confirm mark all as reviewed");
+
+  renderReviewHome(document, root, {
+    ...summary,
+    unreviewed_papers: 5,
+    unreviewed_dates: 3,
+    snapshot_revision: 10,
+    projection_revision: 11,
+    through_date: "2026-09-20",
+  }, actions);
+
+  assert.equal(findButton(root, "Confirm mark all as reviewed"), confirm);
+  assert.match(
+    root.querySelector(".review-finish-all-confirmation").textContent,
+    /Mark all 3 currently unreviewed papers across 2 dates as reviewed\?/,
+  );
+  confirm.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(finishes, [[8, 4, 9, "2026-09-19"]]);
 });
 
 test("a failed whole-backlog finish restores and focuses confirmation", async () => {
@@ -457,72 +494,296 @@ test("review starts immediately while failed-date retry remains independent", as
   );
 });
 
-test("missing abstracts can be retried independently and retain progress across refreshes", async () => {
-  const document = new FakeDocument();
+test("an empty review can retry failed dates and reveal recovered papers", async () => {
   const root = new FakeNode("main");
-  const summary = {
-    unreviewed_papers: 3,
-    unreviewed_dates: 2,
-    oldest_unreviewed_date: "2026-08-01",
-    missing_abstracts: 2,
+  const document = new FakeDocument();
+  const empty = {
+    unreviewed_papers: 0,
+    unreviewed_dates: 0,
+    oldest_unreviewed_date: null,
   };
   let retries = 0;
-  let release;
-  renderReviewHome(document, root, summary, {
-    retryAbstracts: () => {
-      retries++;
-      return new Promise((resolve) => { release = resolve; });
-    },
+  renderReviewHome(document, root, empty, {
+    dailyListRetry: { status: "idle", completed: 0, total: 2 },
+    dailyListProgress: { failed_dates: 2 },
+    retryFailed: async () => retries++,
   });
-  const control = findButton(root, "Retry 2 missing abstracts");
-  control.click();
-  control.click();
-  assert.equal(retries, 1);
-  assert.equal(control.disabled, true);
-  assert.equal(control.getAttribute("aria-busy"), "true");
-  renderReviewHome(document, root, summary, {
-    synchronizing: true,
-    synchronizationPhase: "enrichment",
-    abstractRetry: { status: "running", completed: 1, total: 2 },
-  });
-  release();
+
+  const retry = findButton(root, "Retry 2 failed daily-list dates");
+  assert.equal(retry.hidden, false);
+  assert.equal(retry.disabled, false);
+  assert.equal(findButton(root, "Start review").hidden, true);
+  assert.equal(findButton(root, "Mark all as reviewed").hidden, true);
+  retry.click();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(control, findButton(root, "Retrying abstracts… 1 of 2 completed"));
-  assert.equal(control.disabled, true);
-  assert.equal(findButton(root, "Start review").disabled, false);
-  const progress = root.querySelector(".review-sync-activity").querySelector("progress");
-  assert.equal(progress.getAttribute("value"), "1");
-  assert.equal(progress.getAttribute("max"), "2");
-  renderReviewHome(document, root, { ...summary, missing_abstracts: 0 });
-  assert.equal(control.hidden, true);
+  assert.equal(retries, 1);
+
+  renderReviewHome(document, root, empty, {
+    synchronizing: true,
+    dailyListRetry: { status: "running", completed: 1, total: 2 },
+  });
+  assert.equal(retry.disabled, true);
+  assert.equal(retry.textContent, "Retrying failed daily-list dates… 1 of 2 completed");
+  assert.equal(root.querySelector(".review-sync-activity").hidden, false);
+
+  renderReviewHome(document, root, empty, {
+    dailyListRetry: { status: "idle", completed: 0, total: 2 },
+    dailyListProgress: { failed_dates: 2 },
+  });
+  assert.equal(retry.hidden, false);
+  assert.equal(retry.disabled, false);
+  assert.equal(retry.textContent, "Retry 2 failed daily-list dates");
+  assert.equal(root.querySelector(".review-sync-activity").hidden, true);
+
+  renderReviewHome(document, root, {
+    unreviewed_papers: 1,
+    unreviewed_dates: 1,
+    oldest_unreviewed_date: "2026-08-01",
+  });
+  assert.equal(retry.hidden, true);
+  assert.equal(findButton(root, "Start review").hidden, false);
+  assert.equal(findButton(root, "Mark all as reviewed").hidden, false);
+
+  findButton(root, "Mark all as reviewed").click();
+  renderReviewHome(document, root, empty, {
+    dailyListRetry: { status: "idle", completed: 0, total: 1 },
+  });
+  assert.equal(retry.hidden, false);
+  assert.equal(findButton(root, "Start review").hidden, true);
+  assert.equal(findButton(root, "Mark all as reviewed").hidden, true);
+  assert.equal(root.querySelector(".review-finish-all-confirmation").hidden, true);
 });
 
-test("missing abstract retry stays disabled during sync and recovers from request failure", async () => {
-  const document = new FakeDocument();
+test("retained retry controls keep a pending mark-all request safe for a later backlog", async () => {
   const root = new FakeNode("main");
+  const document = new FakeDocument();
   const summary = {
     unreviewed_papers: 1,
     unreviewed_dates: 1,
     oldest_unreviewed_date: "2026-08-01",
-    missing_abstracts: 1,
+    snapshot_revision: 8,
+    profile_revision: 4,
+    projection_revision: 9,
   };
-  const failures = [];
-  const actions = {
-    retryAbstracts: async () => { throw new Error("Offline"); },
-    failure: (error) => failures.push(error.message),
+  let release;
+  const options = {
+    dailyListRetry: { status: "idle", completed: 0, total: 1 },
+    finishAll: () => new Promise((resolve) => { release = resolve; }),
   };
-  renderReviewHome(document, root, summary, { ...actions, synchronizing: true });
-  const control = findButton(root, "Retry 1 missing abstract");
-  assert.equal(control.disabled, true);
-  renderReviewHome(document, root, summary, actions);
-  let focused = false;
-  control.focus = () => { focused = true; };
-  control.click();
+  renderReviewHome(document, root, summary, options);
+  const markAll = findButton(root, "Mark all as reviewed");
+  markAll.click();
+  const confirm = findButton(root, "Confirm mark all as reviewed");
+  confirm.click();
+
+  renderReviewHome(document, root, {
+    unreviewed_papers: 0,
+    unreviewed_dates: 0,
+    oldest_unreviewed_date: null,
+  }, options);
+  renderReviewHome(document, root, summary, options);
+  assert.equal(markAll.hidden, false);
+  assert.equal(markAll.disabled, true);
+
+  release();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(failures, ["Offline"]);
-  assert.equal(focused, true);
-  assert.equal(control.disabled, false);
-  assert.equal(control.textContent, "Retry 1 missing abstract");
+  renderReviewHome(document, root, summary, options);
+  assert.equal(markAll.disabled, false);
+  markAll.click();
+  assert.equal(confirm.disabled, false);
+  assert.equal(confirm.textContent, "Confirm mark all as reviewed");
+  assert.equal(findButton(root, "Cancel").disabled, false);
+});
+
+test("Review home has no general abstract retry even when a date retry is running", () => {
+  const root = new FakeNode("main");
+  renderReviewHome(new FakeDocument(), root, {
+    unreviewed_papers: 3, unreviewed_dates: 1,
+    oldest_unreviewed_date: "2026-08-04", missing_abstracts: 2,
+  }, {
+    abstractRetry: { status: "running", completed: 1, total: 2 },
+  });
+  assert.equal(root.querySelector(".review-retry-abstracts"), null);
+  assert.equal(root.querySelector(".review-sync-activity").hidden, true);
+  assert.equal(findButton(root, "Start review").disabled, false);
+  assert.equal(findButton(root, "Mark all as reviewed").disabled, false);
+});
+
+test("a persisted arXiv pause disables retries but preserves Review and later clears", () => {
+  const document = new FakeDocument();
+  const root = new FakeNode("main");
+  const summary = {
+    unreviewed_papers: 1, unreviewed_dates: 1,
+    oldest_unreviewed_date: "2026-08-11", missing_abstracts: 1,
+  };
+  const calls = [];
+  const options = {
+    dailyListRetry: { status: "idle", total: 2 },
+    dailyListProgress: { failed_dates: 2 },
+    retryFailed: () => calls.push("dates"),
+    retryAbstracts: () => calls.push("abstracts"),
+    start: () => calls.push("review"),
+    arxivAccess: {
+      paused: true, retry_at: "2026-08-25T12:30:00Z", http_status: 406,
+      message: "arXiv returned Rate exceeded (HTTP 406). Requests are paused.",
+    },
+  };
+  renderReviewHome(document, root, summary, options);
+  const notice = root.querySelector(".arxiv-access-status");
+  assert.equal(notice.hidden, false);
+  assert.equal(notice.getAttribute("role"), "status");
+  assert.match(notice.textContent, /Rate exceeded \(HTTP 406\)/);
+  assert.match(notice.textContent, /Retry available after/);
+  const dates = findButton(root, "Retry 2 failed daily-list dates");
+  assert.equal(dates.disabled, true);
+  dates.click();
+  assert.deepEqual(calls, []);
+  const start = findButton(root, "Start review");
+  assert.equal(start.disabled, false);
+  assert.equal(findButton(root, "Mark all as reviewed").disabled, false);
+  start.click();
+  assert.deepEqual(calls, ["review"]);
+  renderReviewHome(document, root, summary, { ...options, arxivAccess: { paused: false } });
+  assert.equal(notice.hidden, true);
+  assert.equal(dates.disabled, false);
+});
+
+test("an empty Review still explains a paused request without a retry deadline", () => {
+  const root = new FakeNode("main");
+  renderReviewHome(new FakeDocument(), root, {}, {
+    arxivAccess: { paused: true, retry_at: null, message: "The saved request pause could not be read." },
+  });
+  assert.match(root.textContent, /The saved request pause could not be read/);
+  assert.doesNotMatch(root.textContent, /Invalid Date|Retry available after/);
+});
+
+test("Review describes missing abstracts as optional while keeping dates available", () => {
+  const summary = {
+    unreviewed_papers: 3, unreviewed_dates: 1, oldest_unreviewed_date: "2026-08-04",
+    waiting_abstract_dates: 1, waiting_abstract_papers: 3, missing_abstracts: 1,
+  };
+  assert.match(reviewHomeText(summary), /3 unreviewed paper announcements are ready across 1 date/);
+  assert.match(reviewHomeText(summary), /1 unreviewed paper is missing an abstract across 1 date/);
+  assert.match(reviewHomeText(summary), /You can still review and finish these dates/);
+  const mixed = reviewHomeText({
+    ...summary, unreviewed_papers: 5, unreviewed_dates: 2, oldest_unreviewed_date: "2026-08-02",
+    missing_abstracts: 2, waiting_abstract_dates: 2,
+  }, { coverageIncomplete: true });
+  assert.match(mixed, /5 unreviewed paper announcements are ready across 2 dates/);
+  assert.match(mixed, /2 unreviewed papers are missing abstracts across 2 dates/);
+  assert.match(mixed, /coverage is incomplete/);
+  assert.doesNotMatch(mixed, /Waiting for abstracts|become available when/);
+});
+
+test("a date with missing abstracts can retry and finish independently", async () => {
+  const root = new FakeNode("main");
+  const retries = [];
+  const finishes = [];
+  renderReviewView(new FakeDocument(), root, {
+    day: "2026-08-04", total_cards: 3, abstracts_ready: 2, missing_abstracts: 1,
+    snapshot_revision: 37, profile_revision: 4, projection_revision: 9,
+    cards: [item(1), item(2), { ...item(3), abstract: "" }],
+  }, {
+    retryAbstracts: async (day) => retries.push(day),
+    finish: async (...args) => finishes.push(args),
+  });
+  assert.match(root.textContent, /2 of 3 abstracts available/);
+  assert.match(root.textContent, /You can still review and finish this date/);
+  findButton(root, "Retry missing abstracts").click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(retries, ["2026-08-04"]);
+  findButton(root, "Finish date").click();
+  findButton(root, "Confirm finish").click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(finishes, [["2026-08-04", 37, 4, 9]]);
+});
+
+test("date retry preserves progress and explains failure without blocking review", () => {
+  const root = new FakeNode("main");
+  const page = {
+    day: "2026-08-04", total_cards: 3, abstracts_ready: 1, missing_abstracts: 2,
+    cards: [item(1), item(2), item(3)],
+  };
+  renderReviewView(new FakeDocument(), root, page, {
+    abstractRetry: { status: "running", retry_date: "2026-08-04", completed: 1, total: 2 },
+  });
+  assert.equal(findButton(root, "Retrying abstracts… 1 of 2 checked").disabled, true);
+  assert.equal(findButton(root, "Finish date").disabled, false);
+  renderReviewView(new FakeDocument(), root, { ...page, abstracts_ready: 2, missing_abstracts: 1 }, {
+    abstractRetry: {
+      status: "completed", retry_date: "2026-08-04", completed: 2, total: 2,
+      recovered: 1, remaining: 1, error_codes: ["arxiv_http_406"],
+    },
+  });
+  const result = root.querySelector(".review-abstract-retry-result");
+  assert.equal(result.getAttribute("role"), "status");
+  assert.match(result.textContent, /Recovered 1 abstract; 1 still unavailable/);
+  assert.match(result.textContent, /HTTP 406/);
+  assert.equal(findButton(root, "Retry missing abstracts").disabled, false);
+});
+
+test("date retry success remains visible when every abstract is recovered", () => {
+  const root = new FakeNode("main");
+  renderReviewView(new FakeDocument(), root, {
+    day: "2026-08-04", total_cards: 1, abstracts_ready: 1, missing_abstracts: 0,
+    cards: [item(1)],
+  }, {
+    abstractRetry: {
+      status: "completed", retry_date: "2026-08-04", recovered: 1, remaining: 0,
+    },
+  });
+  assert.match(root.textContent, /Recovered 1 abstract; 0 still unavailable/);
+  assert.equal(root.querySelector(".review-retry-abstracts"), null);
+});
+
+test("abstract availability counts reviewed and unreviewed papers on the date", () => {
+  const root = new FakeNode("main");
+  renderReviewView(new FakeDocument(), root, {
+    day: "2026-08-04", total_cards: 1, abstracts_ready: 2, missing_abstracts: 1,
+    cards: [item(1)],
+  });
+  assert.match(root.querySelector(".review-abstract-notice").textContent, /2 of 3 abstracts available/);
+});
+
+test("date retry polling keeps its focused control and reports interrupted progress", () => {
+  const document = new FakeDocument();
+  const root = new FakeNode("main");
+  const page = {
+    day: "2026-08-04", total_cards: 3, abstracts_ready: 1, missing_abstracts: 2,
+    cards: [item(1), item(2), item(3)],
+  };
+  const view = renderReviewView(document, root, page);
+  const control = findButton(root, "Retry missing abstracts");
+  reviewView.updateReviewAbstractStatus(document, view, page, {
+    abstractRetry: { status: "running", retry_date: page.day, completed: 1, total: 2 },
+  });
+  assert.equal(findButton(root, "Retrying abstracts… 1 of 2 checked"), control);
+  reviewView.updateReviewAbstractStatus(document, view, page, {
+    abstractRetry: {
+      status: "interrupted", retry_date: page.day, recovered: 1, remaining: 1,
+      error_codes: ["cancelled"],
+    },
+  });
+  assert.equal(findButton(root, "Retry missing abstracts"), control);
+  assert.match(root.textContent, /Retry interrupted\. Recovered 1 abstract; 1 still unavailable/);
+  assert.doesNotMatch(root.textContent, /arXiv requests failed/);
+});
+
+test("date retry disables during synchronization or a pause and does not leak another date result", () => {
+  const root = new FakeNode("main");
+  const page = {
+    day: "2026-08-04", total_cards: 1, abstracts_ready: 0, missing_abstracts: 1,
+    cards: [item(1)],
+  };
+  for (const options of [{ synchronizing: true }, { arxivAccess: { paused: true } }]) {
+    renderReviewView(new FakeDocument(), root, page, options);
+    assert.equal(findButton(root, "Retry missing abstracts").disabled, true);
+    assert.equal(findButton(root, "Finish date").disabled, false);
+  }
+  renderReviewView(new FakeDocument(), root, page, {
+    abstractRetry: { status: "completed", retry_date: "2026-08-05", recovered: 1, remaining: 0 },
+  });
+  assert.equal(root.querySelector(".review-abstract-retry-result"), null);
 });
 
 test("review page status states how many papers belong to the date", () => {

@@ -539,7 +539,7 @@ def test_larger_retry_after_delta_overrides_the_normal_delay() -> None:
             super().__init__()
             self.started_at: list[float] = []
             self.outcomes: list[HTTPError | FakeResponse] = [
-                http_error(429, Retry_After="12"),
+                http_error(503, Retry_After="12"),
                 FakeResponse(),
             ]
 
@@ -595,7 +595,7 @@ def test_retry_after_http_date_uses_the_injected_wall_clock() -> None:
             self.started_at: list[float] = []
             self.outcomes: list[HTTPError | FakeResponse] = [
                 http_error(
-                    429,
+                    503,
                     Retry_After=format_datetime(wall_start + timedelta(seconds=20)),
                 ),
                 FakeResponse(),
@@ -641,7 +641,7 @@ def test_retry_after_http_date_uses_the_injected_wall_clock() -> None:
     assert clock.sleeps == [20.0]
 
 
-@pytest.mark.parametrize("status", [429, 502, 503, 504])
+@pytest.mark.parametrize("status", [502, 503, 504])
 def test_retryable_statuses_use_exponential_backoff(status: int) -> None:
     clock = FakeClock()
 
@@ -928,11 +928,11 @@ def test_disallowed_final_url_is_rejected_as_defense_in_depth() -> None:
     assert len(opener.requests) == 1
 
 
-def test_unexpected_content_type_is_rejected_before_body_read() -> None:
+def test_unexpected_binary_content_type_is_rejected_before_body_read() -> None:
     class HtmlResponse(FakeResponse):
         def __init__(self) -> None:
             super().__init__()
-            self.headers = {"Content-Type": "text/html; charset=utf-8"}
+            self.headers = {"Content-Type": "application/octet-stream"}
 
         def read(self, size: int = -1) -> bytes:
             raise AssertionError("body was read before content type validation")
@@ -1126,3 +1126,238 @@ def test_default_opener_installs_the_validating_redirect_handler(
     assert response.status == 200
     assert len(captured_handlers) == 1
     assert isinstance(captured_handlers[0], ArxivRedirectHandler)
+
+
+@pytest.mark.parametrize("interface", list(Interface))
+def test_429_stops_immediately_and_blocks_every_interface_until_cooldown_expires(
+    interface: Interface,
+) -> None:
+    from arxiv_digest.arxiv_access import ArxivCooldown, ArxivRateLimited
+
+    now = [datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)]
+    cooldown = ArxivCooldown(wall_clock=lambda: now[0])
+    clock = FakeClock()
+
+    class ThrottledOpener(FakeOpener):
+        def open(self, request: object, timeout: float | None = None) -> FakeResponse:
+            self.requests.append(request)
+            raise http_error(429, Retry_After="120")
+
+    opener = ThrottledOpener()
+    client = ArxivHttpClient(
+        user_agent="fixture", contact_url="https://example.invalid/contact",
+        opener=opener, cooldown=cooldown, monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+    )
+    with pytest.raises(ArxivRateLimited) as first:
+        client.get("https://arxiv.org/catchup/math/2026-08-22", interface=interface, accept="text/html")
+    assert first.value.attempted is True
+    assert first.value.retry_at == now[0] + timedelta(seconds=120)
+    assert len(opener.requests) == 1
+    assert clock.sleeps == []
+    for other in Interface:
+        with pytest.raises(ArxivRateLimited) as blocked:
+            client.get("https://arxiv.org/catchup/math/2026-08-22", interface=other, accept="text/html")
+        assert blocked.value.attempted is False
+    assert len(opener.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "content_type", "body"),
+    [
+        (200, "text/plain", b"Rate exceeded."),
+        (200, "text/html", b"<html><head><title>Rate exceeded</title></head><body><h1>Rate exceeded.</h1></body></html>"),
+        (406, "text/plain", b" Rate exceeded.\n"),
+        (503, "text/html", b"<html><body>Rate exceeded.</body></html>"),
+    ],
+)
+def test_explicit_short_rate_exceeded_response_stops_without_retry(
+    status: int, content_type: str, body: bytes,
+) -> None:
+    from arxiv_digest.arxiv_access import ArxivRateLimited
+    clock = FakeClock()
+
+    class ThrottledOpener(FakeOpener):
+        def open(self, request: object, timeout: float | None = None) -> FakeResponse:
+            self.requests.append(request)
+            if status >= 400:
+                headers = Message()
+                headers["Content-Type"] = content_type
+                raise HTTPError(request.full_url, status, "fixture error", headers, BytesIO(body))
+            response = FakeResponse()
+            response.headers["Content-Type"] = content_type
+            response._body = body
+            return response
+
+    opener = ThrottledOpener()
+    client = ArxivHttpClient(
+        user_agent="fixture", contact_url="https://example.invalid/contact",
+        opener=opener, monotonic=clock.monotonic, sleeper=clock.sleep,
+        wall_clock=lambda: datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc),
+    )
+    with pytest.raises(ArxivRateLimited) as caught:
+        client.get("https://arxiv.org/catchup/math/2026-08-22", interface=Interface.CATCHUP, accept="text/html")
+    assert caught.value.http_status == status
+    assert caught.value.retry_at == datetime(2026, 8, 22, 13, 0, tzinfo=timezone.utc)
+    assert caught.value.attempted is True
+    assert len(opener.requests) == 1
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize("body", [b"", b"Not acceptable", b"<html><body><h1>Some papers</h1><p>Rate exceeded.</p></body></html>"])
+def test_ordinary_406_is_not_classified_as_throttling(body: bytes) -> None:
+    from arxiv_digest.arxiv_access import ArxivCooldown
+    headers = Message()
+    headers["Content-Type"] = "text/html"
+    original = HTTPError("https://arxiv.org/catchup/math/2026-08-22", 406, "fixture", headers, BytesIO(body))
+
+    class RejectedOpener(FakeOpener):
+        def open(self, request: object, timeout: float | None = None) -> FakeResponse:
+            self.requests.append(request)
+            raise original
+
+    opener = RejectedOpener()
+    cooldown = ArxivCooldown()
+    client = ArxivHttpClient(user_agent="fixture", contact_url="https://example.invalid/contact", opener=opener, cooldown=cooldown)
+    with pytest.raises(HTTPError) as caught:
+        client.get(original.url, interface=Interface.CATCHUP, accept="text/html")
+    assert caught.value is original
+    assert cooldown.active() is None
+    assert len(opener.requests) == 1
+
+
+def test_throttle_body_check_does_not_mistake_paper_text_for_a_rate_error() -> None:
+    class PaperOpener(FakeOpener):
+        def open(self, request: object, timeout: float | None = None) -> FakeResponse:
+            self.requests.append(request)
+            response = FakeResponse()
+            response.headers["Content-Type"] = "text/html"
+            response._body = b"<html><body><h1>Daily list</h1><p>A theorem for which the rate exceeded a bound.</p></body></html>"
+            return response
+
+    client = ArxivHttpClient(user_agent="fixture", contact_url="https://example.invalid/contact", opener=PaperOpener())
+    response = client.get("https://arxiv.org/catchup/math/2026-08-22", interface=Interface.CATCHUP, accept="text/html")
+    assert response.status == 200
+    assert b"theorem" in response.body
+
+
+def test_error_body_probe_preserves_cancellation_and_bounds_reads() -> None:
+    cancellation = Event()
+    class CancellingBody(BytesIO):
+        def read1(self, size: int = -1) -> bytes:
+            assert 0 < size <= 4097
+            cancellation.set()
+            return b"Rate exceeded."
+
+    class ErrorOpener(FakeOpener):
+        def open(self, request: object, timeout: float | None = None) -> FakeResponse:
+            headers = Message()
+            headers["Content-Type"] = "text/plain"
+            raise HTTPError(request.full_url, 406, "fixture", headers, CancellingBody())
+
+    client = ArxivHttpClient(user_agent="fixture", contact_url="https://example.invalid/contact", opener=ErrorOpener())
+    with pytest.raises(rate_limit.ArxivRequestCancelled):
+        client.get("https://arxiv.org/catchup/math/2026-08-22", interface=Interface.CATCHUP, accept="text/html", cancelled=cancellation.is_set)
+
+
+def test_restarted_transport_performs_no_network_or_sleep_before_saved_deadline(tmp_path) -> None:
+    from arxiv_digest.arxiv_access import ArxivCooldown, ArxivRateLimited
+    now = [datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)]
+    path = tmp_path / "arxiv-cooldown.json"
+    ArxivCooldown(path, wall_clock=lambda: now[0]).record(retry_after="60", http_status=429)
+    opener = FakeOpener()
+    clock = FakeClock()
+    restarted = ArxivHttpClient(
+        user_agent="fixture", contact_url="https://example.invalid/contact",
+        opener=opener, monotonic=clock.monotonic, sleeper=clock.sleep,
+        cooldown=ArxivCooldown(path, wall_clock=lambda: now[0]),
+    )
+    with pytest.raises(ArxivRateLimited) as caught:
+        restarted.get("https://export.arxiv.org/oai2", interface=Interface.OAI, accept="application/xml")
+    assert caught.value.attempted is False
+    assert opener.requests == []
+    assert clock.sleeps == []
+    now[0] += timedelta(seconds=60)
+    assert restarted.get("https://export.arxiv.org/oai2", interface=Interface.OAI, accept="application/xml").status == 200
+    assert len(opener.requests) == 1
+
+
+def test_corrupt_saved_cooldown_blocks_transport_before_open(tmp_path) -> None:
+    from arxiv_digest.arxiv_access import ArxivCooldown, ArxivCooldownUnavailable
+    path = tmp_path / "arxiv-cooldown.json"
+    path.write_bytes(b"broken")
+    path.chmod(0o600)
+    opener = FakeOpener()
+    client = ArxivHttpClient(
+        user_agent="fixture", contact_url="https://example.invalid/contact",
+        opener=opener, cooldown=ArxivCooldown(path),
+    )
+    with pytest.raises(ArxivCooldownUnavailable):
+        client.get("https://export.arxiv.org/oai2", interface=Interface.OAI, accept="application/xml")
+    assert opener.requests == []
+
+
+def test_large_error_body_cannot_trigger_a_prefix_only_rate_match() -> None:
+    from arxiv_digest.arxiv_access import ArxivCooldown
+    class LargeBody(BytesIO):
+        def __init__(self):
+            super().__init__(b"Rate exceeded." + b" " * 5000 + b"Paper title")
+            self.read_bytes = 0
+        def read1(self, size=-1):
+            assert 0 < size <= 4097
+            result = super().read1(size)
+            self.read_bytes += len(result)
+            return result
+    body = LargeBody()
+    class ErrorOpener(FakeOpener):
+        def open(self, request, timeout=None):
+            headers = Message()
+            headers["Content-Type"] = "text/plain"
+            raise HTTPError(request.full_url, 406, "fixture", headers, body)
+    cooldown = ArxivCooldown()
+    client = ArxivHttpClient(user_agent="fixture", contact_url="https://example.invalid/contact", opener=ErrorOpener(), cooldown=cooldown)
+    with pytest.raises(HTTPError):
+        client.get("https://arxiv.org/catchup/math/2026-08-22", interface=Interface.CATCHUP, accept="text/html")
+    assert body.read_bytes == 4097
+    assert cooldown.active() is None
+
+
+def test_failed_diagnostic_body_read_preserves_the_received_http_status() -> None:
+    class BrokenBody(BytesIO):
+        def read1(self, size: int = -1) -> bytes:
+            raise TimeoutError("fixture body read timed out")
+
+    headers = Message()
+    headers["Content-Type"] = "text/plain"
+    original = HTTPError("https://arxiv.org/catchup/math/2026-08-22", 406, "fixture", headers, BrokenBody())
+    class ErrorOpener(FakeOpener):
+        def open(self, request: object, timeout: float | None = None) -> FakeResponse:
+            raise original
+
+    client = ArxivHttpClient(user_agent="fixture", contact_url="https://example.invalid/contact", opener=ErrorOpener())
+    with pytest.raises(HTTPError) as caught:
+        client.get(original.url, interface=Interface.CATCHUP, accept="text/html")
+    assert caught.value is original
+    assert caught.value.code == 406
+
+
+def test_cooldown_observed_between_retries_preserves_an_earlier_request_attempt() -> None:
+    from arxiv_digest.arxiv_access import ArxivCooldown, ArxivRateLimited
+    cooldown = ArxivCooldown()
+    clock = FakeClock()
+    class ConcurrentThrottleOpener(FakeOpener):
+        def open(self, request: object, timeout: float | None = None) -> FakeResponse:
+            self.requests.append(request)
+            cooldown.record(retry_after="60", http_status=429)
+            raise http_error(503)
+    opener = ConcurrentThrottleOpener()
+    client = ArxivHttpClient(
+        user_agent="fixture", contact_url="https://example.invalid/contact",
+        opener=opener, cooldown=cooldown, monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+    )
+    with pytest.raises(ArxivRateLimited) as caught:
+        client.get("https://arxiv.org/catchup/math/2026-08-22", interface=Interface.CATCHUP, accept="text/html")
+    assert caught.value.attempted is True
+    assert len(opener.requests) == 1
+    assert clock.sleeps == []

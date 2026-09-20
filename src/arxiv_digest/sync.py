@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping
+from urllib.error import HTTPError
 from zoneinfo import ZoneInfo
 
+from arxiv_digest.arxiv_access import ArxivCooldownUnavailable, ArxivRateLimited
 from arxiv_digest.models import (
     CategoryConfig,
     CatchupDay,
@@ -27,6 +29,7 @@ from arxiv_digest.storage.store import CategorySyncRecord, Store
 _MAILING_TIME_ZONE = ZoneInfo("America/New_York")
 SUPPORTED_CATCHUP_WINDOW_DAYS = 90
 DEFAULT_CATCHUP_FINALIZATION_HOUR = 20
+_ARXIV_ACCESS_PAUSES = (ArxivRateLimited, ArxivCooldownUnavailable)
 
 
 def daily_list_coverage_bounds(
@@ -100,6 +103,15 @@ class CategoryProgress:
 
 
 @dataclass(frozen=True, slots=True)
+class AbstractRetryProgress:
+    attempted: int
+    total: int
+    recovered: int
+    remaining: int
+    error_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SyncReport:
     categories: tuple[CategoryProgress, ...]
     offline: bool
@@ -115,6 +127,7 @@ class SyncReport:
     pending_dates: int = 0
     unavailable_dates: int = 0
     daily_list_status: str = "idle"
+    abstract_retry: AbstractRetryProgress | None = None
 
 
 class SyncCancelled(Exception):
@@ -208,6 +221,15 @@ class SyncService:
                 durable_protocol_error_code(error.code),
                 "The arXiv OAI service rejected the request.",
             )
+        if (
+            isinstance(error, HTTPError)
+            and type(error.code) is int
+            and 100 <= error.code <= 599
+        ):
+            return (
+                f"arxiv_http_{error.code}",
+                f"The arXiv request returned HTTP {error.code}.",
+            )
         code = getattr(error, "code", None)
         safe_message = getattr(error, "safe_message", None)
         if isinstance(code, str) and code.strip() and isinstance(
@@ -257,45 +279,46 @@ class SyncService:
                 for mailing_date in requested
             }
         )
-        for mailing_date in target_dates:
+        try:
+            for mailing_date in target_dates:
+                for config in configs:
+                    if mailing_date not in requested_by_category[config.category]:
+                        continue
+                    self._check_cancelled()
+                    if self._attempt_catchup_day(config, mailing_date, attempted):
+                        network_successes += 1
+                    else:
+                        network_failures += 1
+
+            if daily_list_complete is not None:
+                daily_list_complete()
+
+            # Atom and OAI enrich confirmed events but never create visible ones.
             for config in configs:
-                if mailing_date not in requested_by_category[config.category]:
-                    continue
                 self._check_cancelled()
-                if self._sync_catchup_day(config, mailing_date):
+                if self._sync_atom(config):
                     network_successes += 1
                 else:
                     network_failures += 1
-                if attempted is not None:
-                    attempted(config.category, mailing_date)
 
-        if daily_list_complete is not None:
-            daily_list_complete()
+            for config in configs:
+                self._check_cancelled()
+                if self._sync_incremental(config):
+                    network_successes += 1
+                else:
+                    network_failures += 1
 
-        # Atom and OAI enrich confirmed events but never create visible ones.
-        for config in configs:
-            self._check_cancelled()
-            if self._sync_atom(config):
-                network_successes += 1
-            else:
-                network_failures += 1
-
-        for config in configs:
-            self._check_cancelled()
-            if self._sync_incremental(config):
-                network_successes += 1
-            else:
-                network_failures += 1
-
-        for config in configs:
-            self._check_cancelled()
-            state = self.store.category_sync_state(config.category)
-            if state.pending_backfill_start is None:
-                continue
-            if self._sync_backfill(config, state):
-                network_successes += 1
-            else:
-                network_failures += 1
+            for config in configs:
+                self._check_cancelled()
+                state = self.store.category_sync_state(config.category)
+                if state.pending_backfill_start is None:
+                    continue
+                if self._sync_backfill(config, state):
+                    network_successes += 1
+                else:
+                    network_failures += 1
+        except _ARXIV_ACCESS_PAUSES as error:
+            network_failures += int(error.attempted)
 
         return self.progress(
             configs,
@@ -319,16 +342,18 @@ class SyncService:
             self.store.ensure_category_state(
                 config.category, config.oai_set_spec, config.coverage_start
             )
-            requested = self._eligible_catchup_dates(config, dates)
-            self.store.ensure_catchup_targets(config.category, requested)
-            for mailing_date in requested:
-                self._check_cancelled()
-                if self._sync_catchup_day(config, mailing_date):
-                    network_successes += 1
-                else:
-                    network_failures += 1
-                if attempted is not None:
-                    attempted(config.category, mailing_date)
+        try:
+            for config in configs:
+                requested = self._eligible_catchup_dates(config, dates)
+                self.store.ensure_catchup_targets(config.category, requested)
+                for mailing_date in requested:
+                    self._check_cancelled()
+                    if self._attempt_catchup_day(config, mailing_date, attempted):
+                        network_successes += 1
+                    else:
+                        network_failures += 1
+        except _ARXIV_ACCESS_PAUSES as error:
+            network_failures += int(error.attempted)
         return self.progress(
             configs,
             offline=network_failures > 0 and network_successes == 0,
@@ -338,22 +363,36 @@ class SyncService:
         self,
         configs: tuple[CategoryConfig, ...],
         *,
+        day: date | None = None,
         attempted: Callable[[str], None] | None = None,
     ) -> SyncReport:
-        """Fetch only missing abstracts for currently unreviewed visible papers."""
+        """Recover optional abstracts for confirmed papers, optionally on one date."""
 
         self._check_cancelled()
+        if day is not None and type(day) is not date:
+            raise TypeError("abstract retry day must be a calendar date")
         identifiers = self.store.unreviewed_papers_missing_abstracts(
             active_configs=configs
         )
+        if day is not None:
+            date_identifiers = {
+                event.arxiv_id
+                for event in self.store.events_for_date(day, active_configs=configs)
+            }
+            identifiers = tuple(
+                value for value in identifiers if value in date_identifiers
+            )
         for config in configs:
             self.store.ensure_category_state(
                 config.category, config.oai_set_spec, config.coverage_start
             )
         network_successes = 0
         network_failures = 0
+        attempted_count = 0
+        error_codes: set[str] = set()
         for arxiv_id in identifiers:
             self._check_cancelled()
+            request_attempted = True
             try:
                 record = self.oai_source.get_record(
                     arxiv_id, cancelled=self._cancelled
@@ -368,15 +407,35 @@ class SyncService:
                     raise ValueError("OAI record did not provide the requested abstract")
                 self.store.apply_article_snapshot(record.metadata, record.versions)
                 network_successes += 1
+            except _ARXIV_ACCESS_PAUSES as error:
+                request_attempted = error.attempted
+                network_failures += int(request_attempted)
+                error_codes.add(self._error(error, "abstract_retry")[0])
+                break
             except Exception as error:
                 self._raise_cancelled(error)
                 network_failures += 1
+                error_codes.add(self._error(error, "abstract_retry")[0])
             finally:
-                if attempted is not None:
-                    attempted(arxiv_id)
-        return self.progress(
-            configs,
-            offline=network_failures > 0 and network_successes == 0,
+                if request_attempted:
+                    attempted_count += 1
+                    if attempted is not None:
+                        attempted(arxiv_id)
+        still_missing = set(
+            self.store.unreviewed_papers_missing_abstracts(active_configs=configs)
+        )
+        return replace(
+            self.progress(
+                configs,
+                offline=network_failures > 0 and network_successes == 0,
+            ),
+            abstract_retry=AbstractRetryProgress(
+                attempted=attempted_count,
+                total=len(identifiers),
+                recovered=network_successes,
+                remaining=sum(value in still_missing for value in identifiers),
+                error_codes=tuple(sorted(error_codes)),
+            ),
         )
 
     def _sync_incremental(self, config: CategoryConfig) -> bool:
@@ -422,6 +481,8 @@ class SyncService:
                 code, message = self._error(error, "metadata synchronization")
                 self.store.fail_sync_run(run_id, code, message, self._now())
                 self._raise_cancelled(error)
+                if isinstance(error, _ARXIV_ACCESS_PAUSES):
+                    raise
                 if self._is_expired_token(error) and not restarted:
                     restarted = True
                     continue
@@ -464,6 +525,8 @@ class SyncService:
                 raise ValueError("Atom category does not match the request")
             self.store.apply_atom_batch(batch, atom_observations(batch))
             return True
+        except _ARXIV_ACCESS_PAUSES:
+            raise
         except Exception as error:
             self._raise_cancelled(error)
             return False
@@ -528,6 +591,8 @@ class SyncService:
             code, message = self._error(error, "historical backfill")
             self.store.fail_sync_run(run_id, code, message, self._now())
             self._raise_cancelled(error)
+            if isinstance(error, _ARXIV_ACCESS_PAUSES):
+                raise
             return False
 
     def _eligible_catchup_dates(
@@ -535,13 +600,12 @@ class SyncService:
         config: CategoryConfig,
         supplied: Mapping[str, Iterable[date]] | None,
     ) -> tuple[date, ...]:
-        today = self._today()
-        earliest = today - timedelta(days=self.catchup_window_days - 1)
+        earliest, latest_finalized = self.coverage_bounds()
         if supplied is None:
             start = max(config.coverage_start, earliest)
             requested = (
                 start + timedelta(days=offset)
-                for offset in range((today - start).days + 1)
+                for offset in range((latest_finalized - start).days + 1)
             )
         else:
             requested = supplied.get(config.category, ())
@@ -550,13 +614,29 @@ class SyncService:
             for record in self.store.catchup_day_records(config.category)
             if record.status
             in {CatchupDayStatus.COMPLETE, CatchupDayStatus.EMPTY}
-            and self._daily_list_date_is_finalized(record.daily_list_date)
+            and record.daily_list_date <= latest_finalized
         }
         return tuple(
             day
             for day in sorted(set(requested))
-            if earliest <= day <= today and day not in successful
+            if earliest <= day <= latest_finalized and day not in successful
         )
+
+    def _attempt_catchup_day(
+        self,
+        config: CategoryConfig,
+        mailing_date: date,
+        attempted: Callable[[str, date], None] | None,
+    ) -> bool:
+        try:
+            success = self._sync_catchup_day(config, mailing_date)
+        except _ARXIV_ACCESS_PAUSES as error:
+            if error.attempted and attempted is not None:
+                attempted(config.category, mailing_date)
+            raise
+        if attempted is not None:
+            attempted(config.category, mailing_date)
+        return success
 
     def _sync_catchup_day(
         self, config: CategoryConfig, mailing_date: date
@@ -588,6 +668,8 @@ class SyncService:
             return result.status != EnrichmentStatus.FAILED
         except Exception as error:
             self._raise_cancelled(error)
+            if isinstance(error, _ARXIV_ACCESS_PAUSES) and not error.attempted:
+                raise
             code, message = self._error(error, "catch-up")
             result = CatchupDay(
                 category=config.category,
@@ -598,14 +680,15 @@ class SyncService:
                 error_message=message,
             )
             self.store.apply_catchup_day(result, (), self._now())
+            if isinstance(error, _ARXIV_ACCESS_PAUSES):
+                raise
             return False
 
     def progress(
         self, configs: tuple[CategoryConfig, ...], *, offline: bool = False
     ) -> SyncReport:
         values: list[CategoryProgress] = []
-        today = self._today()
-        retry_earliest = today - timedelta(days=self.catchup_window_days - 1)
+        retry_earliest, latest_finalized = self.coverage_bounds()
         statuses_by_category: dict[
             str, dict[date, CatchupDayStatus]
         ] = {}
@@ -617,7 +700,9 @@ class SyncService:
             records = tuple(
                 record
                 for record in self.store.catchup_day_records(config.category)
-                if record.daily_list_date >= config.coverage_start
+                if config.coverage_start
+                <= record.daily_list_date
+                <= latest_finalized
             )
             statuses = {
                 record.daily_list_date: record.status for record in records
@@ -652,7 +737,7 @@ class SyncService:
             )
             retryable_failed_exact = tuple(
                 day for day in failed
-                if retry_earliest <= day <= today
+                if retry_earliest <= day <= latest_finalized
             )
             exact = set(with_papers) | set(empty)
             if exact:

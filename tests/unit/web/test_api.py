@@ -8,6 +8,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 TOKEN = "A" * 43
 HOST = "127.0.0.1:43123"
@@ -143,6 +145,47 @@ def test_sync_start_accepts_scoped_retry_modes_and_requires_booleans() -> None:
             assert rejected.status == 400
 
     assert seen == [{"retry_failed_dates": True}, {"retry_missing_abstracts": True}]
+
+
+def test_sync_start_accepts_one_failed_date_and_validates_its_fields() -> None:
+    from arxiv_digest.web.api import ApiRouter
+
+    seen = []
+    router = ApiRouter(token=TOKEN, host=HOST, handlers={
+        "sync_start": lambda payload: seen.append(payload) or {"job_id": "sync_fixture"},
+    })
+    payload = {
+        "retry_failed_dates": True, "retry_category": "cs.CL",
+        "retry_date": "2026-08-20",
+    }
+    def dispatch(value):
+        return router.dispatch(_request(
+            "POST", "/api/v1/sync/start", origin=ORIGIN,
+            content_type="application/json", body=json.dumps(value).encode(),
+        ))
+
+    assert dispatch(payload).status == 200
+    for invalid in ("2026-02-30", "today", 1, None):
+        assert dispatch({**payload, "retry_date": invalid}).status == 400
+    for invalid in ("", 1, None, "x" * 65):
+        assert dispatch({**payload, "retry_category": invalid}).status == 400
+    assert seen == [payload]
+
+
+def test_sync_start_accepts_date_scoped_optional_abstract_retry() -> None:
+    from arxiv_digest.web.api import ApiRouter
+
+    seen = []
+    router = ApiRouter(token=TOKEN, host=HOST, handlers={
+        "sync_start": lambda payload: seen.append(payload) or {"job_id": "sync_fixture"},
+    })
+    payload = {"retry_missing_abstracts": True, "retry_date": "2026-08-20"}
+    response = router.dispatch(_request(
+        "POST", "/api/v1/sync/start", origin=ORIGIN,
+        content_type="application/json", body=json.dumps(payload).encode(),
+    ))
+    assert response.status == 200
+    assert seen == [payload]
 
 
 def test_settings_coverage_requires_profile_revision() -> None:
@@ -393,7 +436,10 @@ def test_known_route_wrong_method_is_405_and_unknown_route_is_404() -> None:
     assert unknown.status == 404
 
 
-def test_review_finish_all_route_dispatches_the_confirmed_projection_snapshot() -> None:
+@pytest.mark.parametrize("through_date", (None, "2026-08-19"))
+def test_review_finish_all_route_dispatches_the_confirmed_projection_snapshot(
+    through_date,
+) -> None:
     from arxiv_digest.web.api import ApiRouter
 
     seen = []
@@ -408,31 +454,55 @@ def test_review_finish_all_route_dispatches_the_confirmed_projection_snapshot() 
         },
     )
 
+    payload = {
+        "snapshot_revision": 9,
+        "profile_revision": 4,
+        "projection_revision": 6,
+    }
+    if through_date is not None:
+        payload["through_date"] = through_date
     response = router.dispatch(
         _request(
             "POST",
             "/api/v1/review/finish",
             origin=ORIGIN,
             content_type="application/json",
-            body=(
-                b'{"snapshot_revision":9,"profile_revision":4,'
-                b'"projection_revision":6}'
-            ),
+            body=json.dumps(payload).encode(),
         )
     )
 
     assert response.status == 200
-    assert seen == [
-        {
-            "snapshot_revision": 9,
-            "profile_revision": 4,
-            "projection_revision": 6,
-        }
-    ]
+    assert seen == [payload]
     assert _json(response)["data"] == {
         "reviewed_count": 2,
         "through_revision": 9,
     }
+
+
+def test_finish_all_route_preserves_confirmation_cutoff_through_runtime() -> None:
+    from arxiv_digest.application import _DefaultRuntime
+    from arxiv_digest.web.api import ApiRouter
+
+    seen = []
+    runtime = object.__new__(_DefaultRuntime)
+    runtime.review = SimpleNamespace(finish_all=lambda **kwargs: seen.append(kwargs))
+    router = ApiRouter(
+        token=TOKEN, host=HOST,
+        handlers={"review_finish_all": runtime._review_finish_all},
+    )
+    response = router.dispatch(_request(
+        "POST", "/api/v1/review/finish", origin=ORIGIN,
+        content_type="application/json",
+        body=json.dumps({
+            "snapshot_revision": 9, "profile_revision": 4,
+            "projection_revision": 6, "through_date": "2026-08-19",
+        }).encode(),
+    ))
+
+    assert response.status == 200
+    assert len(seen) == 1
+    assert seen[0]["through_date"] == date(2026, 8, 19)
+    assert seen[0]["through_revision"] == 9
 
 
 def test_pdf_route_keeps_nullable_save_version_separate_from_download_version() -> None:
@@ -927,6 +997,8 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
         page_number=1,
         page_count=1,
         total_cards=1,
+        abstracts_ready=1,
+        missing_abstracts=0,
     )
 
     projected = project_review_page(
@@ -941,6 +1013,8 @@ def test_review_page_projection_is_safe_complete_and_snapshot_relative() -> None
     assert "next_unreviewed_date" not in projected
     assert projected["profile_revision"] == 4
     assert projected["projection_revision"] == 9
+    assert projected["abstracts_ready"] == 1
+    assert projected["missing_abstracts"] == 0
     assert projected["cards"] == [
         {
             "event_id": 7,

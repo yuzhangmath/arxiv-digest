@@ -68,11 +68,44 @@ channel when transferring them.
 
 ## Review, Calendar, and coverage
 
-Review and Calendar require recovered daily-list membership. Atom and OAI are
-hidden support for metadata and version resolution; neither source can place a
-paper on a visible date without recovered daily-list membership. Failed,
-pending, or unavailable recovery leaves coverage gaps. Settings preserves and
-reports those gaps instead of filling them with another date source.
+Daily-list retrieval and visible dates stop at the app's finalization cutoff:
+20:00 America/New_York on each mailing date, with daylight saving time handled
+automatically. Records for later dates remain stored but stay out of Review,
+Calendar, coverage counts, and **Finish all** until eligible. This visibility
+rule does not delete saved failures or confirmed announcements.
+
+Review dates require recovered daily-list membership. Successful recovery still
+requires a verified complete daily list or a confirmed empty result for the
+category/date. Partial pages from a failed attempt do not create announcements.
+Missing abstracts do not prevent a confirmed date from being read or finished.
+Atom and OAI are hidden support for metadata and version resolution; neither
+source can place a paper on a visible date without recovered daily-list
+membership. Failed, pending, or unavailable recovery leaves coverage gaps.
+Settings preserves and reports those gaps instead of filling them with another
+date source.
+
+Calendar displays failed retrievals for active categories as **Retrieval failed**
+placeholders when a date has no confirmed announcements. These placeholders have
+no paper count or review status and cannot be opened as a review date. Dates
+with confirmed papers remain accessible and show **Some retrievals failed** if
+another category's daily-list retrieval failed. The count then describes confirmed
+papers only. Finishing those papers preserves the failed category's coverage gap.
+These indicators do not create paper announcements or change review progress;
+they update when recovery succeeds.
+
+Abstract counts are informational. A confirmed date remains available in Review,
+Calendar, navigation, **Finish date**, and **Finish all** when some abstracts are
+missing. Open that date to optionally use **Retry missing abstracts**, including
+for previously reviewed papers. Each recovered abstract is saved immediately;
+an interrupted or partly failed retry preserves earlier successes and review
+progress. Later attempts request only the remaining missing metadata. Recovering
+an abstract does not create an announcement or save a paper to Library.
+
+Retry results show recovered and remaining counts and reported errors for the
+selected date during the current app session. This result display is runtime
+state, excluded from portable backups. Recovered metadata is durable and included
+in backups as before. Abstract counts use stored metadata and active category
+coverage; these changes add no database migration or backup-format change.
 
 The setup candidate corpus does not populate Review, Calendar, or Library, and
 selecting a seed does not save it. Library is independent of category coverage:
@@ -104,6 +137,13 @@ Deleting cache files is safe. The app can fetch or recompute them. Cache
 deletion does not remove the profile, synchronization checkpoints, review
 progress, saved papers, or downloaded PDFs. A temporarily empty cache does not
 mean durable history was lost.
+
+The data directory also contains machine-local arXiv access state in
+`arxiv-cooldown.json`, with a private lock file. It records only a format version,
+retry deadline, and HTTP status. Restarting the app or clearing its cache does
+not cancel an active pause. This operational state is separate
+from the profile and database and is excluded from portable backups. An unreadable
+or invalid cooldown file pauses network access while leaving saved papers usable.
 
 ## PDF destinations
 
@@ -209,7 +249,8 @@ first. Portable exports do not include updater internals or private logs.
 ## What a portable backup excludes
 
 Portable backups exclude caches and raw responses, downloaded PDFs, runtime
-tokens and locks, launcher files and launcher error details, machine-specific
+tokens and locks, machine-local arXiv cooldown state, launcher files and launcher
+error details, machine-specific
 absolute PDF paths, and transient setup drafts. Restore uses a newly confirmed
 destination on the receiving computer. The portable content still includes
 personal interests and library state, so do not publish a backup.

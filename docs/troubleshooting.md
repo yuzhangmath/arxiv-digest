@@ -96,10 +96,41 @@ corpus**. If the same error returns after connectivity is restored, select
 ## Synchronization is offline or partial
 
 Cached Review and Library pages remain usable offline. Settings reports
-metadata synchronization separately from historical daily-list coverage.
-One failed category does not imply that
-all categories succeeded, and an interrupted recovery does not erase the
-metadata checkpoint. Retry after connectivity returns.
+metadata synchronization separately from historical daily-list coverage, and
+shows it as incomplete when a category has a saved failure, even if other arXiv
+requests succeeded. The checkpoint is the last
+completed metadata synchronization; a failed attempt does not advance or erase it.
+After connectivity returns, restart the app to retry ordinary synchronization.
+
+If arXiv reports HTTP 429 or an explicit “Rate exceeded” response, synchronization
+stops and Settings shows when requests can resume. A valid `Retry-After` response
+controls that deadline; otherwise the app uses a one-hour pause. This is a
+conservative local retry policy, not a guarantee that arXiv access will have
+recovered. Restarting the app or clearing its cache does not cancel the pause.
+Saved Review and Library papers remain available during it.
+
+After the pause expires, use the retry button next to one failed date in Settings.
+If that succeeds, retry the remaining failed dates. HTTP 406 is displayed as a
+request refusal with its status code, without assuming it means rate limiting.
+For a plain HTTP 406 from a daily-list page, an OAI ListRecords metadata page
+(including continuation pages), or an OAI GetRecord abstract lookup, the app can
+try the same URL once using the system `curl` executable. This fallback keeps
+the app's request pacing, cooldown, timeout, response-size and
+HTTPS redirect checks. A successful response goes directly through the normal
+parser; the app does not depend on a second Python request or cache warming.
+If `curl` is unavailable or cannot complete the request, the original HTTP
+failure remains available for diagnosis. No curl installation is performed.
+
+When a daily list's first page still returns plain HTTP 406, the app also tries
+that list once without inline abstracts (`abs=False`), as earlier versions
+requested it. Every recovery still requires a complete verified daily list.
+An explicit rate limit or active pause stops requests, including all fallbacks.
+These attempts do not guarantee that arXiv will accept the request, and waiting
+alone does not establish that the problem is resolved.
+
+The app does not mark dates it has not attempted as new failures. If a single
+date still fails after the pause expires, retain the date, HTTP status and time
+for an [arXiv support request](https://info.arxiv.org/help/contact.html).
 
 ## Review or Calendar has coverage gaps
 
@@ -109,10 +140,31 @@ records stay out of both views. A failed, pending, or permanently unavailable
 category/date remains one of the reported coverage gaps. Its papers do not
 appear under a substitute date.
 
+Calendar shows **Retrieval failed** for a failed date with no confirmed papers,
+without implying that the date was empty or reviewed. If confirmed papers are
+already available for that date, it remains clickable and shows **Some retrievals
+failed** alongside the confirmed paper count. Open Settings for coverage details
+and retry controls. After a successful retry, reopen Calendar to see the updated
+date.
+
 Settings shows the target, checked, with-papers, confirmed-empty, failed,
 pending, and unavailable counts per category. Retry a failed date while it is
 still in the supported recovery window. If it is outside that window, the gap
 remains visible and the queue remains incomplete.
+
+Missing abstracts are separate from daily-list coverage. You can read and save
+the confirmed papers and complete the date with **Finish date** or **Finish all**.
+Open the date to optionally choose **Retry missing abstracts**; this requests
+only missing abstracts for its confirmed papers, including previously reviewed
+papers. The date reports recovered and remaining counts and any errors, such as
+HTTP 406, during the current app session. A failed abstract request leaves the
+paper available to review. Each success is saved immediately, so another retry
+continues with the remaining papers. Restarting clears the retry-result display
+but preserves recovered abstracts and review progress.
+
+The curl fallback also applies to the OAI GetRecord requests made by **Retry
+missing abstracts**. It can help when HTTP 406 is preventing access to an
+existing abstract; it cannot supply an abstract absent from arXiv's response.
 
 The setup candidate corpus does not populate Review, Calendar, or Library.
 Library is independent of daily-list coverage: a saved paper stays saved when

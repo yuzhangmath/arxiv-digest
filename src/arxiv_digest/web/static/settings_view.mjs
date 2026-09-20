@@ -86,6 +86,22 @@ export class SettingsController {
     );
   }
 
+  retryFailedDate(category, day) {
+    if (typeof category !== "string" || !category.trim()) {
+      throw new TypeError("Invalid category");
+    }
+    assertIsoDate(day);
+    return this.api.json(
+      "settings-sync-start",
+      "/api/v1/sync/start",
+      jsonPost({
+        retry_failed_dates: true,
+        retry_date: day,
+        retry_category: category.trim(),
+      }),
+    );
+  }
+
   clearCache(confirmed) {
     if (confirmed !== true) throw new TypeError("Confirm cache deletion");
     return this.api.json(
@@ -305,15 +321,43 @@ function actionButton(document, label, action) {
   return node;
 }
 
+export function arxivAccessPauseText(access) {
+  if (access?.paused !== true) return "";
+  const message = typeof access.message === "string" && access.message.trim()
+    ? access.message.trim()
+    : "Requests to arXiv are paused.";
+  const retryAt = typeof access.retry_at === "string" ? new Date(access.retry_at) : null;
+  const deadline = retryAt && Number.isFinite(retryAt.valueOf())
+    ? ` Retry available after ${retryAt.toLocaleString()}.`
+    : "";
+  return `${message}${deadline} Cached Review and Library remain available.`;
+}
+
+function failedDateErrorText(code) {
+  if (code === "arxiv_rate_limited") return "Rate exceeded";
+  if (code === "catchup_http_429") return "Rate exceeded (HTTP 429)";
+  if (code === "catchup_http_406") return "arXiv refused the request (HTTP 406)";
+  const status = /^catchup_http_(\d{3})$/.exec(String(code));
+  if (status) return `Retrieval failed (HTTP ${status[1]})`;
+  if (code === "catchup_layout_changed") return "The daily-list format could not be read";
+  return "Retrieval failed";
+}
+
 function renderSyncSettings(document, model, actions) {
   const wrapper = element(document, "div", undefined, "settings-sync-sections");
   const online = model.online !== false;
   const synchronizing = model.synchronizing === true;
+  const paused = model.arxiv_access?.paused === true;
   const number = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
   const safeCodes = (values) => Array.isArray(values)
     ? values.filter((value) =>
       typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value))
     : [];
+  const metadataCategories = Array.isArray(model.metadata_sync?.categories)
+    ? model.metadata_sync.categories
+    : [];
+  const metadataIncomplete = metadataCategories.some((category) =>
+    category?.status === "failed" || safeCodes(category?.error_codes).length > 0);
 
   const metadata = element(document, "section", undefined, "settings-section");
   metadata.append(
@@ -321,11 +365,15 @@ function renderSyncSettings(document, model, actions) {
     element(
       document,
       "p",
-      synchronizing
+      paused
+        ? "Requests to arXiv are paused."
+        : synchronizing
         ? "Metadata synchronization is running."
-        : online
-        ? "Metadata synchronization is online."
-        : "Synchronization offline. Cached Review and Library remain available.",
+        : !online
+        ? "Synchronization offline. Cached Review and Library remain available."
+        : metadataIncomplete
+        ? "Metadata synchronization is incomplete."
+        : "Metadata synchronization is online.",
       online ? "sync-online" : "sync-offline",
     ),
     element(
@@ -334,9 +382,13 @@ function renderSyncSettings(document, model, actions) {
       `Metadata checkpoints: ${number(model.metadata_sync?.checkpoint_count)}.`,
     ),
   );
-  for (const category of Array.isArray(model.metadata_sync?.categories)
-    ? model.metadata_sync.categories
-    : []) {
+  if (paused) {
+    const notice = element(document, "p", arxivAccessPauseText(model.arxiv_access), "arxiv-access-status");
+    notice.setAttribute("role", "status");
+    notice.setAttribute("aria-live", "polite");
+    metadata.append(notice);
+  }
+  for (const category of metadataCategories) {
     if (typeof category?.category !== "string") continue;
     const card = element(document, "article", undefined, "category-sync-state");
     card.append(element(document, "h3", category.category));
@@ -351,7 +403,10 @@ function renderSyncSettings(document, model, actions) {
     );
     const codes = safeCodes(category.error_codes);
     if (codes.length) {
-      card.append(element(document, "p", `Error codes: ${codes.join(", ")}.`, "error-banner"));
+      const explanation = codes.includes("arxiv_http_406")
+        ? "arXiv refused the metadata request (HTTP 406). "
+        : "";
+      card.append(element(document, "p", `${explanation}Error codes: ${codes.join(", ")}.`, "error-banner"));
     }
     metadata.append(card);
   }
@@ -402,6 +457,28 @@ function renderSyncSettings(document, model, actions) {
         typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value))
       : [];
     retryableCount += retryable.length;
+    const errors = new Map((Array.isArray(category.failed_date_errors)
+      ? category.failed_date_errors : [])
+      .filter((entry) => typeof entry?.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(entry.date))
+      .map((entry) => [entry.date, entry.error_code]));
+    const failedDates = [...new Set([...errors.keys(), ...retryable])].sort();
+    if (failedDates.length) {
+      const list = element(document, "ul", undefined, "failed-daily-list-dates");
+      for (const day of failedDates) {
+        const row = element(document, "li");
+        row.append(element(document, "span", `${day} — ${failedDateErrorText(errors.get(day))}. `));
+        if (retryable.includes(day)) {
+          const retry = actionButton(document, "Retry", () => {
+            if (!retry.disabled) actions.retryFailedDate?.(category.category, day);
+          });
+          retry.setAttribute("aria-label", `Retry ${category.category} ${day}`);
+          retry.disabled = synchronizing || paused || model.daily_list_retry?.status === "running";
+          row.append(retry);
+        }
+        list.append(row);
+      }
+      card.append(list);
+    }
 
     const coverageLabel = element(document, "label", `Extend ${category.category} coverage to`);
     const coverageInput = element(document, "input");
@@ -458,9 +535,9 @@ function renderSyncSettings(document, model, actions) {
         : synchronizing
         ? `Retrying ${count} failed daily-list ${count === 1 ? "date" : "dates"}…`
         : `Retry ${count} failed daily-list ${count === 1 ? "date" : "dates"}`,
-      () => actions.retrySynchronization?.(count),
+      () => { if (!retry.disabled) actions.retrySynchronization?.(count); },
     );
-    retry.disabled = synchronizing || retryRunning;
+    retry.disabled = synchronizing || retryRunning || paused;
     coverage.append(retry);
   }
   wrapper.append(coverage);

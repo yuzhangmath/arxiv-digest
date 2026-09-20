@@ -19,6 +19,9 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 @pytest.fixture(autouse=True)
 def deny_non_loopback_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Python socket guards do not cover curl's subprocess networking. Transport
+    # tests opt back in only by supplying their own offline fake executable.
+    monkeypatch.setattr("arxiv_digest.curl_transport._find_curl", lambda: None)
     original_connect = socket.socket.connect
     original_getaddrinfo = socket.getaddrinfo
     original_gethostbyname = socket.gethostbyname

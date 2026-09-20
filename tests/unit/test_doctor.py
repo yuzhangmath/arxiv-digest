@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from arxiv_digest.paths import resolve_paths
 from arxiv_digest.profile import (
@@ -25,6 +27,31 @@ def _paths(tmp_path: Path):
     )
 
 
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    (
+        ("arxiv_rate_limited", "arxiv_rate_limited"),
+        ("arxiv_cooldown_unavailable", "arxiv_cooldown_unavailable"),
+        ("catchup_http_406", "catchup_http_406"),
+        ("catchup_http_503", "catchup_http_503"),
+        ("arxiv_http_406", "arxiv_http_406"),
+        ("arxiv_http_503", "arxiv_http_503"),
+        ("arxiv_http_406_private_detail", "sync_error"),
+        ("arxiv_http_999", "sync_error"),
+        ("arxiv_http_0406", "sync_error"),
+        ("catchup_http_406_private_detail", "sync_error"),
+        ("catchup_http_999", "sync_error"),
+        ("catchup_http_0406", "sync_error"),
+    ),
+)
+def test_doctor_retains_only_bounded_http_and_cooldown_error_codes(
+    code: str, expected: str,
+) -> None:
+    from arxiv_digest.doctor import _redacted_sync_error_code
+
+    assert _redacted_sync_error_code(code) == expected
+
+
 def test_fresh_doctor_is_redacted_read_only_and_creates_nothing(
     tmp_path: Path,
 ) -> None:
@@ -40,6 +67,80 @@ def test_fresh_doctor_is_redacted_read_only_and_creates_nothing(
     assert "not initialized" in rendered.casefold()
     assert str(root) not in rendered
     assert not root.exists()
+
+
+def test_doctor_hides_unfinalized_dates_until_the_new_york_cutoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arxiv_digest.doctor import inspect_doctor
+
+    paths = _paths(tmp_path)
+    paths.ensure()
+    ProfileRepository(paths.profile_path, paths.profile_lock_path).save_atomic(
+        Profile(
+            schema_version=2,
+            revision=1,
+            category_coverage=(ProfileCategory("cs.SE", date(2026, 9, 19)),),
+            keywords=(),
+            phrases=(),
+            authors=(),
+            seed_papers=(),
+            pdf_destination=PdfDestination("downloads", tmp_path / "Downloads"),
+        ),
+        expected_revision=None,
+    )
+    connection = open_database(paths.database_path)
+    connection.execute(
+        """INSERT INTO category_sync_state(
+               category, set_spec, coverage_start, status, last_error_code
+           ) VALUES ('cs.SE', 'cs:SE', '2026-09-19', 'failed', 'arxiv_http_503')"""
+    )
+    connection.executemany(
+        """INSERT INTO catchup_days(
+               category, daily_list_date, status, error_code
+           ) VALUES ('cs.SE', ?, ?, ?)""",
+        (
+            ("2026-09-19", "empty", None),
+            ("2026-09-20", "failed", "catchup_http_406"),
+            ("2026-09-21", "pending", None),
+        ),
+    )
+    connection.commit()
+    connection.close()
+    stored_database = paths.database_path.read_bytes()
+    stored_profile = paths.profile_path.read_bytes()
+
+    class ObservedDateTime(datetime):
+        observed_at = datetime(2026, 9, 20, 23, 59, 59, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.observed_at.astimezone(tz)
+
+    monkeypatch.setattr("arxiv_digest.doctor.datetime", ObservedDateTime)
+    before = inspect_doctor(paths)
+
+    assert before.database_status == "ok"
+    assert before.daily_list_target_count == 1
+    assert before.daily_list_checked_count == 1
+    assert before.daily_list_empty_count == 1
+    assert before.daily_list_failed_count == 0
+    assert before.daily_list_pending_count == 0
+    assert before.daily_list_gap_count == 0
+    assert before.sync_error_codes == ("arxiv_http_503",)
+
+    ObservedDateTime.observed_at = datetime(2026, 9, 21, tzinfo=timezone.utc)
+    finalized = inspect_doctor(paths)
+
+    assert finalized.daily_list_target_count == 2
+    assert finalized.daily_list_checked_count == 2
+    assert finalized.daily_list_empty_count == 1
+    assert finalized.daily_list_failed_count == 1
+    assert finalized.daily_list_pending_count == 0
+    assert finalized.daily_list_gap_count == 1
+    assert finalized.sync_error_codes == ("arxiv_http_503", "catchup_http_406")
+    assert paths.database_path.read_bytes() == stored_database
+    assert paths.profile_path.read_bytes() == stored_profile
 
 
 def test_initialized_doctor_reports_only_allowlisted_aggregate_state(

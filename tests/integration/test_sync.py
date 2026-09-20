@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
+from urllib.error import HTTPError
 
 import pytest
 
@@ -1248,13 +1249,106 @@ def test_supported_coverage_bounds_use_one_clock_read_at_eastern_midnight(
     )
 
 
-def test_explicit_empty_current_eastern_day_stays_pending_before_finalization(
+@pytest.mark.parametrize("explicit", (False, True))
+def test_unfinalized_daily_list_is_not_created_or_fetched(
+    tmp_path: Path, explicit: bool,
+) -> None:
+    store, oai, atom, catchup, service = _service(tmp_path)
+    current_day = date(2026, 8, 22)
+    config = CategoryConfig("cs.SE", "cs:SE", current_day)
+    atom.values[config.category].append(_empty_atom(config.category, 22))
+    oai.first[config.oai_set_spec].append(_page(22))
+
+    report = service.sync(
+        (config,),
+        catchup_dates={config.category: (current_day,)} if explicit else None,
+    )
+
+    assert catchup.calls == []
+    assert store.catchup_day_records(config.category) == ()
+    assert service.has_pending_daily_list_work((config,)) is False
+    assert report.target_dates == report.checked_dates == report.failed_dates == 0
+    assert report.daily_list_status == "idle"
+
+
+@pytest.mark.parametrize(
+    "mailing_date,cutoff",
+    (
+        (date(2026, 9, 20), datetime(2026, 9, 21, 0, tzinfo=timezone.utc)),
+        (date(2026, 11, 20), datetime(2026, 11, 21, 1, tzinfo=timezone.utc)),
+    ),
+)
+def test_saved_unfinalized_failure_is_hidden_and_retry_waits_for_cutoff(
+    tmp_path: Path, mailing_date: date, cutoff: datetime,
+) -> None:
+    store, oai, atom, catchup, _ = _service(tmp_path)
+    observed_at = {"value": cutoff - timedelta(seconds=1)}
+    service = SyncService(
+        store, oai, atom, catchup, clock=lambda: observed_at["value"],
+    )
+    config = CategoryConfig("cs.SE", "cs:SE", mailing_date)
+    store.ensure_category_state(config.category, config.oai_set_spec, mailing_date)
+    store.apply_catchup_day(
+        CatchupDay(
+            category=config.category,
+            mailing_date=mailing_date,
+            status=EnrichmentStatus.FAILED,
+            pages=(),
+            error_code="catchup_http_406",
+            error_message="Synthetic HTTP failure before finalization.",
+        ),
+        (),
+        observed_at["value"],
+    )
+    records_before = store.catchup_day_records(config.category)
+    attempts: list[tuple[str, date]] = []
+
+    report = service.retry_failed_dates(
+        (config,), {config.category: (mailing_date,)},
+        attempted=lambda category, day: attempts.append((category, day)),
+    )
+
+    assert catchup.calls == attempts == []
+    assert store.catchup_day_records(config.category) == records_before
+    assert report.target_dates == report.checked_dates == report.failed_dates == 0
+    assert report.missing_exact_dates == ()
+    assert report.categories[0].retryable_failed_exact_dates == ()
+    assert report.categories[0].daily_list_errors == ()
+    assert report.daily_list_status == "idle"
+    assert service.has_pending_daily_list_work((config,)) is False
+
+    observed_at["value"] = cutoff
+    report = service.progress((config,))
+    assert report.failed_dates == 1
+    assert report.categories[0].retryable_failed_exact_dates == (mailing_date,)
+    assert service.has_pending_daily_list_work((config,)) is True
+    catchup.values[(config.category, mailing_date)] = CatchupDay(
+        category=config.category,
+        mailing_date=mailing_date,
+        status=EnrichmentStatus.EMPTY,
+        pages=(),
+        error_code=None,
+        error_message=None,
+    )
+
+    report = service.retry_failed_dates(
+        (config,), {config.category: (mailing_date,)},
+        attempted=lambda category, day: attempts.append((category, day)),
+    )
+
+    assert catchup.calls == attempts == [(config.category, mailing_date)]
+    assert report.empty_dates == 1
+    assert report.failed_dates == 0
+    assert service.has_pending_daily_list_work((config,)) is False
+
+
+def test_saved_unfinalized_empty_day_is_hidden_without_changing_its_record(
     tmp_path: Path,
 ) -> None:
     store, oai, atom, catchup, service = _service(tmp_path)
     current_day = date(2026, 8, 22)
     config = CategoryConfig("cs.SE", "cs:SE", current_day)
-    catchup.values[(config.category, current_day)] = CatchupDay(
+    result = CatchupDay(
         category=config.category,
         mailing_date=current_day,
         status=EnrichmentStatus.EMPTY,
@@ -1262,6 +1356,9 @@ def test_explicit_empty_current_eastern_day_stays_pending_before_finalization(
         error_code=None,
         error_message=None,
     )
+    store.ensure_category_state(config.category, config.oai_set_spec, current_day)
+    store.apply_catchup_day(result, (), NOW)
+    records_before = store.catchup_day_records(config.category)
     atom.values[config.category].append(_empty_atom(config.category, 22))
     oai.first[config.oai_set_spec].append(_page(22))
 
@@ -1270,20 +1367,21 @@ def test_explicit_empty_current_eastern_day_stays_pending_before_finalization(
         catchup_dates={config.category: (current_day,)},
     )
 
-    record = store.catchup_day_records(config.category)[0]
-    assert record.status.value == "pending"
+    assert catchup.calls == []
+    assert store.catchup_day_records(config.category) == records_before
+    assert report.target_dates == 0
     assert report.checked_dates == 0
-    assert report.pending_dates == 1
+    assert report.pending_dates == 0
     assert report.empty_dates == 0
 
 
-def test_nonempty_current_day_is_accepted_and_refreshed_before_finalization(
+def test_saved_unfinalized_complete_day_is_hidden_until_cutoff(
     tmp_path: Path,
 ) -> None:
     store, oai, atom, catchup, service = _service(tmp_path)
     current_day = date(2026, 8, 22)
     config = CategoryConfig("cs.SE", "cs:SE", current_day)
-    catchup.values[(config.category, current_day)] = CatchupDay(
+    result = CatchupDay(
         category=config.category,
         mailing_date=current_day,
         status=EnrichmentStatus.COMPLETE,
@@ -1307,6 +1405,10 @@ def test_nonempty_current_day_is_accepted_and_refreshed_before_finalization(
         error_code=None,
         error_message=None,
     )
+    store.ensure_category_state(config.category, config.oai_set_spec, current_day)
+    store.apply_catchup_day(result, catchup_observations(result, NOW), NOW)
+    records_before = store.catchup_day_records(config.category)
+    events_before = store.events_for_date(current_day)
     atom.values[config.category].append(_empty_atom(config.category, 22))
     oai.first[config.oai_set_spec].append(_page(22))
 
@@ -1315,47 +1417,23 @@ def test_nonempty_current_day_is_accepted_and_refreshed_before_finalization(
         catchup_dates={config.category: (current_day,)},
     )
 
-    assert store.catchup_day_records(config.category)[0].status.value == "complete"
-    assert len(store.events_for_date(current_day)) == 1
-    assert report.checked_dates == 1
-    assert report.dates_with_papers == 1
+    assert catchup.calls == []
+    assert store.catchup_day_records(config.category) == records_before
+    assert store.events_for_date(current_day) == events_before
+    assert report.target_dates == 0
+    assert report.checked_dates == 0
+    assert report.dates_with_papers == 0
     assert report.pending_dates == 0
 
-    catchup.values[(config.category, current_day)] = CatchupDay(
-        category=config.category,
-        mailing_date=current_day,
-        status=EnrichmentStatus.COMPLETE,
-        pages=(
-            CatchupPage(
-                category=config.category,
-                mailing_date=current_day,
-                page=1,
-                total_pages=1,
-                entries=(
-                    CatchupEntry(
-                        metadata=_paper("2608.04016"),
-                        section=AnnounceType.NEW,
-                        mailing_date=current_day,
-                        position=0,
-                    ),
-                ),
-                raw_sha256="5" * 64,
-            ),
-        ),
-        error_code=None,
-        error_message=None,
+    finalized_service = SyncService(
+        store, oai, atom, catchup,
+        clock=lambda: datetime(2026, 8, 23, 0, tzinfo=timezone.utc),
     )
-    atom.values[config.category].append(_empty_atom(config.category, 22))
-    oai.first[config.oai_set_spec].append(_page(22))
+    report = finalized_service.progress((config,))
 
-    service.sync(
-        (config,),
-        catchup_dates={config.category: (current_day,)},
-    )
-
-    assert tuple(
-        event.arxiv_id for event in store.events_for_date(current_day)
-    ) == ("2608.04016",)
+    assert report.target_dates == report.checked_dates == report.dates_with_papers == 1
+    assert store.catchup_day_records(config.category) == records_before
+    assert store.events_for_date(current_day) == events_before
 
 
 def test_finalized_current_day_empty_is_terminal_without_next_day_refetch(
@@ -1408,10 +1486,7 @@ def test_pending_current_day_is_resumed_and_finalized_after_the_day_closes(
     pending = date(2026, 8, 21)
     store.ensure_catchup_targets(config.category, (pending,))
 
-    assert service._eligible_catchup_dates(config, None) == (
-        pending,
-        date(2026, 8, 22),
-    )
+    assert service._eligible_catchup_dates(config, None) == (pending,)
 
     catchup.values[(config.category, pending)] = CatchupDay(
         category=config.category,
@@ -1423,9 +1498,7 @@ def test_pending_current_day_is_resumed_and_finalized_after_the_day_closes(
     )
     assert service._sync_catchup_day(config, pending) is True
 
-    assert service._eligible_catchup_dates(config, None) == (
-        date(2026, 8, 22),
-    )
+    assert service._eligible_catchup_dates(config, None) == ()
 
 
 def test_atom_enrichment_alone_does_not_claim_exact_mailing_coverage(
@@ -1449,7 +1522,7 @@ def test_daily_list_preflight_detects_a_missing_required_date(
     tmp_path: Path,
 ) -> None:
     _store, _oai, _atom, _catchup, service = _service(tmp_path)
-    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 22))
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 21))
 
     assert service.has_pending_daily_list_work((config,)) is True
 
@@ -1790,7 +1863,263 @@ def _recover_retry_papers(
     store.apply_catchup_day(day, catchup_observations(day, NOW), NOW)
 
 
-def test_missing_abstract_selection_honors_unreviewed_active_daily_lists(
+@pytest.mark.parametrize("retry_only", (False, True))
+def test_throttled_daily_list_stops_remaining_dates_categories_and_metadata(
+    tmp_path: Path, retry_only: bool,
+) -> None:
+    from arxiv_digest.arxiv_access import ArxivRateLimited
+
+    store, oai, atom, catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 18))
+    other = CategoryConfig("cs.AI", "cs:AI", date(2026, 8, 18))
+    first, blocked, later = (date(2026, 8, day) for day in (18, 19, 20))
+    catchup.values[(config.category, first)] = CatchupDay(
+        config.category, first, EnrichmentStatus.COMPLETE,
+        (CatchupPage(
+            category=config.category, mailing_date=first, page=1, total_pages=1,
+            entries=(CatchupEntry(_paper(), AnnounceType.NEW, first, 0),),
+            raw_sha256="c" * 64,
+        ),),
+        None, None,
+    )
+    catchup.values[(config.category, blocked)] = ArxivRateLimited(
+        retry_at=NOW + timedelta(hours=1), http_status=429,
+    )
+    requested = {config.category: (first, blocked, later), other.category: (later,)}
+    attempts: list[tuple[str, date]] = []
+    daily_list_completed: list[bool] = []
+    callback = lambda category, day: attempts.append((category, day))
+
+    if retry_only:
+        report = service.retry_failed_dates((config, other), requested, attempted=callback)
+    else:
+        report = service.sync(
+            (config, other), catchup_dates=requested, attempted=callback,
+            daily_list_complete=lambda: daily_list_completed.append(True),
+        )
+
+    assert catchup.calls == attempts == [(config.category, first), (config.category, blocked)]
+    assert atom.calls == oai.first_calls == oai.backfill_calls == []
+    assert daily_list_completed == []
+    assert report.offline is False
+    assert report.categories[0].dates_with_papers == (first,)
+    assert report.categories[0].failed_dates == (blocked,)
+    records = {item.daily_list_date: item for item in store.catchup_day_records(config.category)}
+    assert records[first].status.value == "complete"
+    assert store.events_for_date(first)[0].arxiv_id == _paper().arxiv_id
+    assert records[blocked].error_code == "arxiv_rate_limited"
+    assert records[later].status.value == "pending"
+    assert records[later].attempted_at is None
+    assert store.category_sync_state(other.category).completed_through_utc is None
+
+
+@pytest.mark.parametrize("retry_only", (False, True))
+@pytest.mark.parametrize("blocked_kind", ("cooldown", "unavailable"))
+def test_blocked_access_preserves_existing_daily_list_errors_without_attempt_callback(
+    tmp_path: Path, retry_only: bool, blocked_kind: str,
+) -> None:
+    from arxiv_digest.arxiv_access import ArxivCooldownUnavailable, ArxivRateLimited
+
+    store, oai, atom, catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 18))
+    requested = (date(2026, 8, 19), date(2026, 8, 20))
+    store.ensure_category_state(config.category, config.oai_set_spec, config.coverage_start)
+    for day in requested:
+        store.apply_catchup_day(
+            CatchupDay(config.category, day, EnrichmentStatus.FAILED, (),
+                       "catchup_http_406", "The arXiv catch-up request returned HTTP 406."),
+            (), NOW - timedelta(days=1),
+        )
+    before = store.catchup_day_records(config.category)
+    error = (
+        ArxivRateLimited(retry_at=NOW + timedelta(hours=1), http_status=429, attempted=False)
+        if blocked_kind == "cooldown" else ArxivCooldownUnavailable()
+    )
+    catchup.values[(config.category, requested[0])] = error
+    attempts: list[tuple[str, date]] = []
+    callback = lambda category, day: attempts.append((category, day))
+
+    if retry_only:
+        service.retry_failed_dates((config,), {config.category: requested}, attempted=callback)
+    else:
+        service.sync((config,), catchup_dates={config.category: requested}, attempted=callback)
+
+    assert attempts == []
+    assert len(catchup.calls) == 1
+    assert atom.calls == oai.first_calls == oai.backfill_calls == []
+    assert store.catchup_day_records(config.category) == before
+
+
+@pytest.mark.parametrize("phase", ("atom", "incremental", "backfill", "next_page"))
+def test_throttled_metadata_stops_later_source_requests_and_keeps_checkpoint(
+    tmp_path: Path, phase: str,
+) -> None:
+    from arxiv_digest.arxiv_access import ArxivRateLimited
+
+    store, oai, atom, _catchup, service = _service(tmp_path)
+    configs = (
+        CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 18)),
+        CategoryConfig("cs.AI", "cs:AI", date(2026, 8, 18)),
+    )
+    error = ArxivRateLimited(retry_at=NOW + timedelta(hours=1), http_status=429)
+    for config in configs:
+        atom.values[config.category] = [_empty_atom(config.category, 21)]
+        oai.first[config.oai_set_spec] = [_page(21)]
+        store.ensure_category_state(config.category, config.oai_set_spec, config.coverage_start)
+        store.set_pending_backfill(config.category, date(2026, 8, 17), config.coverage_start)
+        oai.backfill[config.oai_set_spec] = [_page(21)]
+    if phase == "atom":
+        atom.values[configs[0].category] = [error]
+    elif phase == "incremental":
+        oai.first[configs[0].oai_set_spec] = [error]
+    elif phase == "backfill":
+        oai.backfill[configs[0].oai_set_spec] = [error]
+    else:
+        oai.first[configs[0].oai_set_spec] = [_page(21, token="fixture-next")]
+        oai.next["fixture-next"] = [error]
+
+    report = service.sync(configs, catchup_dates={})
+
+    if phase == "atom":
+        assert atom.calls == [configs[0].category]
+        assert oai.first_calls == oai.backfill_calls == []
+    elif phase == "backfill":
+        assert len(oai.first_calls) == 2
+        assert len(oai.backfill_calls) == 1
+        assert report.categories[0].historical_backfill.last_error_code == "arxiv_rate_limited"
+        assert store.category_sync_state(configs[1].category).pending_backfill_start is not None
+    else:
+        assert len(oai.first_calls) == 1
+        assert oai.backfill_calls == []
+        assert report.categories[0].metadata_sync.last_error_code == "arxiv_rate_limited"
+        assert store.category_sync_state(configs[0].category).completed_through_utc is None
+        assert store.category_sync_state(configs[1].category).completed_through_utc is None
+
+
+@pytest.mark.parametrize("already_blocked", (False, True))
+def test_missing_abstract_retry_stops_on_throttling_and_preserves_prior_success(
+    tmp_path: Path, already_blocked: bool,
+) -> None:
+    from arxiv_digest.arxiv_access import ArxivRateLimited
+
+    store, oai, _atom, _catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 18))
+    papers = [replace(_paper(f"2608.0400{number}"), abstract="") for number in (1, 2, 3)]
+    _recover_retry_papers(store, config, date(2026, 8, 20), *papers)
+    oai.records[papers[0].arxiv_id] = [_article(arxiv_id=papers[0].arxiv_id)]
+    oai.records[papers[1].arxiv_id] = [ArxivRateLimited(
+        retry_at=NOW + timedelta(hours=1), http_status=429, attempted=not already_blocked,
+    )]
+    attempts: list[str] = []
+
+    report = service.retry_missing_abstracts((config,), attempted=attempts.append)
+
+    assert report.offline is False
+    assert oai.record_calls == [paper.arxiv_id for paper in papers[:2]]
+    assert attempts == [paper.arxiv_id for paper in papers[:1 if already_blocked else 2]]
+    assert store.article_metadata(papers[0].arxiv_id).abstract == _paper().abstract
+    assert store.article_metadata(papers[1].arxiv_id).abstract == ""
+    assert store.article_metadata(papers[2].arxiv_id).abstract == ""
+    assert report.abstract_retry is not None
+    assert report.abstract_retry.attempted == (1 if already_blocked else 2)
+    assert report.abstract_retry.total == 3
+    assert report.abstract_retry.recovered == 1
+    assert report.abstract_retry.remaining == 2
+    assert report.abstract_retry.error_codes == ("arxiv_rate_limited",)
+
+
+def test_date_abstract_retry_reports_partial_recovery_and_retries_only_missing_ids(
+    tmp_path: Path,
+) -> None:
+    store, oai, atom, catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 18))
+    inactive = CategoryConfig("cs.AI", "cs:AI", config.coverage_start)
+    day = date(2026, 8, 20)
+    first, second, other_day, other_category = (
+        replace(_paper(f"2608.0400{number}"), abstract="") for number in (1, 2, 3, 4)
+    )
+    _recover_retry_papers(store, config, day, first, second, _paper("2608.04005"))
+    _recover_retry_papers(store, config, date(2026, 8, 21), other_day)
+    _recover_retry_papers(store, inactive, day, other_category)
+    oai.records[first.arxiv_id] = [_article(arxiv_id=first.arxiv_id)]
+    oai.records[second.arxiv_id] = [
+        HTTPError("https://example.invalid/private", 406, "private transport detail", {}, None),
+        _article(arxiv_id=second.arxiv_id),
+    ]
+    committed: list[tuple[str, bool]] = []
+
+    def observe_attempt(arxiv_id: str) -> None:
+        committed.append((arxiv_id, bool(store.article_metadata(arxiv_id).abstract)))
+
+    report = service.retry_missing_abstracts((config,), day=day, attempted=observe_attempt)
+
+    assert committed == [(first.arxiv_id, True), (second.arxiv_id, False)]
+    assert oai.record_calls == [first.arxiv_id, second.arxiv_id]
+    outcome = report.abstract_retry
+    assert outcome is not None
+    assert (outcome.attempted, outcome.total, outcome.recovered, outcome.remaining) == (2, 2, 1, 1)
+    assert outcome.error_codes == ("arxiv_http_406",)
+    assert "private" not in repr(report)
+    assert not report.offline
+    assert atom.calls == catchup.calls == oai.first_calls == oai.backfill_calls == []
+
+    retried = service.retry_missing_abstracts((config,), day=day)
+
+    assert oai.record_calls == [first.arxiv_id, second.arxiv_id, second.arxiv_id]
+    assert retried.abstract_retry is not None
+    assert (retried.abstract_retry.total, retried.abstract_retry.recovered, retried.abstract_retry.remaining) == (1, 1, 0)
+    assert retried.abstract_retry.error_codes == ()
+    assert store.article_metadata(other_day.arxiv_id).abstract == ""
+    assert store.article_metadata(other_category.arxiv_id).abstract == ""
+    assert service.retry_missing_abstracts((config,), day=day).abstract_retry.total == 0
+
+
+def test_abstract_retry_with_no_targets_reports_zero_requests(tmp_path: Path) -> None:
+    _store, oai, _atom, _catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 18))
+
+    report = service.retry_missing_abstracts((config,), day=date(2026, 8, 20))
+
+    assert report.abstract_retry is not None
+    outcome = report.abstract_retry
+    assert (outcome.attempted, outcome.total, outcome.recovered, outcome.remaining) == (0, 0, 0, 0)
+    assert outcome.error_codes == ()
+    assert oai.record_calls == []
+
+
+def test_metadata_http_failure_preserves_only_the_status_code(tmp_path: Path) -> None:
+    store, oai, atom, _catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 18))
+    atom.values[config.category] = [_empty_atom(config.category, 21)]
+    oai.first[config.oai_set_spec] = [
+        HTTPError("https://example.invalid/private", 406, "private transport detail", {}, None),
+    ]
+
+    report = service.sync((config,), catchup_dates={})
+
+    progress = report.categories[0].metadata_sync
+    assert progress.last_error_code == "arxiv_http_406"
+    assert progress.last_error_message == "The arXiv request returned HTTP 406."
+    assert "private" not in repr(store.category_sync_state(config.category))
+
+
+def _seed_historical_finished_date(tmp_path: Path, store: Store, day: date) -> None:
+    """Represent review progress saved before abstract readiness was required."""
+    reviewed_at = NOW.isoformat().replace("+00:00", "Z")
+    with open_database(tmp_path / "state.sqlite3") as connection:
+        connection.execute(
+            "UPDATE canonical_events SET reviewed_at = ? WHERE daily_list_date = ?",
+            (reviewed_at, day.isoformat()),
+        )
+        connection.execute(
+            """INSERT INTO review_date_state(
+                   daily_list_date, last_finished_at, last_finished_revision
+               ) VALUES (?, ?, ?)""",
+            (day.isoformat(), reviewed_at, store.review_queue_revision()),
+        )
+
+
+def test_missing_abstract_selection_includes_unreviewed_and_reviewed_active_daily_lists(
     tmp_path: Path,
 ) -> None:
     store, _oai, _atom, _catchup, _service_instance = _service(tmp_path)
@@ -1813,10 +2142,7 @@ def test_missing_abstract_selection_honors_unreviewed_active_daily_lists(
         store, config, date(2026, 8, 21), blank,
         replace(_paper("2608.04006"), abstract=""),
     )
-    store.finish_date(
-        date(2026, 8, 21), through_revision=store.review_queue_revision(),
-        finished_at=NOW,
-    )
+    _seed_historical_finished_date(tmp_path, store, date(2026, 8, 21))
     deleted = replace(_paper("2608.04007"), abstract="")
     _recover_retry_papers(store, config, date(2026, 8, 22), blank, deleted)
     with open_database(tmp_path / "state.sqlite3") as connection:
@@ -1830,11 +2156,14 @@ def test_missing_abstract_selection_honors_unreviewed_active_daily_lists(
 
     assert store.unreviewed_papers_missing_abstracts(
         active_configs=(config,)
-    ) == (blank.arxiv_id, whitespace.arxiv_id)
+    ) == (blank.arxiv_id, whitespace.arxiv_id, "2608.04006")
+    assert store.list_review_dates(active_configs=(config,)) == tuple(
+        date(2026, 8, day) for day in (20, 21, 22)
+    )
     assert store.unreviewed_papers_missing_abstracts(active_configs=()) == ()
     assert store.unreviewed_papers_missing_abstracts(
         active_configs=(replace(config, coverage_start=date(2026, 8, 21)),)
-    ) == (blank.arxiv_id,)
+    ) == (blank.arxiv_id, "2608.04006")
 
 
 def test_missing_abstract_retry_hydrates_once_without_changing_review_or_sync(
@@ -1844,19 +2173,17 @@ def test_missing_abstract_retry_hydrates_once_without_changing_review_or_sync(
     config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 1))
     blank = replace(_paper(), abstract="")
     _recover_retry_papers(store, config, date(2026, 8, 19), blank)
-    store.finish_date(
-        date(2026, 8, 19), through_revision=store.review_queue_revision(),
-        finished_at=NOW,
-    )
+    _seed_historical_finished_date(tmp_path, store, date(2026, 8, 19))
     _recover_retry_papers(store, config, date(2026, 8, 20), blank)
     _recover_retry_papers(store, config, date(2026, 8, 21), blank)
     store.save_paper(blank.arxiv_id, None)
-    events_before = tuple(
-        store.events_for_date(day)[0] for day in store.list_review_dates()
-    )
+    confirmed_dates = tuple(date(2026, 8, day) for day in (19, 20, 21))
+    events_before = tuple(store.events_for_date(day)[0] for day in confirmed_dates)
+    assert store.list_review_dates(active_configs=(config,)) == confirmed_dates
     state_before = store.category_sync_state(config.category)
     coverage_before = store.catchup_day_records(config.category)
     revision_before = store.review_queue_revision()
+    projection_before = store.review_revisions()[1]
     article = _article(versions=(_version(1, 49), _version(2, 50)))
     oai.records[blank.arxiv_id] = [article]
     attempts: list[str] = []
@@ -1870,6 +2197,8 @@ def test_missing_abstract_retry_hydrates_once_without_changing_review_or_sync(
     assert store.saved_paper_metadata() == (article.metadata,)
     assert store.unreviewed_papers_missing_abstracts(active_configs=(config,)) == ()
     assert store.review_queue_revision() == revision_before
+    assert store.review_revisions()[1] > projection_before
+    assert store.list_review_dates(active_configs=(config,)) == confirmed_dates
     assert store.category_sync_state(config.category) == state_before
     assert store.catchup_day_records(config.category) == coverage_before
     assert oai.first_calls == oai.backfill_calls == atom.calls == catchup.calls == []
@@ -1886,6 +2215,26 @@ def test_missing_abstract_retry_hydrates_once_without_changing_review_or_sync(
     ]
     assert service.retry_missing_abstracts((config,)).offline is False
     assert oai.record_calls == [blank.arxiv_id]
+
+
+def test_date_abstract_retry_includes_previously_reviewed_papers(
+    tmp_path: Path,
+) -> None:
+    store, oai, atom, catchup, service = _service(tmp_path)
+    config = CategoryConfig("cs.SE", "cs:SE", date(2026, 8, 18))
+    day = date(2026, 8, 19)
+    paper = replace(_paper(), abstract="")
+    _recover_retry_papers(store, config, day, paper)
+    _seed_historical_finished_date(tmp_path, store, day)
+    oai.records[paper.arxiv_id] = [_article()]
+    assert store.list_review_dates(active_configs=(config,)) == (day,)
+
+    service.retry_missing_abstracts((config,), day=day)
+
+    assert oai.record_calls == [paper.arxiv_id]
+    assert store.list_review_dates(active_configs=(config,)) == (day,)
+    assert store.events_for_date(day)[0].reviewed_at == NOW
+    assert oai.first_calls == oai.backfill_calls == atom.calls == catchup.calls == []
 
 
 @pytest.mark.parametrize(

@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from math import ceil
-from typing import Protocol
+from typing import Callable, Protocol
 
-from arxiv_digest.models import CategoryConfig, PaperMetadata
+from arxiv_digest.models import CatchupDayStatus, CategoryConfig, PaperMetadata
 from arxiv_digest.profile import Profile
 from arxiv_digest.ranking import RankedPaper, rank_date
-from arxiv_digest.storage.store import FinishResult, Store
+from arxiv_digest.storage.store import FinishResult, Store, StoreReviewSnapshot
+from arxiv_digest.sync import daily_list_coverage_bounds
 from arxiv_digest.text import build_tfidf_vectors
 
 
@@ -30,6 +31,9 @@ class ReviewSummary:
     profile_revision: int
     projection_revision: int
     missing_abstracts: int = 0
+    waiting_abstract_dates: int = 0
+    waiting_abstract_papers: int = 0
+    through_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +43,21 @@ class ReviewDateSummary:
     unreviewed_papers: int
     newly_discovered: int
     finished: bool
+    abstracts_ready: int = 0
+    missing_abstracts: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarDateSummary:
+    day: date
+    total_papers: int | None
+    unreviewed_papers: int | None
+    newly_discovered: int | None
+    finished: bool | None
+    retrieval_failed: bool
+    abstracts_pending: bool = False
+    abstracts_ready: int | None = None
+    missing_abstracts: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +85,8 @@ class ReviewPage:
     page_count: int
     total_cards: int
     last_finished_revision: int | None = None
+    abstracts_ready: int = 0
+    missing_abstracts: int = 0
 
 
 def page_from_anchor(
@@ -80,6 +101,8 @@ def page_from_anchor(
     previous_date: date | None,
     next_date: date | None,
     last_finished_revision: int | None = None,
+    abstracts_ready: int = 0,
+    missing_abstracts: int = 0,
 ) -> ReviewPage:
     if page_size < 1:
         raise ValueError("review page size must be positive")
@@ -129,13 +152,30 @@ def page_from_anchor(
         page_count=page_count,
         total_cards=len(ranked),
         last_finished_revision=last_finished_revision,
+        abstracts_ready=abstracts_ready,
+        missing_abstracts=missing_abstracts,
     )
 
 
 class ReviewService:
-    def __init__(self, store: Store, profiles: ProfileLoader) -> None:
+    def __init__(
+        self,
+        store: Store,
+        profiles: ProfileLoader,
+        *,
+        latest_finalized_date: Callable[[], date] | None = None,
+    ) -> None:
         self.store = store
         self.profiles = profiles
+        self._latest_finalized_date = latest_finalized_date or (
+            lambda: daily_list_coverage_bounds(datetime.now(timezone.utc))[1]
+        )
+
+    def _require_finalized_date(self, day: date) -> date:
+        latest = self._latest_finalized_date()
+        if day > latest:
+            raise KeyError(day)
+        return latest
 
     def _profile(self) -> Profile:
         profile = self.profiles.load()
@@ -167,6 +207,10 @@ class ReviewService:
             through_revision=through_revision,
             active_configs=active_configs,
         )
+        return self._summary_from_snapshot(snapshot)
+
+    @staticmethod
+    def _summary_from_snapshot(snapshot: StoreReviewSnapshot) -> ReviewDateSummary:
         unreviewed = tuple(
             event for event in snapshot.events if event.reviewed_at is None
         )
@@ -177,28 +221,49 @@ class ReviewService:
             and event.queue_revision > snapshot.last_finished_revision
         )
         return ReviewDateSummary(
-            day=day,
+            day=snapshot.day,
             total_papers=len(snapshot.events),
             unreviewed_papers=len(unreviewed),
             newly_discovered=newly_discovered,
             finished=bool(snapshot.events) and not unreviewed,
+            abstracts_ready=snapshot.abstracts_ready,
+            missing_abstracts=snapshot.missing_abstracts,
         )
 
     def summary(self) -> ReviewSummary:
         profile = self._profile()
+        latest = self._latest_finalized_date()
         active_configs = self._active_configs(profile)
         snapshot_revision, projection_revision = self.store.review_revisions()
-        summaries = tuple(
-            self._date_summary(
-                day,
-                active_configs=active_configs,
-                through_revision=snapshot_revision,
-            )
-            for day in self.store.list_review_dates(
-                through_revision=snapshot_revision,
-                active_configs=active_configs,
-            )
+        readiness = self.store.review_date_readiness(
+            through_revision=snapshot_revision,
+            active_configs=active_configs,
+            through_date=latest,
         )
+        summaries = []
+        waiting = []
+        missing_abstracts: set[str] = set()
+        for value in readiness:
+            snapshot = self.store.review_snapshot(
+                value.day,
+                active_configs=active_configs,
+                through_revision=snapshot_revision,
+            )
+            summary = self._summary_from_snapshot(snapshot)
+            summaries.append(summary)
+            missing_ids = {
+                paper.arxiv_id for paper in snapshot.papers
+                if not paper.abstract.strip()
+            }
+            # The dashboard describes pending review, while date pages and
+            # abstract retries also include already-reviewed papers.
+            pending_missing_ids = {
+                event.arxiv_id for event in snapshot.events
+                if event.reviewed_at is None and event.arxiv_id in missing_ids
+            }
+            if pending_missing_ids:
+                waiting.append(summary)
+                missing_abstracts.update(pending_missing_ids)
         pending = tuple(
             value for value in summaries if value.unreviewed_papers > 0
         )
@@ -210,11 +275,12 @@ class ReviewService:
             snapshot_revision=snapshot_revision,
             profile_revision=profile.revision,
             projection_revision=projection_revision,
-            missing_abstracts=len(
-                self.store.unreviewed_papers_missing_abstracts(
-                    active_configs=active_configs,
-                )
+            missing_abstracts=len(missing_abstracts),
+            waiting_abstract_dates=len(waiting),
+            waiting_abstract_papers=sum(
+                value.unreviewed_papers for value in waiting
             ),
+            through_date=latest,
         )
 
     def start(self) -> ReviewPage | None:
@@ -263,6 +329,7 @@ class ReviewService:
         from_start: bool = False,
     ) -> ReviewPage:
         profile = self._profile()
+        latest = self._require_finalized_date(day)
         active_configs = self._active_configs(profile)
         snapshot = self.store.review_snapshot(
             day,
@@ -308,7 +375,7 @@ class ReviewService:
             )
         )
         links = self.store.review_date_links(
-            day, active_configs=active_configs
+            day, active_configs=active_configs, through_date=latest,
         )
         return page_from_anchor(
             day,
@@ -321,6 +388,8 @@ class ReviewService:
             previous_date=links.previous_date,
             next_date=links.next_date,
             last_finished_revision=snapshot.last_finished_revision,
+            abstracts_ready=snapshot.abstracts_ready,
+            missing_abstracts=snapshot.missing_abstracts,
         )
 
     def record_position(
@@ -333,6 +402,7 @@ class ReviewService:
         projection_revision: int,
     ) -> ReviewPosition:
         profile = self._profile()
+        self._require_finalized_date(day)
         if profile.revision != profile_revision:
             from arxiv_digest.profile import ProfileRevisionError
 
@@ -357,13 +427,15 @@ class ReviewService:
     def previous_date(self, day: date) -> date | None:
         profile = self._profile()
         return self.store.review_date_links(
-            day, active_configs=self._active_configs(profile)
+            day, active_configs=self._active_configs(profile),
+            through_date=self._latest_finalized_date(),
         ).previous_date
 
     def next_date(self, day: date) -> date | None:
         profile = self._profile()
         return self.store.review_date_links(
-            day, active_configs=self._active_configs(profile)
+            day, active_configs=self._active_configs(profile),
+            through_date=self._latest_finalized_date(),
         ).next_date
 
     def next_later_unreviewed_date(self, day: date) -> date | None:
@@ -373,6 +445,7 @@ class ReviewService:
         for candidate in self.store.list_review_dates(
             through_revision=snapshot_revision,
             active_configs=active_configs,
+            through_date=self._latest_finalized_date(),
         ):
             if candidate <= day:
                 continue
@@ -385,18 +458,52 @@ class ReviewService:
                 return candidate
         return None
 
-    def calendar(self, start: date, end: date) -> tuple[ReviewDateSummary, ...]:
+    def calendar(self, start: date, end: date) -> tuple[CalendarDateSummary, ...]:
         if start > end:
             raise ValueError("calendar start must not follow end")
         profile = self._profile()
         active_configs = self._active_configs(profile)
-        return tuple(
-            self._date_summary(day, active_configs=active_configs)
-            for day in self.store.list_review_dates(
-                active_configs=active_configs
+        end = min(end, self._latest_finalized_date())
+        readiness = {
+            value.day: value
+            for value in self.store.review_date_readiness(
+                active_configs=active_configs, through_date=end,
             )
-            if start <= day <= end
-        )
+            if start <= value.day <= end
+        }
+        failed_dates = {
+            record.daily_list_date
+            for config in active_configs
+            for record in self.store.catchup_day_records(config.category)
+            if record.status is CatchupDayStatus.FAILED
+            and max(start, config.coverage_start) <= record.daily_list_date <= end
+        }
+        entries = []
+        for day in sorted(readiness.keys() | failed_dates):
+            summary = (
+                self._date_summary(day, active_configs=active_configs)
+                if day in readiness else None
+            )
+            entries.append(
+                CalendarDateSummary(
+                    day=day,
+                    total_papers=None if summary is None else summary.total_papers,
+                    unreviewed_papers=(
+                        None if summary is None else summary.unreviewed_papers
+                    ),
+                    newly_discovered=(
+                        None if summary is None else summary.newly_discovered
+                    ),
+                    finished=None if summary is None else summary.finished,
+                    retrieval_failed=day in failed_dates,
+                    abstracts_pending=summary is not None and summary.missing_abstracts > 0,
+                    abstracts_ready=(
+                        None if summary is None else summary.abstracts_ready
+                    ),
+                    missing_abstracts=None if summary is None else summary.missing_abstracts,
+                )
+            )
+        return tuple(entries)
 
     def finish_date(
         self,
@@ -408,6 +515,7 @@ class ReviewService:
         finished_at: datetime,
     ) -> FinishResult:
         profile = self._profile()
+        self._require_finalized_date(day)
         if profile.revision != profile_revision:
             from arxiv_digest.profile import ProfileRevisionError
 
@@ -428,16 +536,19 @@ class ReviewService:
         profile_revision: int,
         projection_revision: int,
         finished_at: datetime,
+        through_date: date | None = None,
     ) -> FinishResult:
         profile = self._profile()
         if profile.revision != profile_revision:
             from arxiv_digest.profile import ProfileRevisionError
 
             raise ProfileRevisionError(profile_revision, profile.revision)
+        latest = self._latest_finalized_date()
         return self.store.finish_all(
             through_revision=through_revision,
             finished_at=finished_at,
             profile_revision=profile_revision,
             projection_revision=projection_revision,
             active_configs=self._active_configs(profile),
+            through_date=latest if through_date is None else min(through_date, latest),
         )

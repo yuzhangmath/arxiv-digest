@@ -10,9 +10,11 @@ import {
   renderReviewError,
   renderReviewHome,
   renderReviewView,
+  updateReviewAbstractStatus,
 } from "./review_view.mjs";
 import {
   SettingsController,
+  arxivAccessPauseText,
   renderRestoreError,
   renderRestoreInspection,
   renderSettingsView,
@@ -176,10 +178,18 @@ function scheduleReviewPoll(delay = 1_000) {
   }, delay);
 }
 
+function arxivAccessRefreshDelay(access) {
+  const retryAt = typeof access?.retry_at === "string" ? Date.parse(access.retry_at) : NaN;
+  return Number.isFinite(retryAt)
+    ? Math.max(1_000, Math.min(60_000, retryAt - Date.now() + 100))
+    : 60_000;
+}
+
 function scheduleReviewDateSyncRefresh(
   destination,
   expectedSequence = reviewRequestSequence,
   delay = 1_000,
+  updateStatus = null,
 ) {
   clearReviewPoll();
   const expectedPollGeneration = reviewPollGeneration;
@@ -193,10 +203,13 @@ function scheduleReviewDateSyncRefresh(
     try {
       const serviceStatus = await api.json("review-status", "/api/v1/status");
       if (!reviewPollIsCurrent(expectedSequence, expectedPollGeneration)) return;
+      updateStatus?.(serviceStatus);
       if (serviceStatus?.sync?.status === "running") {
         scheduleReviewDateSyncRefresh(
           trackedDestination,
           expectedSequence,
+          1_000,
+          updateStatus,
         );
         return;
       }
@@ -211,6 +224,7 @@ function scheduleReviewDateSyncRefresh(
         trackedDestination,
         expectedSequence,
         1_500,
+        updateStatus,
       );
     }
   }, delay);
@@ -378,7 +392,7 @@ async function requestReview(destination = {}) {
       synchronizationPhase,
       dailyListRetry,
       dailyListProgress: serviceStatus?.daily_list_progress,
-      abstractRetry: serviceStatus?.abstract_retry,
+      arxivAccess: serviceStatus?.arxiv_access,
       start: (oldest) => navigateReviewDate({ date: oldest }),
       retryFailed: async () => {
         await api.json(
@@ -389,30 +403,12 @@ async function requestReview(destination = {}) {
         statusText("Retrying failed daily-list dates…");
         return requestReview({});
       },
-      retryAbstracts: async () => {
-        const retryHome = content.querySelector(".review-home");
-        const retrySequence = reviewRequestSequence;
-        const isCurrent = () => reviewRequestIsCurrent(retrySequence) &&
-          content.querySelector(".review-home") === retryHome;
-        try {
-          await api.json(
-            "review-sync-start",
-            "/api/v1/sync/start",
-            jsonBody({ retry_missing_abstracts: true }),
-          );
-        } catch (error) {
-          if (isCurrent()) throw error;
-          return false;
-        }
-        if (!isCurrent()) return false;
-        statusText("Retrying missing abstracts…");
-        return requestReview({});
-      },
       pending: () => statusText("Marking all unreviewed papers as reviewed…"),
       finishAll: async (
         snapshotRevision,
         profileRevision,
         projectionRevision,
+        throughDate,
       ) => {
         const finishedHome = content.querySelector(".review-home");
         clearReviewPoll();
@@ -426,6 +422,7 @@ async function requestReview(destination = {}) {
               snapshot_revision: snapshotRevision,
               profile_revision: profileRevision,
               projection_revision: projectionRevision,
+              ...(throughDate === undefined ? {} : { through_date: throughDate }),
             }),
           );
         } catch (error) {
@@ -466,6 +463,9 @@ async function requestReview(destination = {}) {
       failure: showActionFailure,
     });
     if (synchronizing) scheduleReviewPoll();
+    else if (serviceStatus?.arxiv_access?.paused === true) {
+      scheduleReviewPoll(arxivAccessRefreshDelay(serviceStatus.arxiv_access));
+    }
     return true;
   }
   const parameters = new URLSearchParams({ date });
@@ -485,10 +485,32 @@ async function requestReview(destination = {}) {
     date: String(page.day),
     anchor_event_id: page.anchor_event_id ?? null,
   });
-  renderReviewView(document, content, page, {
+  const reviewActions = {
+    synchronizing,
+    arxivAccess: serviceStatus?.arxiv_access,
+    abstractRetry: serviceStatus?.abstract_retry,
     navigate: navigateReviewDate,
     overview: () => navigate("review"),
     failure: showActionFailure,
+    retryAbstracts: async (openedDay) => {
+      const openedView = content.querySelector(".review-view");
+      const retrySequence = reviewRequestSequence;
+      const isCurrent = () => reviewRequestIsCurrent(retrySequence) &&
+        content.querySelector(".review-view") === openedView;
+      try {
+        await api.json(
+          "review-sync-start",
+          "/api/v1/sync/start",
+          jsonBody({ retry_missing_abstracts: true, retry_date: openedDay }),
+        );
+      } catch (error) {
+        if (isCurrent()) throw error;
+        return false;
+      }
+      if (!isCurrent()) return false;
+      statusText(`Retrying missing abstracts for ${openedDay}…`);
+      return requestReview(openedDestination);
+    },
     finish: async (
       openedDay,
       snapshotRevision,
@@ -515,7 +537,7 @@ async function requestReview(destination = {}) {
           content.querySelector(".review-view") === openedView;
         if (!finishIsCurrent) return null;
         if (synchronizing) {
-          scheduleReviewDateSyncRefresh(openedDestination, finishSequence);
+          scheduleReviewDateSyncRefresh(openedDestination, finishSequence, 1_000, updateAbstractStatus);
         }
         throw error;
       }
@@ -561,7 +583,19 @@ async function requestReview(destination = {}) {
       ),
       failure: showActionFailure,
     },
-  });
+  };
+  const openedView = renderReviewView(document, content, page, reviewActions);
+  const updateAbstractStatus = (status) => updateReviewAbstractStatus(
+    document,
+    openedView,
+    page,
+    {
+      ...reviewActions,
+      synchronizing: status?.sync?.status === "running",
+      arxivAccess: status?.arxiv_access,
+      abstractRetry: status?.abstract_retry,
+    },
+  );
   if (page.anchor_event_id != null) {
     api.json(
       "review-position",
@@ -576,7 +610,14 @@ async function requestReview(destination = {}) {
     ).catch(() => {});
   }
   if (synchronizing) {
-    scheduleReviewDateSyncRefresh(openedDestination, requestSequence);
+    scheduleReviewDateSyncRefresh(openedDestination, requestSequence, 1_000, updateAbstractStatus);
+  } else if (serviceStatus?.arxiv_access?.paused === true) {
+    scheduleReviewDateSyncRefresh(
+      openedDestination,
+      requestSequence,
+      arxivAccessRefreshDelay(serviceStatus.arxiv_access),
+      updateAbstractStatus,
+    );
   }
   return true;
 }
@@ -598,6 +639,18 @@ async function requestCalendar() {
   const heading = document.createElement("h1");
   heading.textContent = "Calendar";
   content.append(heading);
+  if (entries.some((entry) => entry.abstracts_pending)) {
+    const guidance = document.createElement("p");
+    guidance.className = "calendar-guidance";
+    guidance.textContent = "Missing abstracts do not prevent review. Open a date to retry its missing abstracts if you want them.";
+    content.append(guidance);
+  }
+  if (entries.some((entry) => entry.retrieval_failed)) {
+    const guidance = document.createElement("p");
+    guidance.className = "calendar-guidance";
+    guidance.textContent = "Failed daily lists have not been retrieved. Counts and review status cover confirmed papers only. See Settings for recovery status.";
+    content.append(guidance);
+  }
   const calendar = document.createElement("section");
   content.append(calendar);
   renderCalendar(document, calendar, entries, (date) => {
@@ -781,6 +834,7 @@ function scheduleSettingsSyncPoll(delay = 1_000) {
             ...settingsModel,
             synchronizing: true,
             daily_list_retry: retry,
+            arxiv_access: serviceStatus?.arxiv_access,
           };
           redrawSettings();
           statusText(
@@ -790,9 +844,17 @@ function scheduleSettingsSyncPoll(delay = 1_000) {
         scheduleSettingsSyncPoll();
         return;
       }
+      const wasSynchronizing = settingsModel?.synchronizing === true;
+      const wasPaused = settingsModel?.arxiv_access?.paused === true;
       await requestSettings();
       if (settingsSyncPollIsCurrent(generation)) {
-        statusText("Synchronization finished.");
+        if (settingsModel?.arxiv_access?.paused === true) {
+          statusText(arxivAccessPauseText(settingsModel.arxiv_access));
+        } else if (wasSynchronizing) {
+          statusText("Synchronization finished.");
+        } else if (wasPaused) {
+          statusText("Retries are available again.");
+        }
       }
     } catch (error) {
       if (error instanceof StaleResponseError || error?.name === "AbortError") return;
@@ -829,6 +891,9 @@ async function requestSettings() {
   settingsModel = { ...settings, doctor, launcher };
   redrawSettings();
   if (settings.synchronizing === true) scheduleSettingsSyncPoll();
+  else if (settings.arxiv_access?.paused === true) {
+    scheduleSettingsSyncPoll(arxivAccessRefreshDelay(settings.arxiv_access));
+  }
 }
 
 function normalizedRestoreInspection(inspection) {
@@ -890,36 +955,49 @@ function showRestoreInspection(inspectionValue) {
   });
 }
 
-const settingsActions = {
-  async retrySynchronization(count = 0) {
-    if (!settingsModel || settingsModel.synchronizing === true) return;
+async function startSettingsRetry(count, request) {
+  if (!settingsModel || settingsModel.synchronizing === true || settingsModel.arxiv_access?.paused === true) return;
+  const generation = settingsSyncPollGeneration;
+  settingsModel = {
+    ...settingsModel,
+    synchronizing: true,
+    daily_list_retry: {
+      status: "running",
+      completed: 0,
+      total: Number.isSafeInteger(count) && count > 0 ? count : 0,
+    },
+  };
+  redrawSettings();
+  statusText("Retrying failed daily-list dates…");
+  try {
+    await request();
+    if (settingsSyncPollIsCurrent(generation)) scheduleSettingsSyncPoll(0);
+  } catch (error) {
+    if (!settingsSyncPollIsCurrent(generation)) return;
     settingsModel = {
       ...settingsModel,
-      synchronizing: true,
+      synchronizing: false,
       daily_list_retry: {
-        status: "running",
+        status: "idle",
         completed: 0,
         total: Number.isSafeInteger(count) && count > 0 ? count : 0,
       },
     };
-    redrawSettings();
-    statusText("Retrying failed daily-list dates…");
     try {
-      await settingsController.retrySynchronization();
-      scheduleSettingsSyncPoll(0);
-    } catch (error) {
-      settingsModel = {
-        ...settingsModel,
-        synchronizing: false,
-        daily_list_retry: {
-          status: "idle",
-          completed: 0,
-          total: Number.isSafeInteger(count) && count > 0 ? count : 0,
-        },
-      };
+      await requestSettings();
+    } catch {
       redrawSettings();
-      showActionFailure(error);
     }
+    showActionFailure(error);
+  }
+}
+
+const settingsActions = {
+  retrySynchronization(count = 0) {
+    return startSettingsRetry(count, () => settingsController.retrySynchronization());
+  },
+  retryFailedDate(category, day) {
+    return startSettingsRetry(1, () => settingsController.retryFailedDate(category, day));
   },
   async openFolder() {
     try {

@@ -334,6 +334,7 @@ class _DefaultRuntime:
         self._active_sync_job: str | None = None
         self._sync_follow_up_requested = False
         self._last_sync_report: Any = None
+        self._last_abstract_retry: dict[str, Any] | None = None
         self._resume_sync_after_update = False
         self._sync_resume_after_cancel = False
         self._runtime_closed = False
@@ -374,6 +375,7 @@ class _DefaultRuntime:
         from arxiv_digest.folders import FolderService
         from arxiv_digest.library import LibraryService
         from arxiv_digest.rate_limit import ArxivHttpClient
+        from arxiv_digest.arxiv_access import ArxivCooldown
         from arxiv_digest.review import ReviewService
         from arxiv_digest.setup import SetupService
         from arxiv_digest.sources.atom import AtomSource
@@ -404,11 +406,19 @@ class _DefaultRuntime:
         except Exception:
             connection.close()
             raise
-        self.review = ReviewService(self.store, self.profiles)
+        self.review = ReviewService(
+            self.store,
+            self.profiles,
+            latest_finalized_date=lambda: self._supported_coverage_bounds()[1],
+        )
         self.library = LibraryService(self.store)
+        self.arxiv_cooldown = ArxivCooldown(
+            self.paths.data_dir / "arxiv-cooldown.json"
+        )
         client = ArxivHttpClient(
             user_agent=f"arxiv-digest/{__version__}",
             contact_url="https://github.com/yuzhangmath/arxiv-digest",
+            cooldown=self.arxiv_cooldown,
         )
         oai = OaiSource(client)
         self.sync = SyncService(
@@ -535,6 +545,33 @@ class _DefaultRuntime:
             self.update_checker.start()
         return self.update_checker.snapshot()
 
+    def _arxiv_access_error(self) -> Exception | None:
+        from arxiv_digest.arxiv_access import ArxivCooldownUnavailable
+
+        cooldown = getattr(self, "arxiv_cooldown", None)
+        if cooldown is None:
+            return None
+        try:
+            return cooldown.active()
+        except ArxivCooldownUnavailable as error:
+            return error
+
+    def _arxiv_access_status(self) -> dict[str, Any]:
+        from arxiv_digest.arxiv_access import ArxivRateLimited
+
+        error = self._arxiv_access_error()
+        retry_at = getattr(error, "retry_at", None)
+        message = getattr(error, "safe_message", None)
+        if isinstance(error, ArxivRateLimited):
+            status = f" (HTTP {error.http_status})" if error.http_status is not None else ""
+            message = f"arXiv reported rate limiting{status}. Requests are paused."
+        return {
+            "paused": error is not None,
+            "retry_at": None if retry_at is None else retry_at.isoformat(),
+            "http_status": getattr(error, "http_status", None),
+            "message": message,
+        }
+
     def status(self, payload: dict[str, Any]) -> dict[str, Any]:
         from arxiv_digest.doctor import _redacted_sync_error_code
 
@@ -653,6 +690,7 @@ class _DefaultRuntime:
                 daily_list_progress["categories"] = daily_list_categories
         return {
             "state": "ready",
+            "arxiv_access": self._arxiv_access_status(),
             "initialized": self.profiles.load() is not None,
             "sync": sync_job,
             "daily_list_retry": retry,
@@ -661,7 +699,9 @@ class _DefaultRuntime:
                 if sync_job is not None
                 and sync_job.get("status") == "running"
                 and isinstance(sync_job.get("abstract_retry"), dict)
-                else {"status": "idle", "completed": 0, "total": 0}
+                else dict(getattr(self, "_last_abstract_retry", None) or {
+                    "status": "idle", "completed": 0, "total": 0,
+                })
             ),
             "metadata_sync": metadata_sync,
             "daily_list_progress": daily_list_progress,
@@ -721,6 +761,10 @@ class _DefaultRuntime:
             profile_revision=payload["profile_revision"],
             projection_revision=payload["projection_revision"],
             finished_at=datetime.now(timezone.utc),
+            through_date=(
+                date.fromisoformat(payload["through_date"])
+                if "through_date" in payload else None
+            ),
         )
 
     def _library_page(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1612,8 +1656,13 @@ class _DefaultRuntime:
             if phase == "enrichment":
                 job.pop("daily_list_retry", None)
 
-    def _run_sync_pass(self, job_id: str, *, retry_failed_dates: bool) -> Any:
+    def _run_sync_pass(
+        self, job_id: str, *, retry_failed_dates: bool,
+        retry_target: tuple[str, date] | None = None,
+    ) -> Any:
         configs = self._sync_configs()
+        if retry_target is not None:
+            configs = tuple(c for c in configs if c.category == retry_target[0])
         pending_daily_lists = getattr(
             self.sync,
             "has_pending_daily_list_work",
@@ -1628,6 +1677,13 @@ class _DefaultRuntime:
         )
         self._set_sync_phase(job_id, phase)
         retry_dates = self._retryable_sync_dates(configs)
+        if retry_target is not None:
+            category, mailing_date = retry_target
+            retry_dates = (
+                {category: (mailing_date,)}
+                if mailing_date in retry_dates.get(category, ())
+                else {}
+            )
         targets_by_date: dict[date, set[str]] = {}
         for category, dates in retry_dates.items():
             for mailing_date in dates:
@@ -1690,13 +1746,23 @@ class _DefaultRuntime:
         self._last_sync_report = report
         return report
 
-    def _run_abstract_retry(self, job_id: str) -> Any:
+    def _run_abstract_retry(self, job_id: str, *, day: date | None = None) -> Any:
+        from arxiv_digest.doctor import _redacted_sync_error_code
+        from arxiv_digest.sync import SyncCancelled
+
         configs = self._sync_configs()
         self._set_sync_phase(job_id, "enrichment")
         identifiers = self.store.unreviewed_papers_missing_abstracts(
             active_configs=configs,
         )
+        if day is not None:
+            date_ids = {
+                event.arxiv_id
+                for event in self.store.events_for_date(day, active_configs=configs)
+            }
+            identifiers = tuple(identifier for identifier in identifiers if identifier in date_ids)
         completed: set[str] = set()
+        scope = {} if day is None else {"retry_date": day.isoformat()}
 
         def record_attempt(arxiv_id: str) -> None:
             completed.add(arxiv_id)
@@ -1705,18 +1771,54 @@ class _DefaultRuntime:
                     "status": "running",
                     "completed": len(completed),
                     "total": len(identifiers),
+                    **scope,
                 }
 
         with self._jobs_lock:
+            self._last_abstract_retry = None
             self._jobs[job_id]["abstract_retry"] = {
                 "status": "running", "completed": 0, "total": len(identifiers),
+                **scope,
             }
         try:
             report = self.sync.retry_missing_abstracts(
                 configs, attempted=record_attempt,
+                **({"day": day} if day is not None else {}),
             )
             self._last_sync_report = report
+            outcome = getattr(report, "abstract_retry", None)
+            if outcome is not None:
+                with self._jobs_lock:
+                    self._last_abstract_retry = {
+                        "status": "completed",
+                        "completed": outcome.attempted,
+                        "attempted": outcome.attempted,
+                        "total": outcome.total,
+                        "recovered": outcome.recovered,
+                        "remaining": outcome.remaining,
+                        "error_codes": sorted({
+                            _redacted_sync_error_code(code) for code in outcome.error_codes
+                        }),
+                        "retry_date": None if day is None else day.isoformat(),
+                    }
             return report
+        except SyncCancelled:
+            remaining_ids = set(self.store.unreviewed_papers_missing_abstracts(
+                active_configs=configs,
+            ))
+            remaining = sum(identifier in remaining_ids for identifier in identifiers)
+            with self._jobs_lock:
+                self._last_abstract_retry = {
+                    "status": "interrupted",
+                    "completed": len(completed),
+                    "attempted": len(completed),
+                    "total": len(identifiers),
+                    "recovered": len(identifiers) - remaining,
+                    "remaining": remaining,
+                    "error_codes": ["cancelled"],
+                    "retry_date": None if day is None else day.isoformat(),
+                }
+            raise
         finally:
             with self._jobs_lock:
                 self._jobs[job_id].pop("abstract_retry", None)
@@ -1724,18 +1826,33 @@ class _DefaultRuntime:
     def _run_sync(
         self, job_id: str, *, retry_failed_dates: bool,
         retry_missing_abstracts: bool = False,
+        retry_target: tuple[str, date] | None = None,
+        abstract_retry_date: date | None = None,
     ) -> Any:
         try:
             while True:
+                if self._arxiv_access_error() is not None:
+                    report = self.sync.progress(self._sync_configs())
+                    self._last_sync_report = report
+                    return report
                 report = (
-                    self._run_abstract_retry(job_id)
+                    self._run_abstract_retry(
+                        job_id,
+                        **({"day": abstract_retry_date} if abstract_retry_date is not None else {}),
+                    )
                     if retry_missing_abstracts
                     else self._run_sync_pass(
                         job_id,
                         retry_failed_dates=retry_failed_dates,
+                        **({"retry_target": retry_target} if retry_target else {}),
                     )
                 )
                 with self._jobs_lock:
+                    if (
+                        retry_target is not None or abstract_retry_date is not None
+                        or self._arxiv_access_error() is not None
+                    ):
+                        return report
                     if getattr(self, "_sync_resume_after_cancel", False):
                         self._sync_resume_after_cancel = False
                         self._sync_cancel.clear()
@@ -1758,6 +1875,32 @@ class _DefaultRuntime:
             and payload.get("retry_missing_abstracts") is True
         ):
             raise ValueError("choose one synchronization retry mode")
+        retry_target = None
+        abstract_retry_date = None
+        if payload.get("retry_missing_abstracts") is True and "retry_date" in payload:
+            if "retry_category" in payload or not isinstance(payload["retry_date"], str):
+                raise ValueError("an abstract retry requires only a confirmed date")
+            abstract_retry_date = date.fromisoformat(payload["retry_date"])
+            if not self.store.events_for_date(
+                abstract_retry_date, active_configs=self._sync_configs(),
+            ):
+                raise ValueError("the selected date has no confirmed papers")
+        elif "retry_date" in payload or "retry_category" in payload:
+            if (
+                payload.get("retry_failed_dates") is not True
+                or not isinstance(payload.get("retry_date"), str)
+                or not isinstance(payload.get("retry_category"), str)
+            ):
+                raise ValueError("a date retry requires a category and failed-date mode")
+            mailing_date = date.fromisoformat(payload["retry_date"])
+            category = payload["retry_category"]
+            if mailing_date not in self._retryable_sync_dates().get(category, ()):
+                raise ValueError("the selected date is not a retryable failed daily list")
+            retry_target = (category, mailing_date)
+        if payload.get("retry_failed_dates") or payload.get("retry_missing_abstracts"):
+            error = self._arxiv_access_error()
+            if error is not None:
+                raise error
         with self._sync_start_lock:
             with self._jobs_lock:
                 if self._active_sync_job is not None:
@@ -1795,6 +1938,8 @@ class _DefaultRuntime:
                         job_id,
                         retry_failed_dates=payload.get("retry_failed_dates") is True,
                         retry_missing_abstracts=payload.get("retry_missing_abstracts") is True,
+                        **({"retry_target": retry_target} if retry_target else {}),
+                        **({"abstract_retry_date": abstract_retry_date} if abstract_retry_date else {}),
                     ),
                     job_id=job_id,
                     request_cancel=self._sync_cancel.set,
@@ -2140,7 +2285,7 @@ class _DefaultRuntime:
             records = tuple(
                 record
                 for record in self.store.catchup_day_records(category)
-                if record.daily_list_date >= profile_category.coverage_start
+                if profile_category.coverage_start <= record.daily_list_date <= coverage_max
             )
             category_days[category] = {
                 record.daily_list_date: record.status.value
@@ -2171,6 +2316,15 @@ class _DefaultRuntime:
                         unavailable=category_unavailable,
                     ),
                     "error_codes": error_codes,
+                    "failed_date_errors": [
+                        {
+                            "date": record.daily_list_date.isoformat(),
+                            "error_code": _redacted_sync_error_code(record.error_code),
+                        }
+                        for record in records
+                        if record.status.value == "failed"
+                        and record.error_code is not None
+                    ],
                     "retryable_failed_dates": [
                         record.daily_list_date.isoformat()
                         for record in records
@@ -2243,6 +2397,7 @@ class _DefaultRuntime:
             pass
         return {
             "revision": profile.revision,
+            "arxiv_access": service_status.get("arxiv_access"),
             "online": not bool(service_status.get("offline")),
             "synchronizing": bool(
                 active_sync is not None
@@ -2727,6 +2882,7 @@ class _DefaultRuntime:
                     self._suggestions.clear()
                     self._suggestion_ids.clear()
                     self._last_sync_report = None
+                    self._last_abstract_retry = None
         except Exception:
             retain_pending = False
             with self._pending_restores_lock:
@@ -2860,6 +3016,8 @@ class _DefaultRuntime:
 
     def start_sync(self) -> None:
         if self.sync is None or self.profiles.load() is None:
+            return
+        if self._arxiv_access_error() is not None:
             return
         self._start_sync_job({})
 

@@ -4,6 +4,8 @@ import json
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from arxiv_digest.application import _DefaultRuntime
 from arxiv_digest.models import EnrichmentStatus
 from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
@@ -15,6 +17,69 @@ from arxiv_digest.web.api import ApiRequest, ApiRouter
 NOW = datetime(2026, 8, 22, 12, tzinfo=timezone.utc)
 TOKEN = "A" * 43
 HOST = "127.0.0.1:43123"
+
+
+@pytest.mark.parametrize("status", tuple(EnrichmentStatus))
+def test_settings_excludes_unfinalized_dates_until_new_york_cutoff(
+    tmp_path, status,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    store = Store(database_path)
+    day = date(2026, 8, 20)
+    store.ensure_category_state("cs.SE", "cs:SE", day)
+    store.record_enrichment_day(EnrichmentDayRecord(
+        category="cs.SE", mailing_date=day, source="catchup", status=status,
+        fetched_at=NOW,
+        error_code="catchup_http_406" if status is EnrichmentStatus.FAILED else None,
+        error_message=(
+            "Daily-list retrieval failed." if status is EnrichmentStatus.FAILED else None
+        ),
+    ))
+    observed_at = datetime(2026, 8, 20, 23, 59, 59, tzinfo=timezone.utc)
+    runtime = object.__new__(_DefaultRuntime)
+    runtime.profiles = SimpleNamespace(load=lambda: Profile(
+        schema_version=2, revision=1,
+        category_coverage=(ProfileCategory("cs.SE", day),),
+        keywords=(), phrases=(), authors=(), seed_papers=(),
+        pdf_destination=PdfDestination("downloads", tmp_path / "pdfs"),
+    ))
+    runtime.status = lambda _payload: {"sync": None, "offline": False}
+    runtime.sync = SimpleNamespace(catchup_window_days=90)
+    runtime.store = store
+    runtime.setup = SimpleNamespace(
+        clock=lambda: observed_at,
+        launcher_settings=lambda: SimpleNamespace(
+            operation="none", error_code=None, retry_available=False,
+        ),
+    )
+    runtime.launcher = None
+    runtime.candidates = SimpleNamespace(
+        cache=SimpleNamespace(root=tmp_path / "missing-cache"),
+    )
+    records_before = store.catchup_day_records("cs.SE")
+
+    before = runtime._settings_get({})
+
+    assert before["coverage_max"] == "2026-08-19"
+    coverage = before["daily_list_coverage"]
+    assert coverage["target"] == 0
+    assert coverage["failed"] == 0
+    assert coverage["pending"] == 0
+    assert coverage["categories"][0]["error_codes"] == []
+    assert coverage["categories"][0]["failed_date_errors"] == []
+    assert coverage["categories"][0]["retryable_failed_dates"] == []
+    assert store.catchup_day_records("cs.SE") == records_before
+
+    observed_at = datetime(2026, 8, 21, 0, 0, tzinfo=timezone.utc)
+    after = runtime._settings_get({})
+
+    assert after["coverage_max"] == "2026-08-20"
+    assert after["daily_list_coverage"]["target"] == 1
+    assert after["daily_list_coverage"]["categories"][0]["retryable_failed_dates"] == (
+        ["2026-08-20"] if status is EnrichmentStatus.FAILED else []
+    )
+    assert store.catchup_day_records("cs.SE") == records_before
 
 
 def test_settings_separates_redacted_persisted_status_aggregates(
@@ -192,6 +257,10 @@ def test_settings_separates_redacted_persisted_status_aggregates(
             "unavailable": 1,
             "gaps": 3,
             "error_codes": ["catchup_layout_changed"],
+            "failed_date_errors": [
+                {"date": "2026-05-20", "error_code": "catchup_layout_changed"},
+                {"date": "2026-08-19", "error_code": "catchup_layout_changed"},
+            ],
             "retryable_failed_dates": ["2026-08-19"],
         }],
     }

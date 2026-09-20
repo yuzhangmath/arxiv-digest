@@ -5,6 +5,7 @@ import re
 from datetime import date, datetime
 from hashlib import sha256
 from types import MappingProxyType
+from urllib.error import HTTPError
 from urllib.parse import (
     parse_qsl,
     quote,
@@ -16,6 +17,7 @@ from urllib.parse import (
 
 from bs4 import BeautifulSoup, Tag
 
+from arxiv_digest.arxiv_access import ArxivCooldownUnavailable, ArxivRateLimited
 from arxiv_digest.models import (
     AnnounceType,
     CatchupDay,
@@ -93,11 +95,18 @@ class CatchupLayoutError(CatchupError):
 class CatchupFetchError(CatchupError):
     """A catch-up request failed without exposing transport details."""
 
-    def __init__(self) -> None:
-        super().__init__(
-            "catchup_fetch_failed",
-            "The arXiv catch-up page could not be retrieved.",
-        )
+    def __init__(self, http_status: int | None = None) -> None:
+        self.http_status = http_status
+        if type(http_status) is int and 100 <= http_status <= 599:
+            super().__init__(
+                f"catchup_http_{http_status}",
+                f"The arXiv catch-up request returned HTTP {http_status}.",
+            )
+        else:
+            super().__init__(
+                "catchup_fetch_failed",
+                "The arXiv catch-up page could not be retrieved.",
+            )
 
 
 def failed_day(
@@ -208,7 +217,7 @@ def _is_catchup_page_url(url: str) -> bool:
         return False
 
 
-def _production_page_number(url: str) -> int | None:
+def _production_page_parameters(url: str) -> tuple[str, int] | None:
     try:
         values = parse_qsl(
             urlsplit(url).query,
@@ -222,21 +231,29 @@ def _production_page_number(url: str) -> int | None:
     parameters = dict(values)
     page = parameters.get("page", "")
     if (
-        parameters.get("abs") != "False"
+        parameters.get("abs") not in {"True", "False"}
         or re.fullmatch(r"[1-9]\d*", page) is None
     ):
         return None
-    return int(page)
+    return parameters["abs"], int(page)
+
+
+def _production_page_number(url: str) -> int | None:
+    parameters = _production_page_parameters(url)
+    return None if parameters is None else parameters[1]
 
 
 def _production_page_url(page_url: str, page: int) -> str:
     current = urlsplit(page_url)
+    parameters = _production_page_parameters(page_url)
+    if parameters is None:
+        raise CatchupLayoutError
     return urlunsplit(
         (
             "https",
             "arxiv.org",
             current.path,
-            urlencode((("abs", "False"), ("page", page))),
+            urlencode((("abs", parameters[0]), ("page", page))),
             "",
         )
     )
@@ -278,15 +295,19 @@ def _legacy_page_url(url: str) -> str | None:
 def _page_urls(root: Tag, page_url: str) -> tuple[str, ...]:
     if not _is_catchup_page_url(page_url):
         raise CatchupLayoutError
-    current_page = _production_page_number(page_url)
-    if current_page is not None:
+    current_parameters = _production_page_parameters(page_url)
+    if current_parameters is not None:
+        current_mode, current_page = current_parameters
         pages = {current_page: _production_page_url(page_url, current_page)}
         for anchor in root.select("a[href]"):
+            if anchor.find_parent("dl") is not None:
+                continue
             candidate = _safe_same_path_url(str(anchor["href"]), page_url)
             if candidate is None:
                 continue
-            page = _production_page_number(candidate)
-            if page is not None:
+            parameters = _production_page_parameters(candidate)
+            if parameters is not None and parameters[0] == current_mode:
+                page = parameters[1]
                 pages[page] = _production_page_url(page_url, page)
         last_page = max(pages)
         if last_page > _MAX_CATCHUP_PAGES:
@@ -513,10 +534,15 @@ def _is_explicitly_empty(root: Tag) -> bool:
 
 
 def _advertised_total(root: Tag) -> int:
+    # Article text can mention counts or link to another catch-up page. Only
+    # the surrounding list controls describe this response's membership.
+    controls = " ".join(
+        text for text in root.strings if text.find_parent("dl") is None
+    )
     totals = {
         int(match.group("count"))
         for match in _TOTAL_ENTRIES_RE.finditer(
-            normalize_space(root.get_text(" ", strip=True))
+            normalize_space(controls)
         )
     }
     if len(totals) != 1:
@@ -629,7 +655,7 @@ class CatchupSource:
         encoded_category = quote(category, safe=".")
         first_url = (
             f"{self._base_url}/{encoded_category}/{mailing_date.isoformat()}"
-            "?abs=False&page=1"
+            "?abs=True&page=1"
         )
         expected_path = urlsplit(_normalized_page_url(first_url)).path
         pending = [first_url]
@@ -647,7 +673,7 @@ class CatchupSource:
                     request_options["cancelled"] = cancelled
                 response = self._client.get(request_url, **request_options)
                 if response.status != 200:
-                    raise CatchupFetchError
+                    raise CatchupFetchError(response.status)
                 page_url = _normalized_page_url(response.final_url)
                 if urlsplit(page_url).path != expected_path:
                     raise CatchupLayoutError
@@ -672,6 +698,30 @@ class CatchupSource:
                 scheduled.add(page_url)
             except ArxivRequestCancelled:
                 raise
+            except (ArxivRateLimited, ArxivCooldownUnavailable) as error:
+                # An earlier page still counts as an attempted daily list if
+                # another request activates the shared cooldown between pages.
+                if pages:
+                    error.attempted = True
+                raise
+            except (HTTPError, CatchupFetchError) as error:
+                status = error.code if isinstance(error, HTTPError) else error.http_status
+                if isinstance(error, HTTPError):
+                    error.close()
+                if status == 406 and request_url == first_url and not pages:
+                    # Recover exact membership using the earlier lightweight
+                    # representation. Metadata remains independently retryable.
+                    # The same client retains normal pacing and cooldown checks.
+                    fallback_url = first_url.rsplit("?", 1)[0] + "?abs=False&page=1"
+                    pending = [fallback_url]
+                    scheduled = {fallback_url}
+                    continue
+                return _failed_day_with_pages(
+                    category,
+                    mailing_date,
+                    CatchupFetchError(status),
+                    pages,
+                )
             except CatchupError as error:
                 return _failed_day_with_pages(
                     category,

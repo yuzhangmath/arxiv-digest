@@ -1,4 +1,5 @@
 import { renderPaperCard } from "./paper_view.mjs";
+import { arxivAccessPauseText } from "./settings_view.mjs";
 
 const TIERS = Object.freeze([
   ["top", "Top"],
@@ -76,11 +77,11 @@ function updateStartButton(control) {
   control.textContent = busy ? "Loading…" : "Start review";
 }
 
-function updateRetryButton(control, retry, synchronizing) {
+function updateRetryButton(control, retry, synchronizing, paused) {
   const busy = control.dataset.busy === "true";
   const running = retry.status === "running";
   control.hidden = retry.total === 0;
-  control.disabled = busy || running || synchronizing;
+  control.disabled = busy || running || synchronizing || paused;
   control.setAttribute("aria-busy", busy || running ? "true" : "false");
   if (running) {
     control.textContent = `Retrying failed daily-list dates… ${retry.completed} of ${retry.total} completed`;
@@ -89,21 +90,6 @@ function updateRetryButton(control, retry, synchronizing) {
   } else {
     const noun = retry.total === 1 ? "date" : "dates";
     control.textContent = `Retry ${retry.total} failed daily-list ${noun}`;
-  }
-}
-
-function updateAbstractRetryButton(control, retry, missing, synchronizing) {
-  const busy = control.dataset.busy === "true";
-  const running = retry.status === "running";
-  control.hidden = missing === 0 && !running && !busy;
-  control.disabled = busy || running || synchronizing;
-  control.setAttribute("aria-busy", busy || running ? "true" : "false");
-  if (running) {
-    control.textContent = `Retrying abstracts… ${retry.completed} of ${retry.total} completed`;
-  } else if (busy) {
-    control.textContent = "Starting abstract retry…";
-  } else {
-    control.textContent = `Retry ${missing} missing ${missing === 1 ? "abstract" : "abstracts"}`;
   }
 }
 
@@ -128,11 +114,16 @@ export function reviewHomeText(
   summary,
   { synchronizing = false, coverageIncomplete = false } = {},
 ) {
+  const waitingDates = nonnegativeCount(summary?.waiting_abstract_dates);
+  const missing = nonnegativeCount(summary?.missing_abstracts);
+  const waiting = missing > 0
+    ? `${missing} unreviewed ${missing === 1 ? "paper is missing an abstract" : "papers are missing abstracts"}${waitingDates > 0 ? ` across ${waitingDates} ${waitingDates === 1 ? "date" : "dates"}` : ""}. You can still review and finish these dates.`
+    : "";
   if (synchronizing && !summary?.oldest_unreviewed_date) {
-    return "Historical daily-list recovery is in progress. Confirmed daily-list announcements will appear as dates are recovered, and this page will update automatically.";
+    return `Historical daily-list recovery is in progress. Dates will appear as their daily lists are recovered, and this page will update automatically.${waiting ? ` ${waiting}` : ""}`;
   }
   if (summary?.oldest_unreviewed_date) {
-    const backlog = reviewSummaryText(summary);
+    const backlog = `${reviewSummaryText(summary)}${waiting ? ` ${waiting}` : ""}`;
     if (synchronizing) {
       return `${backlog} Synchronization is still in progress, so this count may increase. This page will update automatically.`;
     }
@@ -141,9 +132,9 @@ export function reviewHomeText(
       : backlog;
   }
   if (coverageIncomplete) {
-    return "Historical daily-list coverage is incomplete. Confirmed announcements from recovered dates remain available; unresolved gaps may hide additional paper announcements.";
+    return `Historical daily-list coverage is incomplete. Dates with recovered announcements remain available; unresolved gaps may hide additional paper announcements.${waiting ? ` ${waiting}` : ""}`;
   }
-  return "You are caught up. New papers from future synchronizations, including papers added to finished dates, will appear here.";
+  return `You are caught up. New papers from future synchronizations, including papers added to finished dates, will appear here.${waiting ? ` ${waiting}` : ""}`;
 }
 
 function finishAllConfirmationText(summary) {
@@ -164,19 +155,15 @@ export function renderReviewHome(
     synchronizationPhase = "daily_list",
     dailyListRetry,
     dailyListProgress,
-    abstractRetry,
+    arxivAccess,
     start,
     retryFailed,
-    retryAbstracts,
     finishAll,
     pending,
     failure,
   } = {},
 ) {
   const retry = normalizedRetry(dailyListRetry);
-  const abstracts = normalizedRetry(abstractRetry);
-  const missingAbstracts = nonnegativeCount(summary?.missing_abstracts);
-  const retryingAbstracts = abstracts.status === "running";
   const enrichment = synchronizing && synchronizationPhase === "enrichment";
   const recovering = synchronizing && !enrichment;
   let view = container.querySelector(".review-home");
@@ -185,6 +172,10 @@ export function renderReviewHome(
     view = element(document, "section", undefined, "review-home");
     const heading = element(document, "h1", "Review");
     const paragraph = element(document, "p", undefined, "review-home-status");
+    const accessStatus = element(document, "p", undefined, "arxiv-access-status");
+    accessStatus.setAttribute("role", "status");
+    accessStatus.setAttribute("aria-live", "polite");
+    accessStatus.hidden = true;
     const activity = element(
       document,
       "div",
@@ -214,7 +205,7 @@ export function renderReviewHome(
     phaseStatus.setAttribute("role", "status");
     phaseStatus.setAttribute("aria-live", "polite");
     activity.append(progress, progressText, phaseStatus);
-    view.append(heading, paragraph, activity);
+    view.append(heading, paragraph, accessStatus, activity);
     container.append(view);
   }
 
@@ -228,22 +219,19 @@ export function renderReviewHome(
     coverageIncomplete,
   });
   if (paragraph.textContent !== message) paragraph.textContent = message;
+  const accessStatus = view.querySelector(".arxiv-access-status");
+  const accessMessage = arxivAccessPauseText(arxivAccess);
+  accessStatus.hidden = !accessMessage;
+  if (accessStatus.textContent !== accessMessage) accessStatus.textContent = accessMessage;
   const activity = view.querySelector(".review-sync-activity");
   const progress = activity.querySelector("progress");
   const progressText = activity.querySelector(".review-sync-progress-text");
   const phaseStatus = activity.querySelector(".review-sync-phase-status");
   const retrying = retry.status === "running";
   const coverageText = dailyListProgressText(dailyListProgress);
-  activity.hidden = !synchronizing && !retrying && !retryingAbstracts;
-  view.setAttribute("aria-busy", recovering || retrying || retryingAbstracts ? "true" : "false");
-  if (retryingAbstracts) {
-    const text = `Retrying abstracts… ${abstracts.completed} of ${abstracts.total} completed`;
-    progress.setAttribute("value", abstracts.completed);
-    progress.setAttribute("max", abstracts.total);
-    progress.setAttribute("aria-label", text);
-    progressText.textContent = "";
-    if (phaseStatus.textContent !== text) phaseStatus.textContent = text;
-  } else if (enrichment) {
+  activity.hidden = !synchronizing && !retrying;
+  view.setAttribute("aria-busy", recovering || retrying ? "true" : "false");
+  if (enrichment) {
     progress.removeAttribute?.("value");
     progress.removeAttribute?.("max");
     progress.setAttribute("aria-label", "Syncing recent paper data…");
@@ -283,8 +271,9 @@ export function renderReviewHome(
   const oldest = summary?.oldest_unreviewed_date
     ? String(summary.oldest_unreviewed_date)
     : "";
+  const hasReview = Boolean(oldest) && papers > 0;
   let controls = view.querySelector(".review-home-actions");
-  if (!oldest || papers <= 0) {
+  if (!hasReview && retry.total === 0) {
     controls?.remove();
     return view;
   }
@@ -319,6 +308,7 @@ export function renderReviewHome(
         retryButton,
         controls.reviewRetry,
         controls.reviewSynchronizing,
+        controls.reviewPaused,
       );
       let failed = false;
       try {
@@ -332,6 +322,7 @@ export function renderReviewHome(
           retryButton,
           controls.reviewRetry,
           controls.reviewSynchronizing,
+          controls.reviewPaused,
         );
         if (failed) retryButton.focus?.();
       }
@@ -339,41 +330,21 @@ export function renderReviewHome(
     retryButton.className = "review-retry-failed";
     retryButton.setAttribute("aria-busy", "false");
 
-    const abstractButton = button(document, "Retry missing abstracts", async () => {
-      if (abstractButton.disabled || abstractButton.dataset.busy === "true") return;
-      abstractButton.dataset.busy = "true";
-      const update = () => updateAbstractRetryButton(
-        abstractButton,
-        controls.reviewAbstractRetry,
-        controls.reviewMissingAbstracts,
-        controls.reviewSynchronizing,
-      );
-      update();
-      let failed = false;
-      try {
-        await controls.reviewActions?.retryAbstracts?.();
-      } catch (error) {
-        failed = true;
-        controls.reviewActions?.failure?.(error);
-      } finally {
-        abstractButton.dataset.busy = "false";
-        update();
-        if (failed) abstractButton.focus?.();
-      }
-    });
-    abstractButton.className = "review-retry-abstracts";
-    abstractButton.setAttribute("aria-busy", "false");
-
     const markAll = button(document, "Mark all as reviewed", () => {
+      if (confirmation.dataset.busy === "true") return;
       const confirmed = controls.reviewSummary;
       controls.confirmedSnapshot = Object.freeze({
         snapshotRevision: Number(confirmed?.snapshot_revision),
         profileRevision: Number(confirmed?.profile_revision),
         projectionRevision: Number(confirmed?.projection_revision),
+        throughDate: confirmed?.through_date,
       });
       confirmationText.textContent = finishAllConfirmationText(confirmed);
       markAll.disabled = true;
       markAll.setAttribute("aria-expanded", "true");
+      confirm.disabled = false;
+      cancel.disabled = false;
+      confirm.textContent = "Confirm mark all as reviewed";
       confirmation.hidden = false;
       confirm.focus?.();
     });
@@ -409,6 +380,7 @@ export function renderReviewHome(
             controls.confirmedSnapshot.snapshotRevision,
             controls.confirmedSnapshot.profileRevision,
             controls.confirmedSnapshot.projectionRevision,
+            controls.confirmedSnapshot.throughDate,
           );
           confirmation.dataset.busy = "false";
           confirmation.setAttribute("aria-busy", "false");
@@ -422,6 +394,7 @@ export function renderReviewHome(
           controls.reviewActions?.failure?.(error);
           confirm.focus?.();
         }
+        if (confirmation.hidden) markAll.disabled = false;
       },
     );
     confirm.setAttribute("aria-describedby", "review-finish-all-description");
@@ -432,33 +405,35 @@ export function renderReviewHome(
       markAll.focus?.();
     });
     confirmation.append(confirm, cancel);
-    controls.append(startButton, retryButton, abstractButton, markAll, confirmation);
+    controls.append(startButton, retryButton, markAll, confirmation);
     view.append(controls);
   }
 
-  controls.reviewActions = { start, retryFailed, retryAbstracts, finishAll, pending, failure };
+  controls.reviewActions = { start, retryFailed, finishAll, pending, failure };
   controls.reviewSummary = summary;
   controls.reviewRetry = retry;
-  controls.reviewAbstractRetry = abstracts;
-  controls.reviewMissingAbstracts = missingAbstracts;
   controls.reviewSynchronizing = synchronizing;
+  controls.reviewPaused = arxivAccess?.paused === true;
   const startButton = controls.querySelector(".review-start");
+  startButton.hidden = !hasReview;
   startButton.dataset.date = oldest;
   updateStartButton(startButton);
   updateRetryButton(
     controls.querySelector(".review-retry-failed"),
     retry,
     synchronizing,
-  );
-  updateAbstractRetryButton(
-    controls.querySelector(".review-retry-abstracts"),
-    abstracts,
-    missingAbstracts,
-    synchronizing,
+    controls.reviewPaused,
   );
   const confirmation = controls.querySelector(
     ".review-finish-all-confirmation",
   );
+  const markAll = controls.querySelector(".review-finish-all");
+  markAll.hidden = !hasReview;
+  if (!hasReview) {
+    confirmation.hidden = true;
+    markAll.setAttribute("aria-expanded", "false");
+  }
+  markAll.disabled = !confirmation.hidden || confirmation.dataset.busy === "true";
   if (confirmation.hidden) {
     confirmation.querySelector("p").textContent =
       finishAllConfirmationText(summary);
@@ -534,6 +509,108 @@ function navigationButton(document, label, destination, navigate, failure) {
   );
 }
 
+function abstractRetryResultText(retry) {
+  const recovered = nonnegativeCount(retry?.recovered);
+  const remaining = nonnegativeCount(retry?.remaining);
+  let text = `${retry?.status === "interrupted" ? "Retry interrupted. " : ""}Recovered ${recovered} ${recovered === 1 ? "abstract" : "abstracts"}; ${remaining} still unavailable.`;
+  const codes = Array.isArray(retry?.error_codes) ? retry.error_codes : [];
+  const statuses = [...new Set(codes.map((code) =>
+    /^arxiv_http_(\d{3})$/.exec(String(code))?.[1],
+  ).filter(Boolean))];
+  if (statuses.length) {
+    text += ` arXiv requests failed (${statuses.map((code) => `HTTP ${code}`).join(", ")}).`;
+  } else if (codes.some((code) => code !== "cancelled")) {
+    text += " Some arXiv requests failed. You can retry later.";
+  }
+  return text;
+}
+
+export function updateReviewAbstractStatus(document, view, page, actions = {}) {
+  const day = dayOf(page);
+  const missing = nonnegativeCount(page?.missing_abstracts);
+  const retry = actions.abstractRetry?.retry_date === day ? actions.abstractRetry : null;
+  const running = retry?.status === "running";
+  const terminal = retry?.status === "completed" || retry?.status === "interrupted";
+  let notice = view.querySelector(".review-abstract-notice");
+  if (!notice) {
+    notice = element(document, "div", undefined, "review-abstract-notice");
+    view.append(notice);
+  }
+  notice.abstractActions = actions;
+  notice.abstractPage = page;
+  notice.hidden = missing === 0 && !terminal && !running;
+  let description = notice.querySelector(".review-abstract-availability");
+  let control = notice.querySelector(".review-retry-abstracts");
+  if (missing > 0 || running) {
+    if (!description) {
+      description = element(document, "p", undefined, "review-abstract-availability");
+      notice.append(description);
+    }
+    description.hidden = false;
+    const ready = nonnegativeCount(page?.abstracts_ready);
+    description.textContent = `${ready} of ${ready + missing} abstracts available. You can still review and finish this date.`;
+    if (!control) {
+      control = button(document, "Retry missing abstracts", async () => {
+        if (control.disabled || control.dataset.busy === "true") return;
+        control.dataset.busy = "true";
+        const refresh = () => updateReviewAbstractStatus(document, view, notice.abstractPage, notice.abstractActions);
+        refresh();
+        let failed = false;
+        try {
+          await notice.abstractActions.retryAbstracts?.(day);
+        } catch (error) {
+          failed = true;
+          notice.abstractActions.failure?.(error);
+        } finally {
+          control.dataset.busy = "false";
+          refresh();
+          if (failed) control.focus?.();
+        }
+      });
+      control.className = "review-retry-abstracts";
+      notice.append(control);
+    }
+    const progress = normalizedRetry(retry);
+    const busy = control.dataset.busy === "true";
+    control.hidden = false;
+    control.textContent = running
+      ? `Retrying abstracts… ${progress.completed} of ${progress.total} checked`
+      : busy ? "Starting abstract retry…" : "Retry missing abstracts";
+    control.disabled = busy || running || actions.synchronizing === true || actions.arxivAccess?.paused === true;
+    control.setAttribute("aria-busy", busy || running ? "true" : "false");
+  } else {
+    if (description) description.hidden = true;
+    if (control) control.hidden = true;
+  }
+  let result = notice.querySelector(".review-abstract-retry-result");
+  if (terminal) {
+    if (!result) {
+      result = element(document, "p", undefined, "review-abstract-retry-result");
+      result.setAttribute("role", "status");
+      result.setAttribute("aria-live", "polite");
+      notice.append(result);
+    }
+    result.hidden = false;
+    const message = abstractRetryResultText(retry);
+    if (result.textContent !== message) result.textContent = message;
+  } else if (result) {
+    result.hidden = true;
+  }
+  const accessMessage = arxivAccessPauseText(actions.arxivAccess);
+  let accessStatus = notice.querySelector(".arxiv-access-status");
+  if (missing > 0 && accessMessage) {
+    if (!accessStatus) {
+      accessStatus = element(document, "p", undefined, "arxiv-access-status");
+      accessStatus.setAttribute("role", "status");
+      notice.append(accessStatus);
+    }
+    accessStatus.hidden = false;
+    if (accessStatus.textContent !== accessMessage) accessStatus.textContent = accessMessage;
+  } else if (accessStatus) {
+    accessStatus.hidden = true;
+  }
+}
+
 export function renderReviewView(document, container, page, actions = {}) {
   const cards = cardsOf(page);
   if (cards.length > 20) throw new RangeError("Review pages cannot exceed 20 cards");
@@ -561,6 +638,7 @@ export function renderReviewView(document, container, page, actions = {}) {
       "page-count",
     ),
   );
+  updateReviewAbstractStatus(document, view, page, actions);
 
   const dateNavigation = element(document, "nav", undefined, "date-navigation");
   dateNavigation.setAttribute("aria-label", "Review dates");

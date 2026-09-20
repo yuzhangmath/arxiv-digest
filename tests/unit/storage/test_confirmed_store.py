@@ -463,6 +463,7 @@ def test_corrected_daily_list_date_preserves_event_and_date_state(
         observed_at=OBSERVED_AT,
     )
 
+    prior_projection = store.review_revisions()[1]
     corrected = store.apply_catchup_day(
         corrected_day, (corrected_observation,), OBSERVED_AT
     )[0]
@@ -470,6 +471,7 @@ def test_corrected_daily_list_date_preserves_event_and_date_state(
     assert corrected.event_id == original.event_id
     assert corrected.daily_list_date == new_day
     assert corrected.reviewed_at == OBSERVED_AT
+    assert store.review_revisions()[1] > prior_projection
     connection = sqlite3.connect(store.database_path)
     assert connection.execute(
         "SELECT daily_list_date FROM review_date_state"
