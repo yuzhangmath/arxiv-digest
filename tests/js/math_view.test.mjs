@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -101,7 +101,7 @@ test("the KaTeX manifest has the exact version and sorted hashes for every vendo
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) found.push(...await filesBelow(path));
-      else if (entry.name !== "katex-manifest.json") found.push(relative(vendor, path));
+      else if (entry.name !== "katex-manifest.json") found.push(relative(vendor, path).split(sep).join("/"));
     }
     return found.sort();
   }

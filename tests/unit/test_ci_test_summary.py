@@ -42,10 +42,10 @@ def test_error_case_is_reported_and_passing_or_skipped_cases_are_omitted(tmp_pat
 
 def test_missing_report_does_not_add_a_new_diagnostic_failure(tmp_path: Path, capsys) -> None:
     assert ci_test_summary.main([str(tmp_path / "missing.xml")]) == 0
-    assert capsys.readouterr().out == "Python test report is unavailable; see the earlier failed step.\n"
+    assert capsys.readouterr().out == "Test report is unavailable; see the earlier failed step.\n"
 
 
-def test_workflows_preserve_pytest_failure_and_only_summarize_failed_jobs() -> None:
+def test_workflows_preserve_test_failures_and_only_summarize_failed_jobs() -> None:
     root = Path(__file__).resolve().parents[2]
     for name in ("tests.yml", "release.yml"):
         workflow = (root / ".github/workflows" / name).read_text()
@@ -64,3 +64,13 @@ def test_workflows_preserve_pytest_failure_and_only_summarize_failed_jobs() -> N
             suite = workflow.index(command)
             summary = workflow.index(f"      - name: Summarize {label} test failures\n")
             assert suite < summary
+        assert "node --test --test-reporter=spec --test-reporter=junit" in workflow
+        assert '--test-reporter-destination="$RUNNER_TEMP/javascript-tests.xml"' in workflow
+        assert (
+            "      - name: Summarize JavaScript test failures\n"
+            "        if: failure() && matrix.suite == 'python'\n"
+            '        run: python scripts/ci_test_summary.py "$RUNNER_TEMP/javascript-tests.xml"\n'
+        ) in workflow
+        assert workflow.index("      - name: Run JavaScript tests\n") < workflow.index(
+            "      - name: Summarize JavaScript test failures\n"
+        )

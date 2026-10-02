@@ -100,7 +100,14 @@ jobs:
         run: python scripts/ci_test_summary.py "$RUNNER_TEMP/python-tests.xml"
       - name: Run JavaScript tests
         if: matrix.suite == 'python'
-        run: node --test tests/js/*.test.mjs
+        run: |
+          node --test --test-reporter=spec --test-reporter=junit \
+            --test-reporter-destination=stdout \
+            --test-reporter-destination="$RUNNER_TEMP/javascript-tests.xml" \
+            tests/js/*.test.mjs
+      - name: Summarize JavaScript test failures
+        if: failure() && matrix.suite == 'python'
+        run: python scripts/ci_test_summary.py "$RUNNER_TEMP/javascript-tests.xml"
       - name: Install Playwright browsers and Linux dependencies
         if: matrix.suite == 'browser' && runner.os == 'Linux'
         run: python -m playwright install --with-deps chromium webkit

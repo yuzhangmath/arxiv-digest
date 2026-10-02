@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Expose bounded pytest failures through GitHub Actions annotations."""
+"""Expose bounded JUnit test failures through GitHub Actions annotations."""
 from __future__ import annotations
 
 import sys
@@ -37,12 +37,12 @@ def _escape(value: str, *, limit: int, property_value: bool = False) -> str:
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     if len(arguments) != 1:
-        print("Python test report is unavailable; see the earlier failed step.")
+        print("Test report is unavailable; see the earlier failed step.")
         return 0
     try:
         root = ET.parse(Path(arguments[0])).getroot()
     except (OSError, ET.ParseError):
-        print("Python test report is unavailable; see the earlier failed step.")
+        print("Test report is unavailable; see the earlier failed step.")
         return 0
     emitted = 0
     for case in root.iter("testcase"):
@@ -55,14 +55,14 @@ def main(argv: list[str] | None = None) -> int:
             for value in (failure.get("message"), failure.text) if value
         )
         print(
-            f"::error title={_escape(title or 'Python test failure', limit=256, property_value=True)}::"
-            f"{_escape(details or 'Python test failed.', limit=8000)}"
+            f"::error title={_escape(title or 'Test failure', limit=256, property_value=True)}::"
+            f"{_escape(details or 'Test failed.', limit=8000)}"
         )
         emitted += 1
         if emitted == 10:
             break
     if not emitted:
-        print("Python test report contains no failed testcases; see the earlier failed step.")
+        print("Test report contains no failed testcases; see the earlier failed step.")
     return 0
 
 
