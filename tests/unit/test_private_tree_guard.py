@@ -47,7 +47,12 @@ class PrivateTreeGuardTest(unittest.TestCase):
             external = root / "secret.txt"
             external.write_text("FIRST PRIVATE VALUE", encoding="utf-8")
             link = source / "external-link"
-            link.symlink_to(external)
+            try:
+                link.symlink_to(external)
+            except OSError as error:
+                if getattr(error, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink creation requires Developer Mode or privilege")
+                raise
 
             before = create_snapshot(source, include_git=False)
             external.write_text("SECOND PRIVATE VALUE", encoding="utf-8")
@@ -66,10 +71,10 @@ class PrivateTreeGuardTest(unittest.TestCase):
             source.mkdir()
             saved = source / "saved.txt"
             saved.write_text("unchanged", encoding="utf-8")
-            saved.chmod(0o600)
+            saved.chmod(0o444 if os.name == "nt" else 0o600)
             before = create_snapshot(source, include_git=False)
 
-            saved.chmod(0o644)
+            saved.chmod(0o666 if os.name == "nt" else 0o644)
 
             result = verify_snapshot(source, before, include_git=False)
             self.assertEqual(result.changed, ("saved.txt",))
@@ -113,7 +118,13 @@ class PrivateTreeGuardTest(unittest.TestCase):
                 _write_manifest_atomic(manifest, b"first\n")
 
             self.assertEqual(manifest.read_bytes(), b"first\n")
-            self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+            if os.name == "nt":
+                from arxiv_digest.atomic import validate_private_file
+
+                with manifest.open("rb") as handle:
+                    validate_private_file(handle.fileno())
+            else:
+                self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
             link.assert_called_once()
             self.assertEqual(tuple(manifest.parent.glob(".snapshot.json.*")), ())
 
@@ -143,7 +154,12 @@ class PrivateTreeGuardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "snapshot.json"
             original_target = "missing-private-target"
-            manifest.symlink_to(original_target)
+            try:
+                manifest.symlink_to(original_target)
+            except OSError as error:
+                if getattr(error, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink creation requires Developer Mode or privilege")
+                raise
 
             with self.assertRaises(FileExistsError):
                 _write_manifest_atomic(manifest, b"ours\n")

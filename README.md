@@ -1,25 +1,24 @@
 # arXiv Digest
 
-arXiv Digest is a local, explainable review queue for arXiv. It runs on macOS
-and Linux, keeps its durable state on your computer, and opens a loopback-only
+arXiv Digest is a local, explainable review queue for arXiv. It runs on macOS,
+Windows, and Linux, keeps its durable state on your computer, and opens a loopback-only
 dashboard in your browser. There is no cloud account, telemetry, or API key.
 It is an independent project and is not affiliated with or endorsed by arXiv.
 
-This guide describes the current unreleased checkout, including its shorter
-setup, manual updates, and terminal backup restore. The `@v0.3.1` commands
-below install the published release; follow the
-[v0.3.1 guide](https://github.com/yuzhangmath/arxiv-digest/blob/v0.3.1/README.md)
-for that release's workflow. See the [Unreleased changes](CHANGELOG.md#unreleased)
-for changes since that tag.
+This guide describes v0.4.0, including its shorter setup, native Windows
+support, manual updates, and terminal backup restore. See the
+[v0.4.0 release notes](docs/releases/v0.4.0.md) for changes since v0.3.1.
+The tagged installation commands below require `v0.4.0` to appear on the
+[releases page](https://github.com/yuzhangmath/arxiv-digest/releases) first.
 Already using an earlier version? Follow the
 [upgrade guide](docs/installation.md#upgrade-within-application-data-generation-2)
 to back up, replace the program, and verify your saved state.
 
-Already have Python 3.11+, Git, and `pipx`? Open a terminal and run these
-commands one at a time:
+Already have Python 3.11+, Git, and `pipx` on macOS, Windows, or Linux?
+Open a terminal (PowerShell on Windows) and run these commands one at a time:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.4.0
 arxiv-digest init
 ```
 
@@ -76,7 +75,7 @@ name and link the seed or saved paper that contributed the match.
 
 You need:
 
-- macOS or Linux; Windows is not supported in version 0.3.1
+- macOS, Windows 11 or newer, or Linux
 - Python 3.11 or newer
 - Git
 - a current `pipx`
@@ -89,11 +88,24 @@ python3 --version
 git --version
 ```
 
+On Windows, open PowerShell and use `py --version` instead of `python3 --version`.
+The Windows app uses the default browser, a native folder picker, and an optional
+desktop launcher; WSL is not required.
+
 ## Install
 
 ### 1. Install pipx
 
 If `pipx --version` already works, continue to the next step.
+
+On Windows, open PowerShell and run:
+
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath
+```
+
+Open a new PowerShell window, then continue with **2. Install arXiv Digest** below.
 
 In a terminal on macOS with Homebrew, install `pipx`:
 
@@ -150,10 +162,11 @@ pipx --version
 
 ### 2. Install arXiv Digest
 
-In that terminal, install from the public HTTPS repository:
+On macOS, Windows, or Linux, install the tagged release from the public HTTPS
+repository once `v0.4.0` appears on the releases page:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.4.0
 ```
 
 When installation finishes, verify that the installed command works:
@@ -162,7 +175,7 @@ When installation finishes, verify that the installed command works:
 arxiv-digest doctor
 ```
 
-On a fresh installation, `doctor` should report version `0.3.1`, a missing
+On a fresh installation, `doctor` should report version `0.4.0`, a missing
 profile and database, and `arxiv-digest init` as the next step. If your shell
 cannot find `arxiv-digest`, open a new terminal after `pipx ensurepath` and try
 again.
@@ -360,8 +373,8 @@ transfer backups only through trusted channels.
 This release uses application-data generation 2, profile schema 2, and
 portable backup format 2. Earlier databases, profiles, and portable backups
 from application-data generation 1 are rejected without modification; they
-are not converted or imported. Generation-2 data from 0.2.0, 0.2.1, and 0.3.0 remains
-compatible.
+are not converted or imported. Generation-2 data from 0.2.0, 0.2.1, 0.3.0, and
+0.3.1 remains compatible.
 
 `arxiv-digest doctor` prints read-only, redacted diagnostics without changing
 local state or making network requests. See
@@ -412,6 +425,7 @@ PDF, launcher, backup, and recovery guidance.
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
+- [v0.4.0 release notes](docs/releases/v0.4.0.md)
 - [v0.3.1 release notes](docs/releases/v0.3.1.md)
 - [v0.3.0 update-bootstrap notes](docs/releases/v0.3.0.md)
 - [v0.2.1 technical-beta notes](docs/releases/v0.2.1.md)

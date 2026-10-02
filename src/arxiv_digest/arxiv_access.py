@@ -8,10 +8,9 @@ import json
 from math import isfinite
 import os
 from pathlib import Path
-import stat
 from threading import Lock
 
-from arxiv_digest.atomic import atomic_write, exclusive_flock
+from arxiv_digest.atomic import atomic_write, exclusive_flock, open_private_read_file
 
 
 _DEFAULT_COOLDOWN_SECONDS = 60 * 60
@@ -108,16 +107,10 @@ class ArxivCooldown:
             return None
         descriptor: int | None = None
         try:
-            descriptor = os.open(
-                self._path,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK,
-            )
+            descriptor = open_private_read_file(self._path)
             metadata = os.fstat(descriptor)
             if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.getuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or metadata.st_size > _MAX_STATE_BYTES
+                metadata.st_size > _MAX_STATE_BYTES
             ):
                 raise ValueError("invalid cooldown file")
             with os.fdopen(descriptor, "rb") as handle:

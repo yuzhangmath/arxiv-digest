@@ -1,8 +1,32 @@
 from __future__ import annotations
 
 import threading
+import sys
+from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.mark.parametrize("wait_result, expected", [(258, True), (0, False)])
+def test_windows_pid_probe_uses_a_non_destructive_process_handle(monkeypatch, wait_result, expected):
+    from arxiv_digest.web import lifecycle
+
+    closed = []
+    opened = []
+    handle = SimpleNamespace(Close=lambda: closed.append(True))
+    monkeypatch.setattr(lifecycle, "sys", SimpleNamespace(platform="win32"), raising=False)
+    monkeypatch.setitem(sys.modules, "win32api", SimpleNamespace(
+        OpenProcess=lambda rights, inherit, pid: opened.append((rights, inherit, pid)) or handle,
+        error=OSError,
+    ))
+    monkeypatch.setitem(sys.modules, "win32con", SimpleNamespace(SYNCHRONIZE=0x100000))
+    monkeypatch.setitem(sys.modules, "win32event", SimpleNamespace(
+        WaitForSingleObject=lambda actual, timeout: wait_result, WAIT_TIMEOUT=258,
+    ))
+    monkeypatch.setattr(lifecycle.os, "kill", lambda *args: pytest.fail("Windows kill(pid, 0) terminates the process"))
+    assert lifecycle._pid_alive(1234) is expected
+    assert opened == [(0x100000, False, 1234)]
+    assert closed == [True]
 
 
 

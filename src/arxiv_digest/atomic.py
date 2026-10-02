@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import math
 import os
 import stat
@@ -11,9 +10,84 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+if os.name == "nt":
+    from arxiv_digest import _windows
+else:
+    import fcntl
+
+
+def set_private_file_permissions(descriptor: int, mode: int = 0o600) -> None:
+    """Apply private permissions to an open file without reopening its path."""
+    if os.name == "nt":
+        _windows.set_private_file_permissions(descriptor)
+    else:
+        os.fchmod(descriptor, mode)
+
+
+def validate_private_file(descriptor: int) -> None:
+    if os.name == "nt":
+        _windows.validate_private_file(descriptor)
+    else:
+        _validate_private_lock_file(os.fstat(descriptor))
+
+
+def open_private_read_file(path: Path) -> int:
+    """Open a private regular file without following a final symlink."""
+    if os.name == "nt":
+        return _windows.open_private_file(path, create=False)
+    descriptor = os.open(
+        path, os.O_RDONLY | _required_open_flag("O_NOFOLLOW")
+        | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        validate_private_file(descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def fsync_directory(path: Path) -> None:
+    """Flush POSIX directory entries; Windows has no directory-fsync equivalent.
+
+    Windows commits flush file contents and use write-through replacement.
+    Its filesystem controls durability of directory creation/deletion metadata.
+    """
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def replace_file(source: Path, destination: Path) -> None:
+    """Replace a file atomically, requesting write-through on Windows."""
+    if os.name == "nt":
+        _windows.replace_file(source, destination)
+    else:
+        os.replace(source, destination)
+
+
+def _lock(descriptor: int, *, blocking: bool) -> None:
+    if os.name == "nt":
+        _windows.lock(descriptor, blocking=blocking)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+
+
+def _unlock(descriptor: int) -> None:
+    if os.name == "nt":
+        _windows.unlock(descriptor)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def ensure_private_directory(path: Path) -> None:
+    if os.name == "nt":
+        _windows.ensure_private_directory(path, strict=False)
+        return
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     flags = (
         os.O_RDONLY
@@ -39,6 +113,9 @@ def ensure_private_directory(path: Path) -> None:
 def ensure_private_directory_strict(path: Path) -> None:
     """Create or validate an exact private directory without repairing it."""
 
+    if os.name == "nt":
+        _windows.ensure_private_directory(path, strict=True)
+        return
     flags = (
         os.O_RDONLY
         | _required_open_flag("O_DIRECTORY")
@@ -100,6 +177,8 @@ def _validate_private_lock_file(metadata: os.stat_result) -> None:
 def open_private_lock_file(path: Path) -> int:
     """Return a stable no-follow coordination descriptor, owned by the caller."""
 
+    if os.name == "nt":
+        return _windows.open_private_file(path, create=True)
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -141,17 +220,13 @@ def atomic_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
+            set_private_file_permissions(handle.fileno(), mode)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        replace_file(temporary, path)
+        fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -160,24 +235,30 @@ def atomic_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
 @contextmanager
 def exclusive_flock(path: Path) -> Iterator[None]:
     ensure_private_directory(path.parent)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
+    if os.name == "nt":
+        descriptor = open_private_lock_file(path)
+    else:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, 0o600)
     locked = False
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise PermissionError("lock target must be a regular file")
-        if metadata.st_uid != os.getuid():
-            raise PermissionError("lock file must be owned by the current user")
-        if stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise PermissionError("lock file permissions must be 0600")
-        os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if os.name == "nt":
+            validate_private_file(descriptor)
+        else:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise PermissionError("lock target must be a regular file")
+            if metadata.st_uid != os.getuid():
+                raise PermissionError("lock file must be owned by the current user")
+            if stat.S_IMODE(metadata.st_mode) != 0o600:
+                raise PermissionError("lock file permissions must be 0600")
+            os.fchmod(descriptor, 0o600)
+        _lock(descriptor, blocking=True)
         locked = True
         yield
     finally:
         if locked:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            _unlock(descriptor)
         os.close(descriptor)
 
 
@@ -192,7 +273,7 @@ class ExclusiveLock:
         if self._descriptor is not None:
             descriptor, self._descriptor = self._descriptor, None
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                _unlock(descriptor)
             finally:
                 os.close(descriptor)
 
@@ -207,6 +288,9 @@ def acquire_exclusive(path: Path, *, timeout: float = 0) -> ExclusiveLock:
     deadline = time.monotonic() + timeout
 
     def validate() -> None:
+        if os.name == "nt":
+            _windows.validate_private_path(descriptor, path)
+            return
         for metadata in (os.fstat(descriptor), path.lstat()):
             _validate_private_lock_file(metadata)
             if _private_identity(metadata) != identity:
@@ -216,7 +300,7 @@ def acquire_exclusive(path: Path, *, timeout: float = 0) -> ExclusiveLock:
         while True:
             validate()
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock(descriptor, blocking=False)
                 validate()
                 return ExclusiveLock(descriptor)
             except (BlockingIOError, InterruptedError):

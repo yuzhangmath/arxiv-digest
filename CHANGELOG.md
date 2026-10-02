@@ -5,14 +5,44 @@ This file records notable user-visible changes to arXiv Digest.
 ## Contents
 
 - [Unreleased](#unreleased)
+- [0.4.0](#040---2026-10-02)
 - [0.3.1](#031---2026-09-15)
 - [0.3.0](#030---2026-09-08)
 - [0.2.1](#021---2026-08-25)
 
 ## Unreleased
 
+No changes yet.
+
+## [0.4.0] - 2026-10-02
+
+See the [v0.4.0 release notes](docs/releases/v0.4.0.md) for installation and
+generation-2 upgrade guidance.
+
+### Added
+
+- Native Windows support, with local application data, Windows file permissions
+  and locking, browser and clipboard integration, a native PDF-folder picker,
+  and an optional desktop launcher. Windows, macOS, and Linux share the tagged
+  pipx installation route.
+- Windows CI and release validation alongside macOS and Linux, covering Python,
+  Chromium, WebKit, and installation of the wheel through pipx.
+- Settings offers retries for individual failed category/date daily lists.
+  Calendar shows **Retrieval failed** for dates without confirmed papers and
+  **Some retrievals failed** when confirmed papers remain available.
+- Paced system-`curl` fallbacks for plain HTTP 406 from daily-list retrieval,
+  OAI metadata synchronization, and abstract lookups. Daily lists also retain
+  a compatibility attempt without inline abstracts.
+- Persistent pauses after HTTP 429 or explicit arXiv rate-limit responses,
+  using the supplied retry time or a one-hour fallback. Pauses survive restarts
+  while saved Review and Library papers remain available.
+
 ### Changed
 
+- Daily-list dates become eligible at 20:00 America/New_York, consistently
+  across retrieval, Review, Calendar, and coverage counts.
+- Confirmed dates remain reviewable and finishable when abstracts are missing.
+  Retrying daily-list retrieval preserves abstracts already stored locally.
 - New PDF downloads use all authors' surnames followed by the title, without an
   arXiv ID or version prefix. Existing filenames are preserved, and conflicting
   new filenames receive a numbered suffix. Filename associations survive folder
@@ -149,3 +179,5 @@ Full technical-beta notes are available in the
 [0.3.0]: https://github.com/yuzhangmath/arxiv-digest/compare/v0.2.1...v0.3.0
 
 [0.3.1]: https://github.com/yuzhangmath/arxiv-digest/compare/v0.3.0...v0.3.1
+
+[0.4.0]: https://github.com/yuzhangmath/arxiv-digest/compare/v0.3.1...v0.4.0

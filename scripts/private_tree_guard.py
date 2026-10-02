@@ -86,7 +86,7 @@ def _file_state(path: Path) -> FileState:
         return FileState("symlink", mode, len(target), hashlib.sha256(target).hexdigest())
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError("unsupported non-regular file")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     descriptor = os.open(path, flags)
     digest = hashlib.sha256()
     size = 0
@@ -152,17 +152,23 @@ def _write_manifest_atomic(path: Path, payload: bytes) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
+            if os.name == "nt":
+                from arxiv_digest.atomic import set_private_file_permissions
+
+                set_private_file_permissions(handle.fileno())
+            else:
+                os.fchmod(handle.fileno(), 0o600)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.link(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        if os.name != "nt":
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
 

@@ -26,7 +26,6 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Protocol, TextIO
-from urllib.parse import quote
 from urllib.parse import unquote, urlsplit
 
 
@@ -144,17 +143,22 @@ def publish_denylist(denylist: Denylist, destination: Path) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            _set_private_file_permissions(handle.fileno())
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        directory_fd = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if os.name == "nt":
+            from arxiv_digest.atomic import replace_file
+
+            replace_file(temporary, destination)
+        else:
+            os.replace(temporary, destination)
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     except BaseException:
         try:
             os.close(descriptor)
@@ -165,6 +169,17 @@ def publish_denylist(denylist: Denylist, destination: Path) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _set_private_file_permissions(descriptor: int) -> None:
+    # The standalone POSIX audit remains stdlib-only. Windows audit operations
+    # use the same native ACL support as the installed application.
+    if os.name == "nt":
+        from arxiv_digest.atomic import set_private_file_permissions
+
+        set_private_file_permissions(descriptor)
+    else:
+        os.fchmod(descriptor, 0o600)
 
 
 def load_denylist(path: Path) -> Denylist:
@@ -776,6 +791,7 @@ def _open_regular_sqlite_member(path: Path) -> int:
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
     )
     descriptor = os.open(path, flags)
     opened = os.fstat(descriptor)
@@ -796,11 +812,12 @@ def _copy_regular_sqlite_member(source: Path, destination: Path) -> None:
     try:
         destination_descriptor = os.open(
             destination,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0),
             0o600,
         )
         try:
-            os.fchmod(destination_descriptor, 0o600)
+            _set_private_file_permissions(destination_descriptor)
             with os.fdopen(source_descriptor, "rb", closefd=False) as source_handle:
                 with os.fdopen(
                     destination_descriptor,
@@ -832,10 +849,11 @@ def _copy_sqlite_snapshot(path: Path, destination: Path) -> None:
         after = _sqlite_snapshot_digests(path)
         copied = _sqlite_snapshot_digests(destination)
         if before == after == copied:
-            os.chmod(destination, 0o600)
-            snapshot_wal = destination.with_name(destination.name + "-wal")
-            if snapshot_wal.exists():
-                os.chmod(snapshot_wal, 0o600)
+            if os.name != "nt":
+                os.chmod(destination, 0o600)
+                snapshot_wal = destination.with_name(destination.name + "-wal")
+                if snapshot_wal.exists():
+                    os.chmod(snapshot_wal, 0o600)
             return
     raise ValueError("SQLite source changed during read-only inspection")
 
@@ -843,10 +861,15 @@ def _copy_sqlite_snapshot(path: Path, destination: Path) -> None:
 def _collect_sqlite(path: Path, collected: dict[str, set[str]]) -> None:
     with tempfile.TemporaryDirectory(prefix="arxiv-digest-sqlite-") as temporary:
         temporary_path = Path(temporary)
-        os.chmod(temporary_path, 0o700)
+        if os.name == "nt":
+            from arxiv_digest.atomic import ensure_private_directory
+
+            ensure_private_directory(temporary_path)
+        else:
+            os.chmod(temporary_path, 0o700)
         snapshot = temporary_path / path.name
         _copy_sqlite_snapshot(path, snapshot)
-        uri = f"file:{quote(str(snapshot), safe='/')}?mode=ro"
+        uri = snapshot.as_uri() + "?mode=ro"
         connection = sqlite3.connect(uri, uri=True)
         try:
             connection.execute("PRAGMA query_only = ON")

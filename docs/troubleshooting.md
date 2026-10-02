@@ -7,6 +7,7 @@ interests, identifiers, or local paths.
 
 - [Run redacted diagnostics](#run-redacted-diagnostics)
 - [The dashboard does not open](#the-dashboard-does-not-open)
+- [Windows cannot find the command](#windows-cannot-find-the-command)
 - [WSL cannot open the Windows browser](#wsl-cannot-open-the-windows-browser)
 - [First-run setup cannot load live data](#first-run-setup-cannot-load-live-data)
 - [Interests suggestions do not load](#interests-suggestions-do-not-load)
@@ -47,7 +48,21 @@ address for the existing instance. Paste it into your browser's address bar
 and keep the original server terminal running. The option also works after
 `init`, `library`, or `config`. If copying fails, the complete URL is printed
 on its own line for manual copying. Clipboard access uses `pbcopy` on macOS,
-or an available `wl-copy`, `xclip`, or `xsel` tool in a Linux desktop session.
+`clip.exe` on Windows, or an available `wl-copy`, `xclip`, or `xsel` tool in a
+Linux desktop session.
+
+## Windows cannot find the command
+
+Run `py -m pipx ensurepath`, close PowerShell, and open a new window. Then run
+`pipx list` and `Get-Command arxiv-digest` to check the installed command. If
+`py` is unavailable, use the Python command from your installation.
+
+Native Windows support starts with v0.4.0. Follow
+[the installation steps](installation.md#install-arxiv-digest).
+For a missing desktop launcher, run `arxiv-digest install-launcher` after
+installation or upgrading. Double-click **arXiv Digest.cmd** on your Desktop.
+A terminal window remains open while that launcher
+runs the app; use **Quit** in the dashboard to finish.
 
 ## WSL cannot open the Windows browser
 
@@ -72,9 +87,9 @@ These Windows actions require
 [WSL interoperability](https://learn.microsoft.com/en-us/windows/wsl/filesystems#run-windows-tools-from-linux)
 and the relevant Windows tool (`powershell.exe` or `clip.exe`) on WSL's
 `PATH`. If Windows integration is disabled or the tool fails, the app prints
-the address for manual copying and keeps the dashboard available. Native
-Windows installation remains unsupported; this applies to Linux running
-inside WSL.
+the address for manual copying and keeps the dashboard available. This section
+applies to Linux running inside WSL. Native Windows users can install v0.4.0
+directly with the Windows instructions above.
 
 ## First-run setup cannot load live data
 

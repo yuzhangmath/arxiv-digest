@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timezone
 from math import isclose
@@ -266,7 +267,7 @@ def test_previously_reviewed_papers_missing_abstracts_remain_readable(review) ->
     first, later = date(2026, 8, 3), date(2026, 8, 4)
     _add(store, 1, first, abstract="")
     _add(store, 2, later, abstract="")
-    with open_database(store.database_path) as connection:
+    with closing(open_database(store.database_path)) as connection, connection:
         connection.execute(
             "UPDATE canonical_events SET reviewed_at = ? WHERE daily_list_date = ?",
             ("2026-08-05T00:00:00Z", first.isoformat()),
@@ -506,7 +507,7 @@ def test_reopened_date_tiers_new_cards_against_the_complete_date(
         seed,
         (PaperVersion(1, datetime(2025, 1, 1, tzinfo=timezone.utc)),),
     )
-    profiles.profile = _profile(tmp_path=Path("/tmp"), seed_papers=(seed_id,))
+    profiles.profile = _profile(tmp_path=Path("/tmp").resolve(), seed_papers=(seed_id,))
     day = date(2026, 8, 3)
     for number in range(1, 11):
         title = (
@@ -555,7 +556,7 @@ def test_pagination_resume_and_navigation_do_not_finish(
         profile_revision=second.profile_revision,
         projection_revision=second.projection_revision,
     )
-    profiles.profile = _profile(Path("/tmp"), revision=2)
+    profiles.profile = _profile(Path("/tmp").resolve(), revision=2)
     resumed = service.open_date(day)
     assert resumed.page_number == 1
     assert service.summary().unreviewed_papers == 27
@@ -983,7 +984,7 @@ def test_profile_change_reranks_without_resetting_review_state(
 
     neutral = service.open_date(day)
     assert neutral.cards[0].event.event_id != second_id
-    profiles.profile = _profile(Path("/tmp"), revision=2, keywords=("graph",))
+    profiles.profile = _profile(Path("/tmp").resolve(), revision=2, keywords=("graph",))
     reranked = service.open_date(day)
     assert reranked.cards[0].event.event_id == second_id
 
@@ -994,7 +995,7 @@ def test_profile_change_reranks_without_resetting_review_state(
         projection_revision=reranked.projection_revision,
         finished_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
     )
-    profiles.profile = _profile(Path("/tmp"), revision=3, keywords=("other",))
+    profiles.profile = _profile(Path("/tmp").resolve(), revision=3, keywords=("other",))
     assert service.summary().unreviewed_papers == 0
 
 
@@ -1019,7 +1020,7 @@ def test_review_builds_seed_vectors_from_durable_metadata(
     related_id = _add(store, 1, day, title="Quantum widget methods")
     _add(store, 2, day, title="Unrelated queue bookkeeping")
     profiles.profile = _profile(
-        Path("/tmp"), revision=2, seed_papers=(seed_id,)
+        Path("/tmp").resolve(), revision=2, seed_papers=(seed_id,)
     )
 
     page = service.open_date(day)

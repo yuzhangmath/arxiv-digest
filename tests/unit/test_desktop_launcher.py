@@ -59,14 +59,17 @@ def test_explicit_launcher_repair_removes_historical_recovery_wrapper(
         manifest = manager.target / "Contents/Resources/ownership.json"
         ownership = json.loads(manifest.read_text())
         ownership["executable_sha256"] = hashlib.sha256(payload).hexdigest()
-        manifest.write_text(json.dumps(ownership, sort_keys=True, separators=(",", ":")) + "\n")
+        manifest.write_text(json.dumps(ownership, sort_keys=True, separators=(",", ":")) + "\n", newline="\n")
     else:
         script = (
             f"if [ -e {wrapper} ] || [ -L {wrapper} ]; then {wrapper} || exit $?; "
             f"fi; exec {shlex.quote(str(executable))}"
-        ).replace("$", "\\$")
+        ).replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%")
         launcher = manager.target
-        launcher.write_text(launcher.read_text().replace(f'Exec="{executable}"', f'Exec=/bin/sh -c "{script}"'))
+        launcher.write_text("".join(
+            f'Exec=/bin/sh -c "{script}"\n' if line.startswith("Exec=") else line
+            for line in launcher.read_text().splitlines(keepends=True)
+        ), newline="\n")
     assert manager.status().state is LauncherState.OUTDATED
     assert manager.install().state is LauncherState.INSTALLED
     assert b"recover-arxiv-digest" not in launcher.read_bytes()
@@ -331,7 +334,8 @@ def test_macos_launcher_is_owned_atomic_idempotent_and_foreground(
     assert str(executable.resolve()) in first_bytes.decode()
     assert "daemon" not in first_bytes.decode().casefold()
     assert "dashboard" not in first_bytes.decode().casefold()
-    assert os.stat(launcher).st_mode & 0o111
+    if os.name != "nt":
+        assert os.stat(launcher).st_mode & 0o111
     assert manager.install().state is LauncherState.INSTALLED
     assert launcher.read_bytes() == first_bytes
 
@@ -484,7 +488,8 @@ def test_linux_launcher_has_absolute_exec_marker_and_safe_remove(
     payload = desktop.read_text()
 
     assert result.state is LauncherState.INSTALLED
-    assert f'Exec="{executable.resolve()}"' in payload
+    escaped_executable = str(executable.resolve()).replace("\\", "\\\\")
+    assert f'Exec="{escaped_executable}"' in payload
     assert "X-arXiv-Digest-Managed=true" in payload
     assert "Terminal=false" in payload
     assert manager.remove().state is LauncherState.ABSENT
@@ -502,3 +507,119 @@ def test_launcher_requires_an_absolute_installed_console_entry(tmp_path: Path) -
             executable=Path("relative/arxiv-digest"),
             operation_guard=_operation_guard(tmp_path),
         )
+
+
+def test_windows_launcher_is_owned_foreground_and_preserves_special_paths(
+    tmp_path: Path,
+) -> None:
+    import base64
+    from arxiv_digest.desktop_launcher import DesktopLauncherManager, LauncherState
+
+    executable = tmp_path / "bin space ' & % ! 论文" / "arxiv-digest.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"synthetic executable")
+    manager = DesktopLauncherManager(
+        platform="win32", home=tmp_path, executable=executable,
+        operation_guard=_operation_guard(tmp_path),
+    )
+
+    assert manager.status().state is LauncherState.ABSENT
+    installed = manager.install()
+    assert installed.state is LauncherState.INSTALLED
+    assert manager.target == tmp_path / "Desktop/arXiv Digest.cmd"
+    payload = manager.target.read_bytes()
+    assert b"org.arxiv.digest" in payload
+    command = payload.decode("ascii").splitlines()[-1]
+    assert command.startswith("powershell.exe -NoProfile -NonInteractive -EncodedCommand ")
+    script = base64.b64decode(command.split()[-1], validate=True).decode("utf-16-le")
+    quoted_path = str(executable.resolve()).replace("'", "''")
+    assert script == f"$ErrorActionPreference = 'Stop'; & '{quoted_path}'; exit $LASTEXITCODE"
+    assert manager.install().state is LauncherState.INSTALLED
+    assert manager.target.read_bytes() == payload
+    assert manager.remove().state is LauncherState.ABSENT
+    assert not manager.target.exists()
+
+
+def test_windows_launcher_uses_native_redirected_desktop_for_the_current_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from types import SimpleNamespace
+    import arxiv_digest.desktop_launcher as launchers
+
+    executable = tmp_path / "arxiv-digest.exe"
+    executable.write_bytes(b"synthetic executable")
+    desktop = tmp_path / "Redirected Desktop"
+    calls = []
+
+    def folder_path(*arguments):
+        calls.append(arguments)
+        return str(desktop)
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setitem(sys.modules, "win32com.shell", SimpleNamespace(
+        shell=SimpleNamespace(SHGetFolderPath=folder_path),
+        shellcon=SimpleNamespace(CSIDL_DESKTOPDIRECTORY=16),
+    ))
+    manager = launchers.DesktopLauncherManager(
+        platform="win32", home=tmp_path, executable=executable,
+        operation_guard=_operation_guard(tmp_path),
+    )
+    assert manager.target == desktop / "arXiv Digest.cmd"
+    assert calls == [(0, 16, None, 0)]
+    assert not desktop.exists()
+
+
+@pytest.mark.parametrize("install_first", [False, True])
+def test_windows_launcher_preserves_unowned_and_tampered_files(
+    tmp_path: Path, install_first: bool,
+) -> None:
+    from arxiv_digest.desktop_launcher import (
+        DesktopLauncherManager, LauncherCollisionError, LauncherState,
+    )
+
+    executable = tmp_path / "arxiv-digest.exe"
+    executable.write_bytes(b"synthetic executable")
+    manager = DesktopLauncherManager(
+        platform="win32", home=tmp_path, executable=executable,
+        operation_guard=_operation_guard(tmp_path),
+    )
+    if install_first:
+        manager.install()
+    else:
+        manager.target.parent.mkdir(parents=True)
+    with manager.target.open("ab") as handle:
+        handle.write(b"user content\n")
+    expected = manager.target.read_bytes()
+    assert manager.status().state is LauncherState.COLLISION
+    with pytest.raises(LauncherCollisionError):
+        manager.install()
+    with pytest.raises(LauncherCollisionError):
+        manager.remove()
+    assert manager.target.read_bytes() == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows cmd and PowerShell")
+def test_windows_launcher_executes_a_unicode_executable_path_and_waits_for_exit(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+    import venv
+    from arxiv_digest.desktop_launcher import DesktopLauncherManager
+
+    environment = tmp_path / "space ' & % ! 论文"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    manager = DesktopLauncherManager(
+        platform="win32", home=tmp_path,
+        executable=environment / "Scripts/python.exe",
+        operation_guard=_operation_guard(tmp_path),
+    )
+    manager.install()
+    result = subprocess.run(
+        [os.environ["COMSPEC"], "/d", "/c", str(manager.target)],
+        input="print('launcher-finished'); raise SystemExit(19)\n",
+        text=True, capture_output=True, timeout=30, check=False,
+    )
+    assert result.returncode == 19, result.stderr
+    assert "launcher-finished" in result.stdout

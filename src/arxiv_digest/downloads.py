@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import quote
 
+from arxiv_digest.atomic import fsync_directory as _fsync_directory, set_private_file_permissions
 from arxiv_digest.profile import ProfileRepository
 from arxiv_digest.rate_limit import ArxivHttpClient, Interface
 from arxiv_digest.sources.xml import parse_arxiv_id
@@ -20,6 +21,7 @@ from arxiv_digest.storage.store import DownloadFileRecord, Store
 _RESERVED_FILENAME_CHARACTERS = re.compile(r'[/\\:*?"<>|\x00-\x1f\x7f]')
 _MAX_FILENAME_BYTES = 180
 _SAVE_DOWNLOAD_VERSION = object()
+_WINDOWS_DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])", re.IGNORECASE)
 _NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
 _SURNAME_PARTICLES = frozenset({
     "al", "bin", "da", "das", "de", "del", "della", "den", "der", "di",
@@ -52,7 +54,17 @@ def _truncate_utf8(value: str, byte_limit: int) -> str:
     return encoded[:byte_limit].decode("utf-8", errors="ignore")
 
 
+def is_windows_reserved_filename(name: str) -> bool:
+    return bool(
+        _RESERVED_FILENAME_CHARACTERS.search(name)
+        or name.endswith((".", " "))
+        or _WINDOWS_DEVICE_NAME.fullmatch(name.split(".")[0].rstrip(" "))
+    )
+
+
 def _file_matches(path: Path, byte_count: int, digest: str) -> bool:
+    if os.name == "nt" and is_windows_reserved_filename(path.name):
+        return False
     if path.is_symlink() or not path.is_file():
         return False
     if path.stat().st_size != byte_count:
@@ -65,6 +77,8 @@ def _file_matches(path: Path, byte_count: int, digest: str) -> bool:
 
 
 def _verified_pdf(path: Path) -> tuple[int, str] | None:
+    if os.name == "nt" and is_windows_reserved_filename(path.name):
+        return None
     if path.is_symlink() or not path.is_file():
         return None
     digest = sha256()
@@ -86,15 +100,6 @@ def _numbered_filename(filename: str, number: int) -> str:
     stem_budget = _MAX_FILENAME_BYTES - len(suffix.encode("utf-8"))
     stem = _truncate_utf8(Path(filename).stem, stem_budget).rstrip(" .")
     return f"{stem or 'paper'}{suffix}"
-
-
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _author_surname(author: str) -> str:
@@ -132,6 +137,8 @@ def safe_pdf_filename(
     safe_label = " ".join(
         _RESERVED_FILENAME_CHARACTERS.sub(" ", label).split()
     ).strip(" .")
+    if is_windows_reserved_filename(f"{safe_label}.pdf"):
+        safe_label = f"paper {safe_label}"
     safe_label = _truncate_utf8(safe_label, _MAX_FILENAME_BYTES - 4).rstrip(" .")
     return f"{safe_label or 'paper'}.pdf"
 
@@ -351,7 +358,7 @@ class DownloadManager:
         temporary = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "wb") as handle:
-                os.fchmod(handle.fileno(), 0o600)
+                set_private_file_permissions(handle.fileno(), 0o600)
                 handle.write(body)
                 handle.flush()
                 os.fsync(handle.fileno())

@@ -9,6 +9,8 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
+from tests.helpers import assert_private_file
+
 from arxiv_digest.atomic import atomic_write, exclusive_flock
 from arxiv_digest.profile import (
     LegacyProfileGenerationError,
@@ -199,7 +201,7 @@ class ProfileRepositoryTest(unittest.TestCase):
             original = sample_profile(root / "first")
             repository.save_atomic(original, expected_revision=None)
 
-            with mock.patch("os.replace", side_effect=OSError("blocked")):
+            with mock.patch("arxiv_digest.atomic.replace_file", side_effect=OSError("blocked")):
                 with self.assertRaises(OSError):
                     repository.save_atomic(
                         sample_profile(root / "second", revision=2),
@@ -222,7 +224,7 @@ class ProfileRepositoryTest(unittest.TestCase):
                     expected_revision=None,
                 )
 
-            self.assertEqual(fsync.call_count, 2)
+            self.assertEqual(fsync.call_count, 1 if os.name == "nt" else 2)
 
     def test_profile_file_is_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -234,8 +236,9 @@ class ProfileRepositoryTest(unittest.TestCase):
                 expected_revision=None,
             )
 
-            self.assertEqual(stat.S_IMODE(repository.path.stat().st_mode), 0o600)
+            assert_private_file(repository.path)
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits; Windows uses private ACLs")
     def test_atomic_write_applies_requested_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory).resolve() / "value.bin"
@@ -250,15 +253,22 @@ class ProfileRepositoryTest(unittest.TestCase):
             target = root / "target.lock"
             target.write_bytes(b"")
             target.chmod(0o640)
+            original_mode = stat.S_IMODE(target.stat().st_mode)
             link = root / "profile.lock"
-            link.symlink_to(target)
+            try:
+                link.symlink_to(target)
+            except OSError as error:
+                if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink privilege is unavailable")
+                raise
 
             with self.assertRaises(OSError):
                 with exclusive_flock(link):
                     self.fail("a symlink lock target must not be acquired")
 
-            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), original_mode)
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits; Windows ACL rejection has native tests")
     def test_exclusive_flock_rejects_existing_broad_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock_path = Path(directory).resolve() / "profile.lock"
@@ -271,6 +281,7 @@ class ProfileRepositoryTest(unittest.TestCase):
 
             self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o640)
 
+    @unittest.skipIf(os.name == "nt", "POSIX FIFO fixture; Windows rejects non-file handles")
     def test_exclusive_flock_rejects_non_regular_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock_path = Path(directory).resolve() / "profile.lock"
@@ -280,6 +291,7 @@ class ProfileRepositoryTest(unittest.TestCase):
                 with exclusive_flock(lock_path):
                     self.fail("a FIFO must not be acquired as a lock file")
 
+    @unittest.skipIf(os.name == "nt", "POSIX user IDs; Windows ownership uses account SIDs")
     def test_exclusive_flock_rejects_foreign_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock_path = Path(directory).resolve() / "profile.lock"
@@ -300,7 +312,12 @@ class ProfileRepositoryTest(unittest.TestCase):
             redirect = root / "redirect"
             redirect.mkdir()
             lock_parent = root / "locks"
-            lock_parent.symlink_to(redirect, target_is_directory=True)
+            try:
+                lock_parent.symlink_to(redirect, target_is_directory=True)
+            except OSError as error:
+                if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink privilege is unavailable")
+                raise
 
             with self.assertRaises(OSError):
                 with exclusive_flock(lock_parent / "profile.lock"):

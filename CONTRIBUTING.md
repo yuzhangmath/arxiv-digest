@@ -22,6 +22,18 @@ python -m venv .venv
 .venv/bin/python -m pip install --editable ".[dev]"
 ```
 
+On Windows, run the equivalent commands in PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --editable ".[dev]"
+```
+
+Use `.\.venv\Scripts\python.exe` wherever the Unix examples use
+`.venv/bin/python`. Activating the environment is optional. Windows developer
+machines need Git and a Playwright-supported Windows version (currently
+Windows 11 or newer); see [Playwright requirements](https://playwright.dev/python/docs/intro#system-requirements).
+
 Application tests deny non-loopback network access. Add deterministic local
 fixtures for source behavior instead of contacting arXiv.
 
@@ -45,6 +57,23 @@ ARXIV_DIGEST_VERSION=$(.venv/bin/python -c 'from arxiv_digest import __version__
 .venv/bin/python scripts/privacy_scan.py archive "$ARXIV_DIGEST_RELEASE_ARTIFACT_DIR/arxiv_digest-${ARXIV_DIGEST_VERSION}-py3-none-any.whl"
 ```
 
+For PowerShell, create a fresh candidate directory and run the same suites:
+
+```powershell
+$env:ARXIV_DIGEST_RELEASE_ARTIFACT_DIR = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
+.\.venv\Scripts\python.exe -m build --outdir $env:ARXIV_DIGEST_RELEASE_ARTIFACT_DIR
+.\.venv\Scripts\python.exe -m pytest tests/unit tests/integration -q
+node --test tests/js/*.test.mjs
+.\.venv\Scripts\python.exe -m playwright install chromium webkit
+.\.venv\Scripts\python.exe -m pytest tests/browser -q
+.\.venv\Scripts\python.exe -m pytest tests/integration/test_package_contents.py -q
+```
+
+The privacy scanner commands also run with `.\.venv\Scripts\python.exe`.
+Use `$env:ARXIV_DIGEST_RELEASE_ARTIFACT_DIR` for the candidate directory and
+`$arxivDigestVersion = .\.venv\Scripts\python.exe -c 'from arxiv_digest import __version__; print(__version__)'`
+for the filename's version. Quote full artifact paths in scanner arguments.
+
 The tree command above assumes that the checkout's sole `origin` is the
 maintainer SSH URL `git@github.com:yuzhangmath/arxiv-digest.git`. For a
 canonical public HTTPS clone, replace `--expected-remote-from-project` with
@@ -65,7 +94,7 @@ preserve the exact migration, static-asset, license, and notice inventories.
 ## Release verification
 
 Use Python 3.11 or newer and Node.js 24.19.0. Keep installation smoke tests in
-wholly temporary synthetic HOME/XDG and pipx directories. Application tests
+wholly temporary synthetic HOME/XDG, Windows AppData, and pipx directories. Application tests
 deny non-loopback network access; never use the installed personal application
 as a fixture.
 
@@ -76,8 +105,11 @@ omit it and use `dist`. Rebuild when source changes invalidate the candidate,
 and validate the wheel, sdist, exact package resources, checksums, release
 notes, and commit identity against that same candidate.
 
-Release validation runs on macOS and Linux with Python 3.11 and the current
-Python release. Both browser engines are required on each platform. Follow
+Release validation is configured for macOS, Windows, and Linux with Python
+3.11 and the current Python release. Both browser engines are required on
+each platform. CI uses Git Bash for consistent workflow syntax and native
+Python on Windows, preserves LF checkout bytes for artifact comparisons, and
+smoke-tests the native `arxiv-digest.exe` installed by pipx. Follow
 `.github/workflows/` for the single candidate build, source/tag/channel checks,
 privacy gates, isolated pipx smoke, and `SHA256SUMS`. Report unavailable native
 coverage explicitly; mocked platform branches do not establish readiness.

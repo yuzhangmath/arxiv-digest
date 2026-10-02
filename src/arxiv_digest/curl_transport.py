@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from math import isfinite
 import os
@@ -10,7 +11,8 @@ import re
 import selectors
 import shutil
 import subprocess
-from time import monotonic
+import sys
+from time import monotonic, sleep
 from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
@@ -88,6 +90,40 @@ def _parse_headers(block: bytes) -> tuple[int, dict[str, str]]:
     return int(match[1]), headers
 
 
+@contextmanager
+def _pipe_reader(stream):
+    """Read available pipe bytes without blocking cancellation or deadlines."""
+    if sys.platform == "win32":
+        import msvcrt
+        import win32pipe
+
+        handle = msvcrt.get_osfhandle(stream.fileno())
+
+        def read(timeout):
+            try:
+                _, available, _ = win32pipe.PeekNamedPipe(handle, 1)
+            except win32pipe.error as error:
+                if error.winerror in (109, 232):  # Broken/closed pipe means EOF.
+                    return b""
+                raise OSError("curl output could not be read") from error
+            if available:
+                return os.read(stream.fileno(), min(available, _READ_BYTES))
+            sleep(timeout)
+            return None
+
+        yield read
+    else:
+        with selectors.DefaultSelector() as selector:
+            selector.register(stream, selectors.EVENT_READ)
+
+            def read(timeout):
+                if selector.select(timeout):
+                    return os.read(stream.fileno(), _READ_BYTES)
+                return None
+
+            yield read
+
+
 def _read_response(
     process: subprocess.Popen[bytes], *, deadline: float, max_bytes: int,
     cancelled: Callable[[], bool] | None,
@@ -98,16 +134,15 @@ def _read_response(
     status: int | None = None
     headers: dict[str, str] = {}
     header_bytes = 0
-    with selectors.DefaultSelector() as selector:
-        selector.register(process.stdout, selectors.EVENT_READ)
+    with _pipe_reader(process.stdout) as read:
         while True:
             _check_cancelled(cancelled)
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise CurlTransportError()
-            if not selector.select(min(_POLL_SECONDS, remaining)):
+            chunk = read(min(_POLL_SECONDS, remaining))
+            if chunk is None:
                 continue
-            chunk = os.read(process.stdout.fileno(), _READ_BYTES)
             if not chunk:
                 break
             if status is None:

@@ -12,6 +12,8 @@ license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
   "beautifulsoup4>=4.12,<5",
+  "pywin32>=308,<400; sys_platform == 'win32'",
+  "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 
 [project.urls]

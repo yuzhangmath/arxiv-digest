@@ -1,13 +1,14 @@
 # Installation
 
-This guide installs arXiv Digest as an isolated command-line application on
-macOS or Linux.
+This guide installs arXiv Digest v0.4.0 as an isolated command-line application
+on macOS, Windows, or Linux. Native Windows support is new in v0.4.0.
 
 ## Contents
 
 - [Requirements](#requirements)
 - [Install pipx on macOS](#install-pipx-on-macos)
 - [Install pipx on Linux](#install-pipx-on-linux)
+- [Install pipx on Windows](#install-pipx-on-windows)
 - [Install arXiv Digest](#install-arxiv-digest)
 - [Upgrade within application-data generation 2](#upgrade-within-application-data-generation-2)
 - [Complete first-run setup](#complete-first-run-setup)
@@ -16,16 +17,16 @@ macOS or Linux.
 - [Uninstall](#uninstall)
 - [HTTPS and maintainer SSH](#https-and-maintainer-ssh)
 
-The tagged commands in this guide install published `v0.3.1`. The setup and
-maintenance descriptions reflect the current unreleased checkout; use the
-[v0.3.1 installation guide](https://github.com/yuzhangmath/arxiv-digest/blob/v0.3.1/docs/installation.md)
-for that release's workflow. See the [Unreleased changes](../CHANGELOG.md#unreleased)
-for changes since that tag. Existing users should start with
+Confirm that `v0.4.0` appears on the
+[releases page](https://github.com/yuzhangmath/arxiv-digest/releases) before
+using the tagged commands in this guide. See the
+[v0.4.0 release notes](releases/v0.4.0.md) for changes since v0.3.1.
+Existing users should start with
 [the upgrade instructions](#upgrade-within-application-data-generation-2).
 
 ## Requirements
 
-arXiv Digest requires Python 3.11 or newer, macOS or Linux, Git for the
+arXiv Digest requires Python 3.11 or newer, macOS, Windows 11 or newer, or Linux, Git for the
 friend-facing source install, and a current `pipx`. `pipx` keeps applications
 in isolated environments and exposes their commands on your `PATH`.
 
@@ -37,6 +38,10 @@ check that Python 3.11 or newer and Git are available:
 python3 --version
 git --version
 ```
+
+On Windows use PowerShell and `py --version` in place of `python3 --version`.
+Install Python and Git before continuing. If your Python installation provides
+`python` instead of `py`, use that command consistently in the Windows examples.
 
 The commands below follow the current official
 [pipx installation guide](https://pipx.pypa.io/stable/how-to/install-pipx.html).
@@ -96,25 +101,49 @@ For other distributions, prefer the distribution's `pipx` package. Systems
 enforcing PEP 668 may reject `pip install --user`; consult the same official
 pipx guide for its self-managed virtual-environment fallback.
 
+## Install pipx on Windows
+
+In PowerShell, install pipx for your user account:
+
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath
+```
+
+Close PowerShell and open a new window so the updated `PATH` takes effect.
+Check that `pipx --version` works. These commands follow the
+[official pipx Windows installation guidance](https://pipx.pypa.io/stable/how-to/install-pipx.html#windows).
+
 ## Install arXiv Digest
 
-After `pipx ensurepath`, open a new terminal. In that terminal, install arXiv
-Digest from the canonical public HTTPS address:
+These instructions apply to macOS, Windows, and Linux. After `pipx ensurepath`,
+open a new terminal (PowerShell on Windows). In that terminal, install arXiv
+Digest from the canonical public HTTPS address once the tag is published:
 
 ```bash
-pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
+pipx install git+https://github.com/yuzhangmath/arxiv-digest.git@v0.4.0
 ```
 
 The official [pipx CLI reference](https://pipx.pypa.io/stable/reference/cli.html)
 documents VCS URLs as supported package specifications.
 
+On Windows, Python dependencies, including filesystem and time-zone support,
+are installed automatically. You do not need WSL, a Unix shell, or administrator
+privileges for ordinary use. Keep PowerShell open while using the dashboard.
+Setup can create **arXiv Digest.cmd** on your Windows Desktop. Double-click it
+to start the app; it does not run at login. PDF selection uses the Windows folder
+picker; if unavailable, setup offers app-managed Downloads and Documents folders.
+
 ## Upgrade within application-data generation 2
 
-Version 0.3.1 uses the same application-data generation, profile schema, and
-portable backup format as versions 0.2.0, 0.2.1, and 0.3.0. Follow the manual
-upgrade steps below to replace the program while keeping your saved state.
+Version 0.4.0 uses the same application-data generation, profile schema, and
+portable backup format as versions 0.2.0, 0.2.1, 0.3.0, and 0.3.1. Follow the
+manual upgrade steps below to replace the program while keeping your saved
+state. This includes 0.3.x installations that previously supported automatic
+updates and Windows installations made from a source checkout. The dashboard
+now offers release notices and manual instructions only.
 
-Confirm that `v0.3.1` appears on the
+Confirm that `v0.4.0` appears on the
 [releases page](https://github.com/yuzhangmath/arxiv-digest/releases) before
 using the tagged install or upgrade commands in this guide.
 
@@ -136,8 +165,8 @@ pipx list
 If an older version has an unfinished automatic update, resolve it with that
 version before replacing the program; keep its private recovery files intact.
 If you are unsure which copy is running, use
-`command -v arxiv-digest` and compare it with `pipx list` or your virtual
-environment's executable.
+`command -v arxiv-digest` on macOS/Linux or `Get-Command arxiv-digest` in
+PowerShell and compare it with `pipx list` or your virtual environment's executable.
 
 ### Upgrade a pipx installation
 
@@ -146,7 +175,7 @@ environment's executable.
 2. Export your current state with the old version before installing the new one:
 
    ```bash
-   arxiv-digest export arxiv-digest-before-0.3.1.zip
+   arxiv-digest export arxiv-digest-before-0.4.0.zip
    ```
 
    Run this in a private folder where you want to keep the backup. Wait for a
@@ -161,12 +190,12 @@ environment's executable.
 3. Replace the installed program using the explicit new tag:
 
    ```bash
-   pipx install --force git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
+   pipx install --force git+https://github.com/yuzhangmath/arxiv-digest.git@v0.4.0
    ```
 
    This requires Git and internet access. Use the same user and pipx environment
    as before. A plain `pipx upgrade arxiv-digest` can reuse the old pinned tag;
-   use the command above to select 0.3.1 explicitly.
+   use the command above to select 0.4.0 explicitly.
 4. Verify the version, then reopen the app:
 
    ```bash
@@ -174,7 +203,7 @@ environment's executable.
    arxiv-digest
    ```
 
-   The first line of `doctor` output should be `arXiv Digest 0.3.1`. In the
+   The first line of `doctor` output should be `arXiv Digest 0.4.0`. In the
    dashboard, check your interests, Library, review progress, and PDF folder.
    Users who completed setup should return to their dashboard without repeating it.
    If setup unexpectedly appears, quit and check the user account and data
@@ -203,9 +232,17 @@ that environment's `arxiv-digest` first. Then, using that same environment
 (shown here as `.venv`), run:
 
 ```bash
-.venv/bin/python -m pip install --upgrade git+https://github.com/yuzhangmath/arxiv-digest.git@v0.3.1
+.venv/bin/python -m pip install --upgrade git+https://github.com/yuzhangmath/arxiv-digest.git@v0.4.0
 .venv/bin/arxiv-digest doctor
 .venv/bin/arxiv-digest
+```
+
+On Windows, use the equivalent PowerShell commands:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade git+https://github.com/yuzhangmath/arxiv-digest.git@v0.4.0
+.\.venv\Scripts\arxiv-digest.exe doctor
+.\.venv\Scripts\arxiv-digest.exe
 ```
 
 Replace `.venv` with your environment's path and run without a source-tree
@@ -213,8 +250,6 @@ Replace `.venv` with your environment's path and run without a source-tree
 tagged package; keep any local source changes separately. Verify the version
 and saved state as above. Contributor setup is documented in
 [CONTRIBUTING](../CONTRIBUTING.md#development-setup).
-
-
 
 ## Complete first-run setup
 

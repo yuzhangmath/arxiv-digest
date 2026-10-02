@@ -6,6 +6,45 @@ from pathlib import Path
 
 import pytest
 
+from arxiv_digest.atomic import ensure_private_directory, set_private_file_permissions
+from tests.helpers import assert_private_file
+
+
+@pytest.fixture(autouse=True)
+def private_instance_directory(tmp_path):
+    ensure_private_directory(tmp_path)
+
+
+def _make_public(path):
+    if os.name != "nt":
+        path.chmod(0o644)
+        return
+    import ntsecuritycon
+    import win32security
+
+    information = win32security.DACL_SECURITY_INFORMATION
+    descriptor = win32security.GetFileSecurity(str(path), information)
+    acl = descriptor.GetSecurityDescriptorDacl()
+    acl.AddAccessAllowedAce(
+        win32security.ACL_REVISION, ntsecuritycon.FILE_GENERIC_READ,
+        win32security.CreateWellKnownSid(win32security.WinWorldSid, None),
+    )
+    descriptor.SetSecurityDescriptorDacl(True, acl, False)
+    win32security.SetFileSecurity(str(path), information, descriptor)
+
+
+def _make_private(path):
+    with path.open("rb") as handle:
+        set_private_file_permissions(handle.fileno())
+
+
+def _symlink(link, target):
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege unavailable")
+        raise
 
 
 def test_second_claim_verifies_private_descriptor_and_returns_existing(tmp_path) -> None:
@@ -35,8 +74,8 @@ def test_second_claim_verifies_private_descriptor_and_returns_existing(tmp_path)
         assert existing.descriptor.port == 43123
         assert existing.descriptor.startup_nonce == "nonce_abcd12345678"
         assert probed == [existing.descriptor]
-        assert stat.S_IMODE(descriptor_path.stat().st_mode) == 0o600
-        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+        assert_private_file(descriptor_path)
+        assert_private_file(lock_path)
     finally:
         owner.release()
 
@@ -48,7 +87,7 @@ def test_untrusted_lock_or_runtime_metadata_is_rejected(tmp_path) -> None:
     target = tmp_path / "elsewhere"
     target.write_text("not a lock", encoding="utf-8")
     lock_path = tmp_path / "runtime.lock"
-    lock_path.symlink_to(target)
+    _symlink(lock_path, target)
 
     with pytest.raises(InstanceSecurityError, match="process lock"):
         SingleInstance(lock_path, tmp_path / "runtime.json").acquire()
@@ -66,7 +105,7 @@ def test_contender_rejects_world_readable_runtime_descriptor(tmp_path) -> None:
         startup_nonce="nonce_abcd12345678",
         token="A" * 43,
     )
-    descriptor_path.chmod(0o644)
+    _make_public(descriptor_path)
 
     try:
         with pytest.raises(InstanceSecurityError, match="not private"):
@@ -77,7 +116,7 @@ def test_contender_rejects_world_readable_runtime_descriptor(tmp_path) -> None:
                 health_probe=lambda descriptor: True,
             ).acquire()
     finally:
-        descriptor_path.chmod(0o600)
+        _make_private(descriptor_path)
         owner.release()
 
 
@@ -116,7 +155,7 @@ def test_contender_rejects_runtime_descriptor_path_substitution(
         startup_nonce="nonce_abcd12345678",
         token="A" * 43,
     )
-    original_open = lifecycle.os.open
+    original_open = lifecycle.open_private_read_file if os.name == "nt" else lifecycle.os.open
     replaced = False
 
     def replace_before_open(path, *args, **kwargs):
@@ -126,10 +165,13 @@ def test_contender_rejects_runtime_descriptor_path_substitution(
             payload = descriptor_path.read_bytes()
             descriptor_path.rename(tmp_path / "original-runtime.json")
             descriptor_path.write_bytes(payload)
-            descriptor_path.chmod(0o600)
+            _make_private(descriptor_path)
         return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(lifecycle.os, "open", replace_before_open)
+    if os.name == "nt":
+        monkeypatch.setattr(lifecycle, "open_private_read_file", replace_before_open)
+    else:
+        monkeypatch.setattr(lifecycle.os, "open", replace_before_open)
     try:
         with pytest.raises(InstanceSecurityError, match="changed"):
             SingleInstance(
@@ -165,7 +207,7 @@ def test_runtime_descriptor_must_remain_private_and_stable_during_read(
         if result and not changed:
             changed = True
             if change == "permissions":
-                descriptor_path.chmod(0o644)
+                _make_public(descriptor_path)
             else:
                 descriptor_path.write_bytes(result.replace(b"43123", b"43124"))
         return result
@@ -178,7 +220,7 @@ def test_runtime_descriptor_must_remain_private_and_stable_during_read(
                 pid_alive=lambda pid: True, health_probe=lambda descriptor: True,
             ).acquire()
     finally:
-        descriptor_path.chmod(0o600)
+        _make_private(descriptor_path)
         owner.release()
 
 
@@ -200,9 +242,9 @@ def test_release_preserves_a_replaced_runtime_descriptor(
     descriptor_path.rename(original_path)
     if replacement == "file":
         descriptor_path.write_bytes(original_path.read_bytes())
-        descriptor_path.chmod(0o600)
+        _make_private(descriptor_path)
     else:
-        descriptor_path.symlink_to(original_path)
+        _symlink(descriptor_path, original_path)
 
     owner.release()
 
@@ -213,6 +255,7 @@ def test_release_preserves_a_replaced_runtime_descriptor(
 
 
 @pytest.mark.parametrize("flag", ["O_NOFOLLOW", "O_CLOEXEC"])
+@pytest.mark.skipif(os.name == "nt", reason="POSIX open flags; Windows uses native no-reparse handles")
 def test_runtime_descriptor_read_requires_safe_open_flags(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str,
 ) -> None:
@@ -221,3 +264,18 @@ def test_runtime_descriptor_read_requires_safe_open_flags(
     monkeypatch.setattr(lifecycle.os, flag, 0)
     with pytest.raises(lifecycle.InstanceSecurityError, match="unsupported"):
         lifecycle._read_private_descriptor(tmp_path / "runtime.json")
+
+
+def test_real_process_liveness_probe_does_not_terminate_owner():
+    import subprocess
+    import sys
+    from arxiv_digest.web.lifecycle import _pid_alive
+
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert _pid_alive(process.pid)
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+    assert not _pid_alive(process.pid)

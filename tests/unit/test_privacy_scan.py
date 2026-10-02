@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import stat
 import subprocess
@@ -371,6 +372,41 @@ def test_derivation_reads_committed_live_wal_without_mutating_private_files(
 
         def __exit__(self, *args: object) -> object:
             temporary = temporary_paths[-1]
+            if os.name == "nt":
+                import win32security
+
+                from arxiv_digest.atomic import (
+                    ensure_private_directory_strict,
+                    validate_private_file,
+                )
+
+                ensure_private_directory_strict(temporary)
+                information = win32security.DACL_SECURITY_INFORMATION
+                parent_acl = win32security.GetNamedSecurityInfo(
+                    str(temporary), win32security.SE_FILE_OBJECT, information,
+                ).GetSecurityDescriptorDacl()
+                expected_grants = {
+                    (parent_acl.GetAce(index)[1],
+                     win32security.ConvertSidToStringSid(parent_acl.GetAce(index)[2]))
+                    for index in range(parent_acl.GetAceCount())
+                }
+                for path in temporary.iterdir():
+                    if path.is_file():
+                        if path.name.endswith("-shm"):
+                            # SQLite-created journals inherit the protected
+                            # directory's grants without protecting their own ACL.
+                            acl = win32security.GetNamedSecurityInfo(
+                                str(path), win32security.SE_FILE_OBJECT, information,
+                            ).GetSecurityDescriptorDacl()
+                            grants = set()
+                            for index in range(acl.GetAceCount()):
+                                ace = acl.GetAce(index)
+                                assert ace[0][0] == win32security.ACCESS_ALLOWED_ACE_TYPE
+                                grants.add((ace[1], win32security.ConvertSidToStringSid(ace[2])))
+                            assert grants == expected_grants
+                        else:
+                            with path.open("rb") as handle:
+                                validate_private_file(handle.fileno())
             temporary_modes.append(
                 (
                     stat.S_IMODE(temporary.stat().st_mode),
@@ -426,11 +462,12 @@ def test_derivation_reads_committed_live_wal_without_mutating_private_files(
         assert before == after
         assert temporary_modes == [
             (
-                0o700,
+                0o777 if os.name == "nt" else 0o700,
                 {
-                    "library.sqlite3": 0o600,
-                    "library.sqlite3-shm": 0o600,
-                    "library.sqlite3-wal": 0o600,
+                    name: 0o666 if os.name == "nt" else 0o600
+                    for name in (
+                        "library.sqlite3", "library.sqlite3-shm", "library.sqlite3-wal"
+                    )
                 },
             )
         ]
@@ -825,7 +862,13 @@ def test_denylist_publication_is_atomic_mode_0600_and_round_trips(
 
     publish_denylist(denylist, destination)
 
-    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    if os.name == "nt":
+        from arxiv_digest.atomic import validate_private_file
+
+        with destination.open("rb") as handle:
+            validate_private_file(handle.fileno())
+    else:
+        assert stat.S_IMODE(destination.stat().st_mode) == 0o600
     assert load_denylist(destination) == denylist
     assert list(destination.parent.iterdir()) == [destination]
 

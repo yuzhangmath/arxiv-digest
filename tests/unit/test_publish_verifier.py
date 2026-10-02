@@ -31,9 +31,9 @@ def bundle_path(tmp_path: Path) -> Path:
         payload = f"synthetic {name}\n".encode()
         (root / name).write_bytes(payload)
         checksums.append(f"{hashlib.sha256(payload).hexdigest()}  {name}\n")
-    (root / "SHA256SUMS").write_text("".join(checksums), encoding="ascii")
+    (root / "SHA256SUMS").write_bytes("".join(checksums).encode("ascii"))
     (root / "RELEASE_NOTES.md").write_bytes(NOTES)
-    (root / "COMMIT_SHA").write_text(COMMIT + "\n", encoding="ascii")
+    (root / "COMMIT_SHA").write_bytes((COMMIT + "\n").encode("ascii"))
     return root
 
 
@@ -102,7 +102,7 @@ def test_bundle_rejects_unsafe_or_changed_artifacts(bundle_path, mutation):
     elif mutation == "checksum":
         (bundle_path / "SHA256SUMS").write_text("0" * 64)
     elif mutation == "commit":
-        (bundle_path / "COMMIT_SHA").write_text("0" * 40 + "\n")
+        (bundle_path / "COMMIT_SHA").write_bytes(b"0" * 40 + b"\n")
     else:
         notes.write_bytes(b"\xff")
     with pytest.raises(ValueError):
@@ -202,11 +202,14 @@ def test_release_keeps_single_build_native_coverage_and_publish_permission_bound
         assert "artifact-ids: ${{ needs.build.outputs.artifact_id }}" in job
         assert "digest-mismatch: error" in job
     for job in (native, (ROOT / ".github/workflows/tests.yml").read_text()):
-        assert "os: [ubuntu-24.04, macos-latest]" in job
+        assert "os: [ubuntu-24.04, macos-latest, windows-latest]" in job
         assert 'python: ["3.11", "3.x"]' in job
+        assert "defaults:\n      run:\n        shell: bash" in job
+        assert "git config --global core.autocrlf false" in job
         assert "python -m pytest tests/unit tests/integration" in job
         assert "python -m pytest tests/browser" in job
         assert "chromium webkit" in job
-        assert "python -m pipx install" in job
+        assert '[sys.executable, "-m", "pipx", "install", str(wheel)]' in job
+        assert '"arxiv-digest.exe" if os.name == "nt"' in job
         assert "--ignore=" not in job
     assert "UPDATE_MANIFEST" not in workflow

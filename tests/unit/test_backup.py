@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import stat
 import warnings
@@ -10,6 +11,8 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+
+from tests.helpers import assert_private_file
 
 from arxiv_digest import __version__
 from arxiv_digest.models import CategoryConfig, PaperMetadata, PaperVersion
@@ -598,7 +601,7 @@ def test_export_is_deterministic_portable_and_excludes_machine_local_state(
     export_backup(paths, second, clock=lambda: NOW)
 
     assert first.read_bytes() == second.read_bytes()
-    assert stat.S_IMODE(first.stat().st_mode) == 0o600
+    assert_private_file(first)
     with zipfile.ZipFile(first) as archive:
         assert archive.namelist() == [
             "manifest.json",
@@ -673,6 +676,28 @@ def test_export_is_deterministic_portable_and_excludes_machine_local_state(
         b"%PDF-1.7",
     ):
         assert excluded not in archive_bytes
+
+
+def test_export_permission_failure_removes_temporary_file(tmp_path, monkeypatch):
+    import arxiv_digest.backup as backup
+
+    paths = initialized_paths(tmp_path)
+    destination = tmp_path / "portable.zip"
+    before = set(tmp_path.iterdir())
+    opened = []
+
+    def fail(descriptor):
+        opened.append(descriptor)
+        raise PermissionError("private permissions unavailable")
+
+    monkeypatch.setattr(backup, "set_private_file_permissions", fail)
+    with pytest.raises(PermissionError, match="unavailable"):
+        backup.export_backup(paths, destination, clock=lambda: NOW)
+
+    assert set(tmp_path.iterdir()) == before
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
 
 
 def test_export_fsyncs_verified_archive_before_linking_and_directory(

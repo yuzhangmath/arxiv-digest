@@ -17,11 +17,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
-from urllib.parse import quote
 
 from arxiv_digest import __version__
-from arxiv_digest.atomic import atomic_write, exclusive_flock
+from arxiv_digest.atomic import (
+    atomic_write, exclusive_flock, fsync_directory as _fsync_directory,
+    replace_file, set_private_file_permissions,
+)
 from arxiv_digest.folders import DestinationKind, FolderChoice, FolderService
+from arxiv_digest.downloads import is_windows_reserved_filename
 from arxiv_digest.maintenance import MaintenanceBarrier
 from arxiv_digest.paths import AppPaths
 from arxiv_digest.profile import (
@@ -778,6 +781,8 @@ def _recompute_local_downloads(
                 payload["byte_count"], payload["sha256"], payload["last_verified_at"],
             ),
         )
+        if os.name == "nt" and is_windows_reserved_filename(filename):
+            continue
         candidate = destination / filename
         if candidate.is_symlink() or not candidate.is_file():
             continue
@@ -895,7 +900,7 @@ def _copy_file_exclusive(source: Path, destination: Path) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
+        set_private_file_permissions(descriptor, 0o600)
         with source.open("rb") as reader, os.fdopen(descriptor, "wb") as writer:
             descriptor = -1
             for chunk in iter(lambda: reader.read(1024 * 1024), b""):
@@ -933,9 +938,8 @@ def _write_restore_journal(path: Path, value: Mapping[str, object]) -> None:
 
 
 def _verify_database_readonly(path: Path) -> None:
-    encoded = quote(str(path.resolve()), safe="/")
     connection = sqlite3.connect(
-        f"file:{encoded}?mode=ro&immutable=1",
+        path.resolve().as_uri() + "?mode=ro&immutable=1",
         uri=True,
     )
     try:
@@ -961,8 +965,9 @@ def _verify_published_pair(paths: AppPaths) -> None:
     profile = decode_profile(profile_payload)
     digest = hashlib.sha256(profile_payload).hexdigest()
     _verify_database_readonly(paths.database_path)
-    encoded = quote(str(paths.database_path.resolve()), safe="/")
-    connection = sqlite3.connect(f"file:{encoded}?mode=ro&immutable=1", uri=True)
+    connection = sqlite3.connect(
+        paths.database_path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True,
+    )
     try:
         marker = connection.execute(
             "SELECT pending_revision, pending_sha256, status "
@@ -1004,7 +1009,7 @@ def _restore_old_file(
     if _sha256_file(rollback) != old_digest:
         raise BackupError("rollback_failed", "restore rollback hash is invalid")
     rollback_identity = rollback.lstat()
-    os.replace(rollback, active)
+    replace_file(rollback, active)
     _fsync_directory(active.parent)
     # rename of two hard links to the same inode is a no-op. Before the first
     # publication this leaves the rollback name behind unless removed explicitly.
@@ -1110,12 +1115,12 @@ def _publish_restored_state(
     _write_restore_journal(paths.restore_journal_path, journal)
     try:
         crash_injector("journal_fsynced")
-        os.replace(staged_database, paths.database_path)
+        replace_file(staged_database, paths.database_path)
         _fsync_directory(paths.database_path.parent)
         journal["phase"] = "database_published"
         _write_restore_journal(paths.restore_journal_path, journal)
         crash_injector("database_published")
-        os.replace(staged_profile, paths.profile_path)
+        replace_file(staged_profile, paths.profile_path)
         _fsync_directory(paths.profile_path.parent)
         journal["phase"] = "profile_published"
         _write_restore_journal(paths.restore_journal_path, journal)
@@ -1324,7 +1329,7 @@ def _recover_restore_locked(paths: AppPaths) -> None:
     if database_is_new and not profile_is_new and _matches_digest(
         staged_profile, new_profile_digest
     ):
-        os.replace(staged_profile, paths.profile_path)
+        replace_file(staged_profile, paths.profile_path)
         _fsync_directory(paths.profile_path.parent)
         profile_is_new = True
     if database_is_new and profile_is_new:
@@ -1439,7 +1444,6 @@ def restore_backup(
                 fresh.profile.revision,
             )
             paths.ensure()
-            os.chmod(paths.backup_dir, 0o700)
             pre_restore_path: Path | None = None
             if current is not None:
                 for _ in range(100):
@@ -1681,21 +1685,11 @@ def _verify_written_archive(
                 raise BackupError("archive_invalid", "backup verification failed")
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _fsync_file(path: Path) -> None:
     descriptor = os.open(
         path,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        (os.O_RDWR if os.name == "nt" else os.O_RDONLY)
+        | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
@@ -1750,10 +1744,12 @@ def _snapshot_payloads(
             suffix=".tmp",
             dir=destination.parent,
         )
-        os.close(descriptor)
         temporary = Path(temporary_name)
         try:
-            os.chmod(temporary, 0o600)
+            try:
+                set_private_file_permissions(descriptor)
+            finally:
+                os.close(descriptor)
             _write_archive(
                 temporary,
                 manifest,

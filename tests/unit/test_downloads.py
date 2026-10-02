@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import stat
 import threading
 import unicodedata
@@ -10,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers import assert_private_file
+
 import arxiv_digest.downloads as downloads_module
 from arxiv_digest.downloads import (
     DownloadError,
@@ -18,6 +21,13 @@ from arxiv_digest.downloads import (
     arxiv_pdf_url,
     safe_pdf_filename,
 )
+
+
+@pytest.mark.parametrize("title", ["CON", "nul", "LPT1", "COM9", "AUX.notes", "COM¹"])
+def test_new_pdf_names_avoid_windows_reserved_device_names(title):
+    filename = safe_pdf_filename("2608.32002", 1, title)
+    assert filename.startswith("paper ")
+    assert filename.endswith(".pdf")
 from arxiv_digest.models import PaperMetadata, PaperVersion
 from arxiv_digest.profile import (
     PdfDestination,
@@ -214,7 +224,7 @@ def test_download_uses_stored_paper_and_atomically_publishes_a_private_pdf(
     )
     published = destination / result.filename
     assert published.read_bytes() == PDF_BYTES
-    assert stat.S_IMODE(published.stat().st_mode) == 0o600
+    assert_private_file(published)
     assert tuple(path for path in destination.iterdir() if path != published) == ()
     assert client.calls == [
         (
@@ -301,7 +311,7 @@ def test_download_fsyncs_the_destination_directory_after_publication(
 
     manager.download("2608.32010", 1)
 
-    assert fsynced_directory == [False, True]
+    assert fsynced_directory == ([False] if os.name == "nt" else [False, True])
 
 
 def test_download_rejects_a_non_pdf_content_type_without_leaving_a_file(

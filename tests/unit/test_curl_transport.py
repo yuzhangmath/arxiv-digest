@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 from time import monotonic
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,12 +14,44 @@ from arxiv_digest.curl_transport import CurlTransport, CurlTransportError, CurlU
 from arxiv_digest.rate_limit import ArxivRequestCancelled
 
 
+def test_windows_pipe_reader_polls_without_selecting_a_file_handle(monkeypatch):
+    events = []
+    replies = iter([(b"", 0, 0), (b"x", 3, 0)])
+
+    class PipeError(Exception):
+        winerror = 109
+
+    def peek(handle, size):
+        assert handle == 42
+        try:
+            return next(replies)
+        except StopIteration:
+            raise PipeError()
+
+    monkeypatch.setitem(sys.modules, "msvcrt", SimpleNamespace(get_osfhandle=lambda fd: 42))
+    monkeypatch.setitem(sys.modules, "win32pipe", SimpleNamespace(PeekNamedPipe=peek, error=PipeError))
+    monkeypatch.setattr(curl_transport, "sys", SimpleNamespace(platform="win32"), raising=False)
+    monkeypatch.setattr(curl_transport, "sleep", lambda delay: events.append(delay), raising=False)
+    monkeypatch.setattr(curl_transport.os, "read", lambda fd, size: b"abc" if size == 3 else pytest.fail("unbounded read"))
+    monkeypatch.setattr(curl_transport.selectors, "DefaultSelector", lambda: pytest.fail("Windows selectors only support sockets"))
+    stream = SimpleNamespace(fileno=lambda: 12)
+    with curl_transport._pipe_reader(stream) as read:
+        assert read(0.05) is None
+        assert read(0.05) == b"abc"
+        assert read(0.05) == b""
+    assert events == [0.05]
+
+
 @pytest.fixture
 def fake_curl(tmp_path, monkeypatch):
     processes = []
     real_popen = curl_transport.subprocess.Popen
 
     def tracked_popen(*args, **kwargs):
+        # Use the real Python child on every OS; Windows does not execute shebangs.
+        command, *rest = args
+        if command[0] == str(tmp_path / "curl"):
+            args = ([sys.executable, *command], *rest)
         process = real_popen(*args, **kwargs)
         processes.append(process)
         return process

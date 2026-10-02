@@ -7,10 +7,34 @@ from unittest import mock
 
 
 from arxiv_digest.paths import resolve_paths
+from arxiv_digest.atomic import ensure_private_directory_strict
 
 
 
 class ResolvePathsTest(unittest.TestCase):
+    def test_windows_paths_separate_durable_data_from_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            local = home / "Local AppData"
+            paths = resolve_paths(
+                platform="win32", home=home,
+                environ={"LOCALAPPDATA": str(local)},
+            )
+            self.assertEqual(paths.config_dir, local / "arxiv-digest/data")
+            self.assertEqual(paths.data_dir, paths.config_dir)
+            self.assertEqual(paths.cache_dir, local / "arxiv-digest/cache")
+            self.assertEqual(paths.profile_path, paths.data_dir / "profile.json")
+            self.assertEqual(paths.backup_dir, paths.data_dir / "backups")
+
+    def test_windows_paths_ignore_missing_or_relative_localappdata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            for environ in ({}, {"LOCALAPPDATA": "relative"}, {"LOCALAPPDATA": ""}):
+                with self.subTest(environ=environ):
+                    paths = resolve_paths(platform="win32", home=home, environ=environ)
+                    self.assertEqual(paths.data_dir, home / "AppData/Local/arxiv-digest/data")
+                    self.assertEqual(paths.cache_dir, home / "AppData/Local/arxiv-digest/cache")
+
     def test_macos_paths_use_application_support(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
@@ -136,7 +160,12 @@ class ResolvePathsTest(unittest.TestCase):
             root.mkdir()
             redirect = root / "redirect"
             redirect.mkdir()
-            (root / "config").symlink_to(redirect, target_is_directory=True)
+            try:
+                (root / "config").symlink_to(redirect, target_is_directory=True)
+            except OSError as error:
+                if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink privilege unavailable")
+                raise
             paths = resolve_paths(
                 platform="linux",
                 home=root / "unused-home",
@@ -174,8 +203,12 @@ class ResolvePathsTest(unittest.TestCase):
                 paths.backup_dir,
             ):
                 with self.subTest(path=path):
-                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+                    if os.name == "nt":
+                        ensure_private_directory_strict(path)
+                    else:
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
 
+    @unittest.skipIf(os.name == "nt", "POSIX ownership; native ACL checks have separate tests")
     def test_ensure_rejects_foreign_owned_app_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve() / "isolated"

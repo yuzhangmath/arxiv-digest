@@ -233,6 +233,7 @@ def test_wsl_without_windows_helpers_does_not_launch_xdg_open(
     [
         ("linux", {"WSL_DISTRO_NAME": "SyntheticLinux"}, ["clip.exe"]),
         ("darwin", {}, ["pbcopy"]),
+        ("win32", {}, ["clip.exe"]),
         ("linux", {"WAYLAND_DISPLAY": "wayland-0"}, ["wl-copy"]),
         ("linux", {"DISPLAY": ":0"}, ["xclip", "-selection", "clipboard"]),
         ("linux", {"DISPLAY": ":0"}, ["xsel", "--clipboard", "--input"]),

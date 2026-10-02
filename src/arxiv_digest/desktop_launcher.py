@@ -1,13 +1,15 @@
-"""Opt-in, foreground-only desktop launchers for macOS and Linux."""
+"""Opt-in, foreground-only desktop launchers for macOS, Linux, and Windows."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.resources
 import json
 import os
 import shutil
 import shlex
+import sys
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -15,12 +17,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from arxiv_digest.atomic import acquire_exclusive, atomic_write
+from arxiv_digest.atomic import acquire_exclusive, atomic_write, fsync_directory
 from arxiv_digest.paths import AppPaths
 
 
 _MAC_SCHEMA_VERSION = 3
 _LINUX_SCHEMA_VERSION = 2
+_WINDOWS_SCHEMA_VERSION = 1
 _BUNDLE_ID = "org.arxiv.digest"
 _MAC_ICON_FILENAME = "arxiv-digest.icns"
 
@@ -62,11 +65,7 @@ def launcher_operation_guard(
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    fsync_directory(path)
 
 
 
@@ -80,8 +79,8 @@ class DesktopLauncherManager:
         operation_guard: Callable[[], AbstractContextManager[None]],
         legacy_recovery_wrapper: Path | None = None,
     ) -> None:
-        if platform != "darwin" and not platform.startswith("linux"):
-            raise RuntimeError("desktop launchers support macOS and Linux")
+        if platform not in {"darwin", "win32"} and not platform.startswith("linux"):
+            raise RuntimeError("desktop launchers support macOS, Linux, and Windows")
         if not executable.is_absolute():
             raise ValueError("launcher executable must be an absolute path")
         self.platform = platform
@@ -91,12 +90,40 @@ class DesktopLauncherManager:
         self._legacy_recovery_wrapper = legacy_recovery_wrapper
         if not self.executable.is_file():
             raise ValueError("launcher executable must be an installed file")
+        self._windows_desktop = self.home / "Desktop"
+        if (
+            self.platform == "win32"
+            and sys.platform == "win32"
+            and self.home.resolve() == Path.home().resolve()
+        ):
+            from win32com.shell import shell, shellcon
+
+            # Windows may redirect Desktop to OneDrive or another location.
+            # Synthetic homes stay isolated from the current account's Desktop.
+            self._windows_desktop = Path(shell.SHGetFolderPath(
+                0, shellcon.CSIDL_DESKTOPDIRECTORY, None, 0,
+            ))
 
     @property
     def target(self) -> Path:
         if self.platform == "darwin":
             return self.home / "Applications/arXiv Digest.app"
+        if self.platform == "win32":
+            return self._windows_desktop / "arXiv Digest.cmd"
         return self.home / ".local/share/applications/arxiv-digest.desktop"
+
+    def _windows_payload(self) -> bytes:
+        # Keep the cmd file ASCII and the executable out of cmd.exe expansion.
+        # PowerShell's literal string and UTF-16 command encoding preserve paths
+        # with apostrophes, percent signs, non-ASCII text, and shell metacharacters.
+        quoted = str(self.executable).replace("'", "''")
+        script = f"$ErrorActionPreference = 'Stop'; & '{quoted}'; exit $LASTEXITCODE"
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        return (
+            "@echo off\r\n"
+            f"rem {_BUNDLE_ID} managed launcher schema {_WINDOWS_SCHEMA_VERSION}\r\n"
+            f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}\r\n"
+        ).encode("ascii")
 
     def _mac_launcher(self) -> bytes:
         quoted = str(self.executable).replace("'", "'\"'\"'")
@@ -230,6 +257,19 @@ class DesktopLauncherManager:
         target = self.target
         if not target.exists() and not target.is_symlink():
             return LauncherStatus(LauncherState.ABSENT, target)
+        if self.platform == "win32":
+            try:
+                current = (
+                    target.is_file()
+                    and not target.is_symlink()
+                    and target.read_bytes() == self._windows_payload()
+                )
+            except OSError:
+                current = False
+            return LauncherStatus(
+                LauncherState.INSTALLED if current else LauncherState.COLLISION,
+                target,
+            )
         if self.platform == "darwin":
             launcher = target / "Contents/MacOS/arxiv-digest"
             plist = target / "Contents/Info.plist"
@@ -323,7 +363,8 @@ class DesktopLauncherManager:
             return self._install_macos()
         target = self.target
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        atomic_write(target, self._linux_payload(), mode=0o700)
+        payload = self._windows_payload() if self.platform == "win32" else self._linux_payload()
+        atomic_write(target, payload, mode=0o700)
         return self.status()
 
     def _install_macos(self) -> LauncherStatus:

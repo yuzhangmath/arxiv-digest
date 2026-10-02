@@ -1,4 +1,5 @@
 import hashlib
+import os
 import sqlite3
 from importlib.resources import files
 from pathlib import Path
@@ -64,6 +65,23 @@ def _create_version_three_database(path: Path) -> None:
         )
     connection.commit()
     connection.close()
+
+
+def test_database_permission_failure_removes_temporary_file(tmp_path, monkeypatch):
+    opened = []
+
+    def fail(descriptor):
+        opened.append(descriptor)
+        raise PermissionError("private permissions unavailable")
+
+    monkeypatch.setattr(database_module, "set_private_file_permissions", fail)
+    with pytest.raises(CorruptDatabaseError, match="could not be opened safely"):
+        open_database(tmp_path / "state.sqlite3")
+
+    assert list(tmp_path.iterdir()) == []
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
 
 
 def test_open_database_creates_required_tables(tmp_path: Path) -> None:

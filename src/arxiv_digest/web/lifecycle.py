@@ -9,6 +9,7 @@ import json
 import os
 import re
 import stat
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -18,7 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from arxiv_digest.atomic import ExclusiveLock, acquire_exclusive, atomic_write
+from arxiv_digest.atomic import (
+    ExclusiveLock, acquire_exclusive, atomic_write, open_private_read_file,
+    validate_private_file,
+)
 
 
 INACTIVITY_SECONDS = 3 * 60
@@ -67,6 +71,24 @@ class OwnedInstance:
 
 
 def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        import win32api
+        import win32con
+        import win32event
+
+        # os.kill(pid, 0) calls TerminateProcess on Windows.
+        try:
+            handle = win32api.OpenProcess(win32con.SYNCHRONIZE, False, pid)
+        except win32api.error as error:
+            if error.winerror == 87:  # ERROR_INVALID_PARAMETER: PID no longer exists.
+                return False
+            if error.winerror == 5:  # ERROR_ACCESS_DENIED: process exists.
+                return True
+            raise OSError("process liveness could not be checked") from error
+        try:
+            return win32event.WaitForSingleObject(handle, 0) == win32event.WAIT_TIMEOUT
+        finally:
+            handle.Close()
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -153,6 +175,13 @@ def _decode_descriptor(payload: bytes) -> RuntimeDescriptor:
 
 
 def _is_private_file(metadata: os.stat_result) -> bool:
+    if os.name == "nt":
+        # Ownership and DACL are checked on the no-follow handle after opening.
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink == 1
+            and not metadata.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        )
     return (
         stat.S_ISREG(metadata.st_mode)
         and metadata.st_uid == os.getuid()
@@ -179,7 +208,9 @@ def _file_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
 def _read_private_descriptor(
     path: Path, *, expected_identity: tuple[int, int] | None = None,
 ) -> RuntimeDescriptor:
-    if not getattr(os, "O_NOFOLLOW", 0) or not getattr(os, "O_CLOEXEC", 0):
+    if os.name != "nt" and (
+        not getattr(os, "O_NOFOLLOW", 0) or not getattr(os, "O_CLOEXEC", 0)
+    ):
         raise InstanceSecurityError("private runtime descriptor reads are unsupported")
     try:
         initial = path.lstat()
@@ -189,7 +220,7 @@ def _read_private_descriptor(
             initial.st_dev, initial.st_ino
         ) != expected_identity:
             raise InstanceSecurityError("runtime descriptor path changed")
-        descriptor = os.open(
+        descriptor = open_private_read_file(path) if os.name == "nt" else os.open(
             path,
             os.O_RDONLY
             | os.O_NOFOLLOW
@@ -215,6 +246,7 @@ def _read_private_descriptor(
             if len(payload) > 64 * 1024:
                 raise InstanceSecurityError("runtime descriptor is too large")
         final = os.fstat(descriptor)
+        validate_private_file(descriptor)
         current = path.lstat()
         if (
             _file_snapshot(final) != _file_snapshot(opened)

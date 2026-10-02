@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import ContextManager, Literal
 
 from arxiv_digest.candidates import CandidateDocument
-from arxiv_digest.atomic import atomic_write, exclusive_flock
+from arxiv_digest.atomic import (
+    atomic_write, exclusive_flock, fsync_directory as _fsync_directory,
+    replace_file,
+)
 from arxiv_digest.desktop_launcher import LauncherCollisionError
 from arxiv_digest.maintenance import MaintenanceBarrier
 from arxiv_digest.models import CategoryConfig
@@ -813,7 +816,7 @@ class SetupService:
                 self.crash_injector("sqlite_pending_committed")
 
                 # Phase 3: publish the exact bytes named by the marker.
-                os.replace(pending_path, self.profile_repository.path)
+                replace_file(pending_path, self.profile_repository.path)
                 _fsync_directory(self.profile_repository.path.parent)
                 self.crash_injector("profile_replaced")
 
@@ -878,7 +881,7 @@ class SetupService:
         active_matches = _profile_file_matches(active_path, revision, digest)
         pending_matches = _profile_file_matches(pending_path, revision, digest)
         if not active_matches and pending_matches:
-            os.replace(pending_path, active_path)
+            replace_file(pending_path, active_path)
             _fsync_directory(active_path.parent)
             active_matches = True
         if not active_matches:
@@ -1022,14 +1025,6 @@ def _normalize_categories(
     if len(folded) != len(set(folded)):
         raise ValueError("selected categories must be unique")
     return tuple(result)
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _profile_file_matches(path: Path, revision: int, digest: str) -> bool:

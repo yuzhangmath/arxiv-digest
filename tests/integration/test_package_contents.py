@@ -40,6 +40,7 @@ EXPECTED_PYTHON_MODULES = frozenset(
     {
         "__init__.py",
         "__main__.py",
+        "_windows.py",
         "application.py",
         "arxiv_access.py",
         "atomic.py",

@@ -3,10 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 import json
+import os
 from pathlib import Path
-import stat
 
 import pytest
+
+from arxiv_digest.atomic import atomic_write
+from tests.helpers import assert_private_file
 
 from arxiv_digest.arxiv_access import (
     ArxivCooldown,
@@ -31,7 +34,7 @@ def test_cooldown_persists_private_minimal_state_and_expires_after_restart(tmp_p
     assert observed.attempted is True
     assert observed.http_status == 429
     assert observed.retry_at == NOW + timedelta(seconds=120)
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert_private_file(path)
     assert json.loads(path.read_text()) == {
         "schema_version": 1,
         "retry_at": "2026-08-22T12:02:00+00:00",
@@ -77,8 +80,7 @@ def test_second_response_cannot_shorten_an_active_cooldown(tmp_path: Path) -> No
 @pytest.mark.parametrize("payload", [b"not-json", b"{}", b'{"schema_version":2,"retry_at":"2026-08-22T13:00:00+00:00","http_status":429}', b'{"schema_version":1,"retry_at":"2026-08-22T13:00:00","http_status":429}', b"x" * 5000])
 def test_invalid_persistence_blocks_requests_without_echoing_contents(tmp_path: Path, payload: bytes) -> None:
     path = tmp_path / "private-cooldown.json"
-    path.write_bytes(payload)
-    path.chmod(0o600)
+    atomic_write(path, payload)
     cooldown = ArxivCooldown(path, wall_clock=lambda: NOW)
     with pytest.raises(ArxivCooldownUnavailable) as caught:
         cooldown.raise_if_active()
@@ -107,18 +109,25 @@ def test_failed_atomic_persistence_keeps_memory_blocked(tmp_path: Path, monkeypa
 
 def test_duplicate_json_fields_are_not_used_to_hide_a_deadline(tmp_path: Path) -> None:
     path = tmp_path / "arxiv-cooldown.json"
-    path.write_text('{"schema_version":1,"retry_at":"2026-08-22T13:00:00+00:00","retry_at":"1970-01-01T00:00:00+00:00","http_status":429}')
-    path.chmod(0o600)
+    atomic_write(path, b'{"schema_version":1,"retry_at":"2026-08-22T13:00:00+00:00","retry_at":"1970-01-01T00:00:00+00:00","http_status":429}')
     with pytest.raises(ArxivCooldownUnavailable):
         ArxivCooldown(path, wall_clock=lambda: NOW).active()
 
 
-@pytest.mark.parametrize("kind", ["symlink", "fifo", "public"])
+@pytest.mark.parametrize("kind", [
+    "symlink",
+    pytest.param("fifo", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO fixture")),
+    pytest.param("public", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits; Windows ACL rejection has native tests")),
+])
 def test_cooldown_rejects_nonprivate_or_nonregular_files_without_waiting(tmp_path: Path, kind: str) -> None:
-    import os
     path = tmp_path / "arxiv-cooldown.json"
     if kind == "symlink":
-        path.symlink_to(tmp_path / "missing.json")
+        try:
+            path.symlink_to(tmp_path / "missing.json")
+        except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                pytest.skip("Windows symlink privilege is unavailable")
+            raise
     elif kind == "fifo":
         os.mkfifo(path, 0o600)
     else:

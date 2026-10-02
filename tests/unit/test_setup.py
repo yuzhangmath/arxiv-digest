@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -77,7 +78,7 @@ def test_legacy_personalization_draft_resumes_at_destination_without_losing_choi
     from arxiv_digest.setup import _encode_payload
     selected = replace(draft, seed_papers=(_seed(),), keywords=("geometry",),
                        phrases=("derived category",), authors=("Ada Example",))
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.execute(
             "UPDATE setup_draft SET current_step = ?, payload_json = ? WHERE singleton = 1",
             (legacy_step, _encode_payload(selected)),

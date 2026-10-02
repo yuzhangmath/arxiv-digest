@@ -69,7 +69,7 @@ def resolve_paths(
         if not candidate.is_absolute():
             raise RuntimeError("test root must be absolute")
         root = candidate.resolve()
-        if root in (Path("/"), home):
+        if root == Path(root.anchor) or root == home:
             raise RuntimeError("test root is too broad")
         return _resolved_app_paths(
             config=root / "config",
@@ -80,6 +80,13 @@ def resolve_paths(
         data = home / "Library/Application Support/arxiv-digest"
         config = data
         cache = home / "Library/Caches/arxiv-digest"
+    elif platform == "win32":
+        local = Path(environ.get("LOCALAPPDATA", ""))
+        if not local.is_absolute():
+            local = home / "AppData/Local"
+        data = local / "arxiv-digest/data"
+        config = data
+        cache = local / "arxiv-digest/cache"
     elif platform.startswith("linux"):
         def absolute_xdg(name: str, fallback: Path) -> Path:
             raw = environ.get(name)
@@ -92,5 +99,5 @@ def resolve_paths(
         data = absolute_xdg("XDG_DATA_HOME", home / ".local/share") / "arxiv-digest"
         cache = absolute_xdg("XDG_CACHE_HOME", home / ".cache") / "arxiv-digest"
     else:
-        raise RuntimeError("arxiv-digest 0.2 supports macOS and Linux")
+        raise RuntimeError("arxiv-digest supports macOS, Windows, and Linux")
     return _resolved_app_paths(config=config, data=data, cache=cache)

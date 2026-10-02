@@ -169,16 +169,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         python: ["3.11", "3.x"]
         suite: [python, browser]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 60
     env:
       EXPECTED_COMMIT: ${{ needs.build.outputs.commit_sha }}
       VERSION: ${{ needs.build.outputs.version }}
 
     steps:
+      - name: Preserve source line endings on every platform
+        run: git config --global core.autocrlf false
+
       - name: Check out the built commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -251,8 +257,8 @@ jobs:
         if: matrix.suite == 'browser' && runner.os == 'Linux'
         run: python -m playwright install --with-deps chromium webkit
 
-      - name: Install Playwright browsers on macOS
-        if: matrix.suite == 'browser' && runner.os == 'macOS'
+      - name: Install Playwright browsers on macOS and Windows
+        if: matrix.suite == 'browser' && runner.os != 'Linux'
         run: python -m playwright install chromium webkit
 
       - name: Run browser tests
@@ -272,24 +278,40 @@ jobs:
           set -euo pipefail
           python -m pip install --disable-pip-version-check pipx
           umask 022
-          wheel="${ARXIV_DIGEST_RELEASE_ARTIFACT_DIR}/arxiv_digest-${VERSION}-py3-none-any.whl"
-          mkdir -p \
-            "${RUNNER_TEMP}/pipx-home" \
-            "${RUNNER_TEMP}/pipx-bin" \
-            "${RUNNER_TEMP}/unrelated"
-          cd "${RUNNER_TEMP}/unrelated"
-          PIPX_HOME="${RUNNER_TEMP}/pipx-home" \
-          PIPX_BIN_DIR="${RUNNER_TEMP}/pipx-bin" \
-            python -m pipx install "$wheel"
-          doctor_output="$(
-            ARXIV_DIGEST_TESTING=1 \
-            ARXIV_DIGEST_TEST_ROOT="${RUNNER_TEMP}/doctor-state" \
-              "${RUNNER_TEMP}/pipx-bin/arxiv-digest" doctor
-          )"
-          test "${doctor_output%%$'\n'*}" = "arXiv Digest ${VERSION}"
-          test ! -e "${RUNNER_TEMP}/doctor-state/config/profile.json"
-          test ! -e "${RUNNER_TEMP}/doctor-state/data/state.sqlite3"
-          test ! -e "${RUNNER_TEMP}/doctor-state/data/runtime.json"
+          python - <<'PY_SMOKE'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "pipx-smoke"
+          root.mkdir()
+          version = os.environ["VERSION"]
+          wheel = Path(os.environ["ARXIV_DIGEST_RELEASE_ARTIFACT_DIR"]) / f"arxiv_digest-{version}-py3-none-any.whl"
+          smoke_env = dict(os.environ)
+          for key, directory in (
+              ("HOME", "home"), ("USERPROFILE", "home"),
+              ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+              ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state"),
+              ("APPDATA", "appdata"), ("LOCALAPPDATA", "localappdata"),
+              ("PIPX_HOME", "pipx-home"), ("PIPX_BIN_DIR", "pipx-bin"),
+              ("PIPX_SHARED_LIBS", "pipx-shared"), ("PIPX_MAN_DIR", "pipx-man"),
+              ("PIPX_COMPLETION_DIR", "pipx-completion"), ("PIP_CACHE_DIR", "pip-cache"),
+          ):
+              location = root / directory
+              location.mkdir(exist_ok=True)
+              smoke_env[key] = str(location)
+          smoke_env["PIPX_DEFAULT_PYTHON"] = sys.executable
+          unrelated = root / "unrelated"
+          unrelated.mkdir(exist_ok=True)
+          subprocess.run([sys.executable, "-m", "pipx", "install", str(wheel)], cwd=unrelated, env=smoke_env, check=True)
+          state = root / "doctor-state"
+          smoke_env.update(ARXIV_DIGEST_TESTING="1", ARXIV_DIGEST_TEST_ROOT=str(state))
+          executable = root / "pipx-bin" / ("arxiv-digest.exe" if os.name == "nt" else "arxiv-digest")
+          result = subprocess.run([str(executable), "doctor"], cwd=unrelated, env=smoke_env, capture_output=True, text=True, check=True)
+          assert result.stdout.splitlines()[0] == f"arXiv Digest {version}"
+          for relative in ("config/profile.json", "data/state.sqlite3", "data/runtime.json"):
+              assert not (state / relative).exists(), relative
+          PY_SMOKE
 
       - name: Confirm validation preserved candidate bytes and tracked source
         shell: bash

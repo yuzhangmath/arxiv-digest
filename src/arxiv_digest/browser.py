@@ -75,7 +75,7 @@ def open_browser(url: str) -> bool:
 
 def copy_url(url: str) -> bool:
     """Copy on explicit request, returning False when no clipboard is available."""
-    if _is_wsl():
+    if sys.platform == "win32" or _is_wsl():
         commands = [["clip.exe"]]
     elif sys.platform == "darwin":
         commands = [["pbcopy"]]

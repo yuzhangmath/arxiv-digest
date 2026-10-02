@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import tempfile
-import stat
 from datetime import date
 from pathlib import Path
 from subprocess import CompletedProcess
 
 import pytest
+
+from tests.helpers import assert_private_file
 
 import arxiv_digest.folders as folders_module
 from arxiv_digest.folders import (
@@ -43,6 +44,92 @@ def test_standard_choices_are_friendly_and_need_no_typed_paths(
     )
     assert not (tmp_path / "Downloads").exists()
     assert not (tmp_path / "Documents").exists()
+
+
+def test_windows_picker_returns_unicode_path_without_shell_interpolation(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "论文 & 'chosen' %Folder%"
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(arguments: list[str], **options: object) -> CompletedProcess[str]:
+        calls.append((arguments, options))
+        return CompletedProcess(arguments, 0, stdout=str(destination), stderr="")
+
+    service = FolderService(
+        platform="win32", home=tmp_path,
+        executable_lookup=lambda name: "powershell.exe" if name == "powershell.exe" else None,
+        process_runner=run,
+    )
+    result = service.pick_custom()
+
+    assert result.status is PickerStatus.SELECTED
+    assert result.choice == FolderChoice(DestinationKind.CUSTOM, destination, destination.name)
+    arguments, options = calls[0]
+    assert arguments[:5] == ["powershell.exe", "-NoProfile", "-NonInteractive", "-STA", "-Command"]
+    assert "System.Windows.Forms.FolderBrowserDialog" in arguments[5]
+    assert "[Console]::OutputEncoding" in arguments[5]
+    assert str(destination) not in arguments[5]
+    assert options["encoding"] == "utf-8"
+    assert options["shell"] is False
+
+
+@pytest.mark.parametrize(
+    ("returncode", "output", "expected"),
+    [(0, "", PickerStatus.CANCELLED), (1, "", PickerStatus.FAILED),
+     (0, "relative-folder", PickerStatus.FAILED)],
+)
+def test_windows_picker_reports_cancellation_and_failures(
+    tmp_path: Path, returncode: int, output: str, expected: PickerStatus,
+) -> None:
+    service = FolderService(
+        platform="win32", home=tmp_path,
+        executable_lookup=lambda _name: "powershell.exe",
+        process_runner=lambda arguments, **_: CompletedProcess(
+            arguments, returncode, stdout=output, stderr="private diagnostic",
+        ),
+    )
+    result = service.pick_custom()
+    assert result.status is expected
+    assert result.choice is None
+    assert "private diagnostic" not in (result.message or "")
+
+
+def test_windows_picker_without_powershell_remains_unavailable(tmp_path: Path) -> None:
+    service = FolderService(
+        platform="win32", home=tmp_path, executable_lookup=lambda _: None,
+    )
+    assert service.pick_custom().status is PickerStatus.UNAVAILABLE
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_windows_open_passes_only_the_active_folder_to_the_shell_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed: bool,
+) -> None:
+    destination = tmp_path / "论文 & 'chosen' %Folder%"
+    destination.mkdir()
+    profile = Profile(
+        schema_version=2, revision=1,
+        category_coverage=(ProfileCategory("cs.SE", date(2026, 8, 1)),),
+        keywords=(), phrases=(), authors=(), seed_papers=(),
+        pdf_destination=PdfDestination("custom", destination),
+    )
+    calls: list[tuple[str, str]] = []
+
+    def startfile(path: str, operation: str) -> None:
+        calls.append((path, operation))
+        if failed:
+            raise OSError("private-folder")
+
+    monkeypatch.setattr(folders_module.os, "startfile", startfile, raising=False)
+    service = FolderService(
+        platform="win32", home=tmp_path,
+        process_runner=lambda *args, **kwargs: pytest.fail("unexpected subprocess"),
+    )
+    result = service.open_active(profile)
+    assert result.status is (OpenStatus.FAILED if failed else OpenStatus.OPENED)
+    assert calls == [(str(destination), "open")]
+    assert "private-folder" not in (result.message or "")
 
 
 def test_macos_custom_choice_uses_the_native_picker_argument_array(
@@ -417,7 +504,7 @@ def test_validation_fsyncs_a_private_probe_then_renames_and_deletes_it(
 
     def replace(source: str | Path, destination: str | Path) -> None:
         source_path = Path(source)
-        assert stat.S_IMODE(source_path.stat().st_mode) == 0o600
+        assert_private_file(source_path)
         replacements.append((source_path, Path(destination)))
         real_replace(source, destination)
 

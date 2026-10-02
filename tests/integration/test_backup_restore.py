@@ -19,6 +19,7 @@ from arxiv_digest.paths import resolve_paths
 from arxiv_digest.profile import PdfDestination, Profile, ProfileRepository
 from arxiv_digest.setup import SetupService
 from arxiv_digest.storage.store import Store
+from tests.helpers import assert_private_file
 from tests.unit.test_backup import (
     NOW,
     archive_payloads,
@@ -569,7 +570,7 @@ def test_nonempty_restore_creates_and_verifies_a_private_recovery_backup(
         "pre-restore-20260822T120000Z-1212121212121212"
         ".arxiv-digest-backup.zip"
     )
-    assert result.pre_restore_path.stat().st_mode & 0o777 == 0o600
+    assert_private_file(result.pre_restore_path)
     recovery = inspect_backup(result.pre_restore_path)
     assert recovery.manifest.application_version == __version__
     assert recovery.profile.revision == 1

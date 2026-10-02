@@ -1660,7 +1660,7 @@ def test_interests_edit_publishes_profile_v2_with_exact_active_coverage() -> Non
         phrases=(),
         authors=(),
         seed_papers=(),
-        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads").resolve()),
     )
     state = SimpleNamespace(
         category="cs.SE",
@@ -1714,7 +1714,7 @@ def test_profile_projection_reports_authoritative_profile_coverage() -> None:
         phrases=(),
         authors=(),
         seed_papers=(),
-        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads").resolve()),
     )
     state = SimpleNamespace(
         set_spec="cs:SE",
@@ -1748,7 +1748,7 @@ def test_interests_readd_requires_fresh_coverage_when_sync_state_is_retained(
         phrases=(),
         authors=(),
         seed_papers=(),
-        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads").resolve()),
     )
     states = {
         "cs.SE": SimpleNamespace(
@@ -1804,7 +1804,7 @@ def test_interests_readd_rejects_coverage_outside_supported_window() -> None:
         phrases=(),
         authors=(),
         seed_papers=(),
-        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads").resolve()),
     )
     published = []
     runtime = object.__new__(_DefaultRuntime)
@@ -1859,7 +1859,7 @@ def test_interests_readd_uses_fresh_coverage_not_the_retained_boundary() -> None
         phrases=(),
         authors=(),
         seed_papers=(),
-        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads")),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/downloads").resolve()),
     )
     states = {
         "cs.SE": SimpleNamespace(

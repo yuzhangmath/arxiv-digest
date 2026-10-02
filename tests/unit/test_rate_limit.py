@@ -1284,9 +1284,9 @@ def test_restarted_transport_performs_no_network_or_sleep_before_saved_deadline(
 
 def test_corrupt_saved_cooldown_blocks_transport_before_open(tmp_path) -> None:
     from arxiv_digest.arxiv_access import ArxivCooldown, ArxivCooldownUnavailable
+    from arxiv_digest.atomic import atomic_write
     path = tmp_path / "arxiv-cooldown.json"
-    path.write_bytes(b"broken")
-    path.chmod(0o600)
+    atomic_write(path, b"broken")
     opener = FakeOpener()
     client = ArxivHttpClient(
         user_agent="fixture", contact_url="https://example.invalid/contact",

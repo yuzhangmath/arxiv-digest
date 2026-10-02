@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from email.message import Message
@@ -157,7 +158,7 @@ def test_curl_response_cannot_confirm_a_malformed_or_partial_daily_list(
     assert report.dates_with_papers == report.empty_dates == 0
     assert store.events_for_date(DAY) == ()
     assert store.catchup_day_records(config.category)[0].error_code == "catchup_layout_changed"
-    with open_database(database) as connection:
+    with closing(open_database(database)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM source_observations").fetchone()[0] == 0
 
 

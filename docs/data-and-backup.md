@@ -10,6 +10,7 @@ PDFs, and portable backups.
 - [Review, Calendar, and coverage](#review-calendar-and-coverage)
 - [macOS locations](#macos-locations)
 - [Linux locations](#linux-locations)
+- [Windows locations](#windows-locations)
 - [Cache safety](#cache-safety)
 - [PDF destinations](#pdf-destinations)
 - [Export a backup](#export-a-backup)
@@ -130,6 +131,32 @@ fallbacks appear only on systems where no native folder picker is available.
 - Backups: the `backups` folder inside the durable data directory
 
 Relative XDG overrides are ignored in favor of the platform fallback.
+
+## Windows locations
+
+- Configuration and durable data: `%LOCALAPPDATA%\arxiv-digest\data`
+- Regenerable cache: `%LOCALAPPDATA%\arxiv-digest\cache`
+- Backups: the `backups` folder inside the durable data directory
+- Optional launcher: `arXiv Digest.cmd` in your Windows Desktop folder,
+  including a Desktop redirected to OneDrive
+
+Paste the data and cache paths into File Explorer's address bar. A missing or
+relative `LOCALAPPDATA` value falls back to `AppData\Local` inside your Windows
+user folder. Keep durable data, PDF destinations, and exported backups on a
+local filesystem supporting Windows access controls and file locking, such as
+NTFS. FAT/exFAT destinations cannot preserve the protected permissions the app
+requires and are rejected. Use a trusted transfer channel when moving backups.
+
+Windows writes flush file contents and request write-through replacement. It
+does not provide the directory `fsync` used on macOS and Linux, so durability of
+directory creation, deletion, and rename metadata across sudden power loss
+depends on the filesystem. Keep independent verified backups of important state.
+
+Generation-2 portable backups can move your profile, Library, and review
+progress between Windows, macOS, and Linux. Export on the old computer, import
+on the new one, and confirm a PDF destination there. Copy downloaded PDFs
+separately; portable backups do not contain them. Native Windows and WSL use
+separate application data directories.
 
 ## Cache safety
 

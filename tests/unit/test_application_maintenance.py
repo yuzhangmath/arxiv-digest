@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -23,6 +24,27 @@ def _runtime():
     runtime._sync_start_lock = threading.Lock()
     runtime._sync_follow_up_requested = False
     return runtime
+
+
+def test_runtime_permission_failure_removes_temporary_file(tmp_path, monkeypatch):
+    import arxiv_digest.application as application
+
+    runtime = _runtime()
+    runtime.paths = SimpleNamespace(cache_dir=tmp_path)
+    opened = []
+
+    def fail(descriptor, mode):
+        opened.append(descriptor)
+        raise PermissionError("private permissions unavailable")
+
+    monkeypatch.setattr(application, "set_private_file_permissions", fail)
+    with pytest.raises(PermissionError, match="unavailable"):
+        runtime._private_temp(".zip")
+
+    assert list(tmp_path.iterdir()) == []
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
 
 
 def test_runtime_background_job_blocks_exclusive_maintenance_until_terminal() -> None:

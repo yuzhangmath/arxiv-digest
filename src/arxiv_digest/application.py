@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from arxiv_digest import __version__
+from arxiv_digest.atomic import set_private_file_permissions
 from arxiv_digest.browser import copy_url as copy_dashboard_url, open_browser
 from arxiv_digest.maintenance import MaintenanceBarrier
 from arxiv_digest.paths import AppPaths, resolve_paths
@@ -1973,8 +1974,14 @@ class _DefaultRuntime:
             suffix=suffix,
             dir=self.paths.cache_dir,
         )
-        os.fchmod(descriptor, 0o600)
-        os.close(descriptor)
+        try:
+            try:
+                set_private_file_permissions(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+        except BaseException:
+            Path(name).unlink(missing_ok=True)
+            raise
         return Path(name)
 
     def _backup_export(self, payload: dict[str, Any]) -> Any:

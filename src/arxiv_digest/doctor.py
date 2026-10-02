@@ -7,7 +7,6 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
 
 from arxiv_digest import __version__
 from arxiv_digest.paths import AppPaths
@@ -73,8 +72,7 @@ class DoctorReport:
 
 
 def _readonly_database(path: Path) -> sqlite3.Connection:
-    encoded = quote(str(path.resolve()), safe="/")
-    connection = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only = ON")
     return connection

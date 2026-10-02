@@ -5,6 +5,8 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from tests.helpers import assert_private_file
+
 from arxiv_digest.models import OaiArticle, OaiTombstone, PaperMetadata, PaperVersion
 from arxiv_digest.sources.oai import OaiProtocolError
 
@@ -137,7 +139,7 @@ def test_candidate_cache_round_trips_exact_shard_and_expires_after_seven_days(
     cache.save_shard(shard)
 
     assert cache.load_shard("synthetic.alpha", "synthetic:alpha") == shard
-    assert (cache.shard_path("synthetic.alpha", "synthetic:alpha").stat().st_mode & 0o777) == 0o600
+    assert_private_file(cache.shard_path("synthetic.alpha", "synthetic:alpha"))
     current[0] = created_at + timedelta(days=7, microseconds=1)
     assert cache.load_shard("synthetic.alpha", "synthetic:alpha") is None
 

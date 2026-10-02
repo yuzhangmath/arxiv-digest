@@ -234,10 +234,10 @@ def test_clearing_cache_does_not_cancel_saved_cooldown(tmp_path):
 
 def test_unreadable_cooldown_remains_visible_without_breaking_local_status(tmp_path):
     from arxiv_digest.arxiv_access import ArxivCooldown
+    from arxiv_digest.atomic import atomic_write
 
     path = tmp_path / "arxiv-cooldown.json"
-    path.write_text("invalid")
-    path.chmod(0o600)
+    atomic_write(path, b"invalid")
     value = runtime()
     value.arxiv_cooldown = ArxivCooldown(path)
     status = value._arxiv_access_status()

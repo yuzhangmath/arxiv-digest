@@ -10,7 +10,22 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from arxiv_digest.atomic import set_private_file_permissions
 from arxiv_digest.profile import PdfDestination, Profile
+
+
+_WINDOWS_PICKER_SCRIPT = (
+    "$ErrorActionPreference = 'Stop'; "
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+    "Add-Type -AssemblyName System.Windows.Forms; "
+    "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+    "$dialog.Description = 'Choose PDF destination'; "
+    "try { "
+    "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { "
+    "[Console]::Write($dialog.SelectedPath) "
+    "} "
+    "} finally { $dialog.Dispose() }"
+)
 
 
 class DestinationKind(StrEnum):
@@ -129,6 +144,17 @@ class FolderService:
                     'destination")\non error number -128\nreturn ""\nend try'
                 ),
             ]
+        elif self.platform == "win32":
+            executable = self.executable_lookup("powershell.exe")
+            if executable is None:
+                return FolderPickerResult(
+                    PickerStatus.UNAVAILABLE,
+                    message="The native folder picker is unavailable.",
+                )
+            arguments = [
+                executable, "-NoProfile", "-NonInteractive", "-STA",
+                "-Command", _WINDOWS_PICKER_SCRIPT,
+            ]
         else:
             return FolderPickerResult(
                 PickerStatus.UNAVAILABLE,
@@ -141,6 +167,7 @@ class FolderService:
                 text=True,
                 check=False,
                 shell=False,
+                **({"encoding": "utf-8"} if self.platform == "win32" else {}),
             )
         except OSError:
             return FolderPickerResult(
@@ -194,7 +221,7 @@ class FolderService:
             probe = Path(name)
             with os.fdopen(descriptor, "wb") as handle:
                 descriptor = None
-                os.fchmod(handle.fileno(), 0o600)
+                set_private_file_permissions(handle.fileno())
                 handle.write(b"arxiv-digest-folder-probe\n")
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -223,6 +250,15 @@ class FolderService:
                 OpenStatus.FAILED,
                 "The active PDF destination is unavailable.",
             )
+        if self.platform == "win32":
+            try:
+                os.startfile(str(destination), "open")
+            except OSError:
+                return OpenFolderResult(
+                    OpenStatus.FAILED,
+                    "The active PDF destination could not be opened.",
+                )
+            return OpenFolderResult(OpenStatus.OPENED)
         executable_name = (
             "xdg-open" if self.platform.startswith("linux") else "open"
         )

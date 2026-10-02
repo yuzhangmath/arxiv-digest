@@ -119,7 +119,7 @@ def _profile(
         phrases=phrases,
         authors=authors,
         seed_papers=seed_papers,
-        pdf_destination=PdfDestination("downloads", Path("/tmp/ranking-papers")),
+        pdf_destination=PdfDestination("downloads", Path("/tmp/ranking-papers").resolve()),
     )
 
 

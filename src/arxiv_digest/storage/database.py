@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 
+from arxiv_digest.atomic import replace_file, set_private_file_permissions
+
 
 class CorruptDatabaseError(RuntimeError):
     pass
@@ -212,9 +214,12 @@ def _create_database(path: Path) -> None:
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
-    os.close(descriptor)
     temporary = Path(temporary_name)
     try:
+        try:
+            set_private_file_permissions(descriptor)
+        finally:
+            os.close(descriptor)
         connection = _connect(temporary)
         try:
             connection.execute("PRAGMA journal_mode = DELETE")
@@ -223,7 +228,7 @@ def _create_database(path: Path) -> None:
             _check(connection, len(_migration_scripts()))
         finally:
             connection.close()
-        os.replace(temporary, path)
+        replace_file(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 

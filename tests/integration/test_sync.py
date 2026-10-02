@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -2106,7 +2107,7 @@ def test_metadata_http_failure_preserves_only_the_status_code(tmp_path: Path) ->
 def _seed_historical_finished_date(tmp_path: Path, store: Store, day: date) -> None:
     """Represent review progress saved before abstract readiness was required."""
     reviewed_at = NOW.isoformat().replace("+00:00", "Z")
-    with open_database(tmp_path / "state.sqlite3") as connection:
+    with closing(open_database(tmp_path / "state.sqlite3")) as connection, connection:
         connection.execute(
             "UPDATE canonical_events SET reviewed_at = ? WHERE daily_list_date = ?",
             (reviewed_at, day.isoformat()),
@@ -2145,7 +2146,7 @@ def test_missing_abstract_selection_includes_unreviewed_and_reviewed_active_dail
     _seed_historical_finished_date(tmp_path, store, date(2026, 8, 21))
     deleted = replace(_paper("2608.04007"), abstract="")
     _recover_retry_papers(store, config, date(2026, 8, 22), blank, deleted)
-    with open_database(tmp_path / "state.sqlite3") as connection:
+    with closing(open_database(tmp_path / "state.sqlite3")) as connection, connection:
         connection.execute(
             "UPDATE articles SET is_deleted = 1 WHERE arxiv_id = ?",
             (deleted.arxiv_id,),
