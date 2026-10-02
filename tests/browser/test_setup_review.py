@@ -1531,11 +1531,13 @@ def test_bulk_review_refresh_failure_does_not_cross_into_another_view() -> None:
             application.review_summary_gate.set()
 
 
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
 @pytest.mark.parametrize("destination", ["review-date", "library"])
 def test_late_bulk_finish_cannot_replace_destination_or_leak_success_status(
+    engine: str,
     destination: str,
 ) -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
+    with running_fixture() as (server, application), browser_page(engine) as page:
         application.review_finish_all_gate = threading.Event()
 
         try:
@@ -1545,6 +1547,11 @@ def test_late_bulk_finish_cannot_replace_destination_or_leak_success_status(
                 "button", name="Confirm mark all as reviewed"
             ).click()
             assert application.review_finish_all_entered.wait(timeout=5)
+            confirmation = page.locator(
+                "#review-finish-all-confirmation"
+            ).element_handle()
+            assert confirmation is not None
+            assert confirmation.get_attribute("aria-busy") == "true"
 
             if destination == "review-date":
                 page.get_by_role("button", name="Start review", exact=True).click()
@@ -1559,7 +1566,11 @@ def test_late_bulk_finish_cannot_replace_destination_or_leak_success_status(
                 lambda response: response.url.endswith("/api/v1/review/finish")
             ):
                 application.review_finish_all_gate.set()
-            page.wait_for_timeout(300)
+            page.wait_for_function(
+                "node => node.getAttribute('aria-busy') === 'false'",
+                arg=confirmation,
+                timeout=5_000,
+            )
 
             if destination == "review-date":
                 assert page.get_by_role(
@@ -1578,8 +1589,9 @@ def test_late_bulk_finish_cannot_replace_destination_or_leak_success_status(
             application.review_finish_all_gate.set()
 
 
-def test_late_failed_bulk_finish_does_not_leak_status_into_library() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_late_failed_bulk_finish_does_not_leak_status_into_library(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
         application.review_finish_all_gate = threading.Event()
         application.review_finish_all_failures = 1
 
@@ -1590,6 +1602,11 @@ def test_late_failed_bulk_finish_does_not_leak_status_into_library() -> None:
                 "button", name="Confirm mark all as reviewed"
             ).click()
             assert application.review_finish_all_entered.wait(timeout=5)
+            confirmation = page.locator(
+                "#review-finish-all-confirmation"
+            ).element_handle()
+            assert confirmation is not None
+            assert confirmation.get_attribute("aria-busy") == "true"
 
             page.get_by_role("button", name="Library", exact=True).click()
             page.get_by_role("heading", name="Library", exact=True).wait_for()
@@ -1598,7 +1615,11 @@ def test_late_failed_bulk_finish_does_not_leak_status_into_library() -> None:
                 lambda response: response.url.endswith("/api/v1/review/finish")
             ):
                 application.review_finish_all_gate.set()
-            page.wait_for_timeout(300)
+            page.wait_for_function(
+                "node => node.getAttribute('aria-busy') === 'false'",
+                arg=confirmation,
+                timeout=5_000,
+            )
 
             assert page.get_by_role(
                 "heading", name="Library", exact=True
@@ -1681,8 +1702,9 @@ def test_late_failed_review_render_does_not_cross_into_library() -> None:
             application.review_summary_gate.set()
 
 
-def test_review_polling_preserves_focus_and_exposes_live_status() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_review_polling_preserves_focus_and_exposes_live_status(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
         application.sync_running = True
         application.sync_phase = "enrichment"
         application.review_ready = True
@@ -1699,7 +1721,12 @@ def test_review_polling_preserves_focus_and_exposes_live_status() -> None:
         phase_status.evaluate("node => { window.__reviewPhaseStatus = node; }")
 
         start.focus()
-        page.wait_for_timeout(1_400)
+        # Observe a rendered summary update before checking preserved focus.
+        with application.lock:
+            application.review_missing_abstracts = 1
+        page.get_by_text(
+            "1 unreviewed paper is missing an abstract", exact=False
+        ).wait_for(timeout=5_000)
 
         assert page.evaluate("document.activeElement?.textContent") == "Start review"
         assert phase_status.evaluate(
@@ -2093,6 +2120,9 @@ def test_open_review_date_refreshes_once_when_synchronization_finishes(
         application.sync_running = True
         application.review_ready = True
         application.review_metadata_tracks_sync = True
+        application.abstract_retry_running = True
+        application.abstract_retry_date = "2026-07-31"
+        application.abstract_retry_total = 20
         page_errors: list[str] = []
         page.on("pageerror", lambda error: page_errors.append(str(error)))
 
@@ -2107,7 +2137,12 @@ def test_open_review_date_refreshes_once_when_synchronization_finishes(
             "button", name="Save", exact=True
         )
         save.focus()
-        page.wait_for_timeout(1_300)
+        # Observe an in-progress poll before letting synchronization finish.
+        with application.lock:
+            application.abstract_retry_completed = 1
+        page.get_by_role(
+            "button", name="Retrying abstracts… 1 of 20 checked", exact=True
+        ).wait_for(timeout=5_000)
         assert page.evaluate("document.activeElement?.textContent") == "Save"
         assert "Version not confirmed" in unresolved.inner_text()
         assert application.review_date_requests == 1
@@ -2123,8 +2158,9 @@ def test_open_review_date_refreshes_once_when_synchronization_finishes(
         assert page_errors == []
 
 
-def test_finishing_date_wins_over_inflight_terminal_sync_refresh() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_finishing_date_wins_over_inflight_terminal_sync_refresh(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
         application.sync_running = True
         application.review_ready = True
         application.review_metadata_tracks_sync = True
@@ -2156,11 +2192,14 @@ def test_finishing_date_wins_over_inflight_terminal_sync_refresh() -> None:
                 )
             ):
                 application.review_finish_gate.set()
-            page.wait_for_timeout(300)
 
-            assert page.get_by_role(
+            # Finishing still fetches status and the overview before rendering.
+            page.get_by_role(
                 "button", name="Start review", exact=True
-            ).is_visible()
+            ).wait_for(timeout=5_000)
+            page.get_by_text(
+                "Finished review for 2026-07-31.", exact=True
+            ).wait_for(timeout=5_000)
             assert page.get_by_role(
                 "heading", name="Review 2026-07-31"
             ).count() == 0
@@ -2523,8 +2562,9 @@ def test_successful_date_finish_is_not_retried_when_overview_refresh_fails() -> 
         assert application.review_finish_requests == 1
 
 
-def test_late_date_finish_cannot_replace_library_or_leak_success_status() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_late_date_finish_cannot_replace_library_or_leak_success_status(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
         application.review_finish_gate = threading.Event()
         application.saved_anchor = 181
 
@@ -2535,6 +2575,11 @@ def test_late_date_finish_cannot_replace_library_or_leak_success_status() -> Non
             page.get_by_role("button", name="Finish date", exact=True).click()
             page.get_by_role("button", name="Confirm finish", exact=True).click()
             assert application.review_finish_entered.wait(timeout=5)
+            confirmation = page.locator(
+                "#review-finish-confirmation"
+            ).element_handle()
+            assert confirmation is not None
+            assert confirmation.get_attribute("aria-busy") == "true"
 
             page.get_by_role("button", name="Library", exact=True).click()
             page.get_by_role("heading", name="Library", exact=True).wait_for()
@@ -2545,7 +2590,11 @@ def test_late_date_finish_cannot_replace_library_or_leak_success_status() -> Non
                 )
             ):
                 application.review_finish_gate.set()
-            page.wait_for_timeout(300)
+            page.wait_for_function(
+                "node => node.getAttribute('aria-busy') === 'false'",
+                arg=confirmation,
+                timeout=5_000,
+            )
 
             assert page.get_by_role(
                 "heading", name="Library", exact=True
@@ -2556,8 +2605,9 @@ def test_late_date_finish_cannot_replace_library_or_leak_success_status() -> Non
             application.review_finish_gate.set()
 
 
-def test_late_failed_date_finish_does_not_leak_status_into_library() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_late_failed_date_finish_does_not_leak_status_into_library(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
         application.review_finish_gate = threading.Event()
         application.review_finish_failures = 1
         application.saved_anchor = 181
@@ -2569,6 +2619,11 @@ def test_late_failed_date_finish_does_not_leak_status_into_library() -> None:
             page.get_by_role("button", name="Finish date", exact=True).click()
             page.get_by_role("button", name="Confirm finish", exact=True).click()
             assert application.review_finish_entered.wait(timeout=5)
+            confirmation = page.locator(
+                "#review-finish-confirmation"
+            ).element_handle()
+            assert confirmation is not None
+            assert confirmation.get_attribute("aria-busy") == "true"
 
             page.get_by_role("button", name="Library", exact=True).click()
             page.get_by_role("heading", name="Library", exact=True).wait_for()
@@ -2579,7 +2634,11 @@ def test_late_failed_date_finish_does_not_leak_status_into_library() -> None:
                 )
             ):
                 application.review_finish_gate.set()
-            page.wait_for_timeout(300)
+            page.wait_for_function(
+                "node => node.getAttribute('aria-busy') === 'false'",
+                arg=confirmation,
+                timeout=5_000,
+            )
 
             assert page.get_by_role(
                 "heading", name="Library", exact=True
