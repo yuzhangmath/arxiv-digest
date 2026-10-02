@@ -13,6 +13,10 @@ This file records notable user-visible changes to arXiv Digest.
 
 ### Changed
 
+- New PDF downloads use all authors' surnames followed by the title, without an
+  arXiv ID or version prefix. Existing filenames are preserved, and conflicting
+  new filenames receive a numbered suffix. Filename associations survive folder
+  changes and portable restores while missing PDFs remain marked absent.
 - **Retry missing abstracts** now runs on a confirmed Review date, including
   previously reviewed papers. Each recovered abstract is saved immediately,
   and reading, saving, and finishing the date remain available during retries.

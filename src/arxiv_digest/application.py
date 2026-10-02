@@ -1701,7 +1701,9 @@ class _DefaultRuntime:
                 connection.execute("SELECT COUNT(*) FROM saved_papers").fetchone()[0]
             )
             pdf_count = int(
-                connection.execute("SELECT COUNT(*) FROM download_files").fetchone()[0]
+                connection.execute(
+                    "SELECT COUNT(*) FROM download_files WHERE is_present = 1"
+                ).fetchone()[0]
             )
         finally:
             connection.close()

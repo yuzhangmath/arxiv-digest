@@ -94,6 +94,7 @@ EXPECTED_MIGRATIONS = frozenset(
         "0002_download_state.sql",
         "0003_setup_draft.sql",
         "0004_confirmed_daily_list.sql",
+        "0005_download_presence.sql",
     }
 )
 

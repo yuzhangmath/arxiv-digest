@@ -311,7 +311,9 @@ class FixtureApplication:
         )
         self.sync_start_entered.set()
         if self.sync_start_gate is not None:
-            assert self.sync_start_gate.wait(timeout=5)
+            # The test releases this gate in finally. A timed release can send
+            # the response before slow CI navigation has reached its listener.
+            self.sync_start_gate.wait()
         with self.lock:
             if self.sync_start_failures > 0:
                 self.sync_start_failures -= 1
@@ -2053,7 +2055,10 @@ def test_late_abstract_retry_response_preserves_navigation(
         try:
             page.goto(server.launch_url("review"))
             page.get_by_role("button", name="Start review", exact=True).click()
-            page.get_by_role("button", name="Retry missing abstracts", exact=True).click()
+            retry = page.get_by_role("button", name="Retry missing abstracts", exact=True)
+            retry_control = retry.element_handle()
+            assert retry_control is not None
+            retry.click()
             assert application.sync_start_entered.wait(timeout=5)
             if destination == "review-date":
                 page.get_by_role("button", name="Next date", exact=True).click()
@@ -2064,9 +2069,14 @@ def test_late_abstract_retry_response_preserves_navigation(
             heading.wait_for()
             summary_requests = application.review_summary_requests
             status = page.locator("#status").inner_text()
-            with page.expect_response(lambda response: response.url.endswith("/api/v1/sync/start")):
+            with page.expect_response(
+                lambda response: response.url.endswith("/api/v1/sync/start")
+            ) as response:
                 application.sync_start_gate.set()
-            page.wait_for_timeout(300)
+            assert response.value.status == (500 if fails else 200)
+            page.wait_for_function(
+                "control => control.dataset.busy === 'false'", arg=retry_control,
+            )
             assert heading.is_visible()
             assert application.review_summary_requests == summary_requests
             assert page.locator("#status").inner_text() == status

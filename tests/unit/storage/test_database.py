@@ -228,6 +228,66 @@ def test_new_database_applies_download_state_migration(tmp_path: Path) -> None:
     assert table == ("download_files",)
 
 
+def _create_version_four_database(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        for version, script in database_module._migration_scripts()[:4]:
+            database_module._apply_migration(connection, version, script)
+    finally:
+        connection.close()
+
+
+def test_schema_four_migration_preserves_download_metadata_and_presence(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    _create_version_four_database(path)
+    connection = sqlite3.connect(path)
+    _insert_article(connection, "2608.00006")
+    connection.execute(
+        "INSERT INTO article_versions(arxiv_id, version, submitted_at) VALUES (?, ?, ?)",
+        ("2608.00006", 1, "2026-08-01T00:00:00Z"),
+    )
+    values = (
+        "2608.00006", 1, "Example Synthetic title.pdf", 32, "1" * 64,
+        "2026-08-01T00:00:00Z",
+    )
+    connection.execute(
+        """INSERT INTO download_files(
+               arxiv_id, version, filename, byte_count, sha256, last_verified_at
+           ) VALUES (?, ?, ?, ?, ?, ?)""",
+        values,
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = open_database(path)
+    try:
+        assert migrated.execute(
+            """SELECT arxiv_id, version, filename, byte_count, sha256,
+                      last_verified_at, is_present FROM download_files"""
+        ).fetchone() == (*values, 1)
+        with pytest.raises(sqlite3.IntegrityError):
+            migrated.execute("UPDATE download_files SET is_present = 2")
+    finally:
+        migrated.close()
+
+
+def test_schema_five_without_presence_column_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    _create_version_four_database(path)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        (5, "2026-08-01T00:00:00Z"),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(CorruptDatabaseError):
+        open_database(path)
+
+
 def test_existing_version_one_database_is_rejected_without_migration(
     tmp_path: Path,
 ) -> None:

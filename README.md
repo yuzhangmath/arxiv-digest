@@ -202,7 +202,9 @@ Selecting a seed paper affects ranking preferences but does not save it. A
 paper enters Library only when you explicitly save it.
 
 Downloaded PDFs stay in the selected folder and are not included in portable
-backups.
+backups. New PDF filenames use all authors' surnames followed by the paper title,
+for example `Example Sample A Synthetic Paper.pdf`. Existing downloads keep their
+filenames; conflicting new filenames receive a numbered suffix.
 
 ## Try the main workflow
 

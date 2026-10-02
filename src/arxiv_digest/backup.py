@@ -766,6 +766,18 @@ def _recompute_local_downloads(
         filename = payload["filename"]
         if not _is_portable_filename(filename):
             continue
+        # Keep the portable identity even when PDF bytes will be copied later.
+        # Presence belongs to this destination and is verified below.
+        connection.execute(
+            """INSERT INTO download_files(
+                   arxiv_id, version, filename, byte_count, sha256,
+                   last_verified_at, is_present
+               ) VALUES (?, ?, ?, ?, ?, ?, 0)""",
+            (
+                payload["arxiv_id"], payload["version"], filename,
+                payload["byte_count"], payload["sha256"], payload["last_verified_at"],
+            ),
+        )
         candidate = destination / filename
         if candidate.is_symlink() or not candidate.is_file():
             continue
@@ -789,17 +801,12 @@ def _recompute_local_downloads(
         ):
             continue
         connection.execute(
-            """INSERT INTO download_files(
-                   arxiv_id, version, filename, byte_count, sha256,
-                   last_verified_at
-               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            """UPDATE download_files SET is_present = 1, last_verified_at = ?
+               WHERE arxiv_id = ? AND version = ?""",
             (
+                timestamp,
                 payload["arxiv_id"],
                 payload["version"],
-                filename,
-                byte_count,
-                digest.hexdigest(),
-                timestamp,
             ),
         )
 

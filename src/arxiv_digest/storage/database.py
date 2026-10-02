@@ -164,6 +164,12 @@ def _check(connection: sqlite3.Connection, expected_version: int) -> None:
         }
     if not required_tables <= present:
         raise CorruptDatabaseError("database schema is incomplete")
+    if expected_version >= 5:
+        download_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(download_files)")
+        }
+        if "is_present" not in download_columns:
+            raise CorruptDatabaseError("database download presence schema is incomplete")
     triggers = {
         row[0]
         for row in connection.execute(

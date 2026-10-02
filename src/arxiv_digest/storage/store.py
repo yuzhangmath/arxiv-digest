@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
@@ -2003,7 +2004,7 @@ class Store:
             connection.close()
 
     def download_file(
-        self, arxiv_id: str, version: int
+        self, arxiv_id: str, version: int, *, include_missing: bool = False,
     ) -> DownloadFileRecord | None:
         if version < 1:
             raise ValueError("download version must be positive")
@@ -2013,8 +2014,9 @@ class Store:
                 """SELECT arxiv_id, version, filename, byte_count, sha256,
                           last_verified_at
                    FROM download_files
-                   WHERE arxiv_id = ? AND version = ?""",
-                (arxiv_id, version),
+                   WHERE arxiv_id = ? AND version = ?
+                     AND (is_present = 1 OR ?)""",
+                (arxiv_id, version, include_missing),
             ).fetchone()
             if row is None:
                 return None
@@ -2026,6 +2028,40 @@ class Store:
                 sha256=row["sha256"],
                 last_verified_at=_parse_utc(row["last_verified_at"]),
             )
+        finally:
+            connection.close()
+
+    def download_files(self) -> tuple[DownloadFileRecord, ...]:
+        connection = self._connect()
+        try:
+            return tuple(
+                DownloadFileRecord(
+                    arxiv_id=row["arxiv_id"],
+                    version=int(row["version"]),
+                    filename=row["filename"],
+                    byte_count=int(row["byte_count"]),
+                    sha256=row["sha256"],
+                    last_verified_at=_parse_utc(row["last_verified_at"]),
+                )
+                for row in connection.execute(
+                    """SELECT arxiv_id, version, filename, byte_count, sha256,
+                              last_verified_at
+                       FROM download_files ORDER BY arxiv_id, version"""
+                )
+            )
+        finally:
+            connection.close()
+
+    def download_file_owner(self, filename: str) -> tuple[str, int] | None:
+        connection = self._connect()
+        try:
+            key = unicodedata.normalize("NFKC", filename).casefold()
+            for row in connection.execute(
+                "SELECT arxiv_id, version, filename FROM download_files"
+            ):
+                if unicodedata.normalize("NFKC", row["filename"]).casefold() == key:
+                    return row["arxiv_id"], int(row["version"])
+            return None
         finally:
             connection.close()
 
@@ -2053,12 +2089,18 @@ class Store:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM download_files")
+            connection.execute("UPDATE download_files SET is_present = 0")
             connection.executemany(
                 """INSERT INTO download_files(
                        arxiv_id, version, filename, byte_count, sha256,
-                       last_verified_at
-                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                       last_verified_at, is_present
+                   ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                   ON CONFLICT(arxiv_id, version) DO UPDATE SET
+                       filename = excluded.filename,
+                       byte_count = excluded.byte_count,
+                       sha256 = excluded.sha256,
+                       last_verified_at = excluded.last_verified_at,
+                       is_present = 1""",
                 (
                     (
                         record.arxiv_id,
@@ -2085,13 +2127,14 @@ class Store:
             connection.execute(
                 """INSERT INTO download_files(
                        arxiv_id, version, filename, byte_count, sha256,
-                       last_verified_at
-                   ) VALUES (?, ?, ?, ?, ?, ?)
+                       last_verified_at, is_present
+                   ) VALUES (?, ?, ?, ?, ?, ?, 1)
                    ON CONFLICT(arxiv_id, version) DO UPDATE SET
                        filename = excluded.filename,
                        byte_count = excluded.byte_count,
                        sha256 = excluded.sha256,
-                       last_verified_at = excluded.last_verified_at""",
+                       last_verified_at = excluded.last_verified_at,
+                       is_present = 1""",
                 (
                     record.arxiv_id,
                     record.version,
@@ -2628,7 +2671,8 @@ class Store:
                         int(value[0])
                         for value in connection.execute(
                             """SELECT version FROM download_files
-                               WHERE arxiv_id = ? ORDER BY version""",
+                               WHERE arxiv_id = ? AND is_present = 1
+                               ORDER BY version""",
                             (row["arxiv_id"],),
                         )
                     ),

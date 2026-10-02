@@ -262,7 +262,9 @@ def inspect_doctor(
                 )
                 downloaded_pdf_count = int(
                     connection.execute(
-                        "SELECT count(*) FROM download_files"
+                        "SELECT count(*) FROM download_files WHERE is_present = 1"
+                        if schema_version >= 5
+                        else "SELECT count(*) FROM download_files"
                     ).fetchone()[0]
                 )
                 raw_codes.update(

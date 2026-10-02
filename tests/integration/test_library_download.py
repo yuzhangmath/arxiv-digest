@@ -106,6 +106,43 @@ def test_save_plus_pdf_keeps_the_library_save_when_download_fails(
     assert page.entries[0].saved_version == 1
 
 
+def test_save_plus_pdf_names_the_file_with_all_author_surnames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, library, downloads = configured_services(tmp_path)
+    store.apply_article_snapshot(
+        PaperMetadata(
+            arxiv_id="2608.33001",
+            title="Persistent Synthetic Save",
+            authors=("Rowan Example", "Mira Sample"),
+            abstract="A fictional filename integration record.",
+            primary_category="cs.SE",
+            categories=("cs.SE",),
+        ),
+        (PaperVersion(1, datetime(2026, 8, 1, tzinfo=timezone.utc)),),
+    )
+    payload = b"%PDF-1.7\nsynthetic author-title filename\n"
+    monkeypatch.setattr(
+        downloads.client, "get",
+        lambda url, **_options: HttpResponse(
+            status=200, final_url=url,
+            headers={"content-type": "application/pdf"}, body=payload,
+            observed_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        ),
+    )
+
+    result = downloads.download("2608.33001", 1, save_first=True)
+
+    assert result.filename == "Example Sample Persistent Synthetic Save.pdf"
+    assert (tmp_path / "PDFs" / result.filename).read_bytes() == payload
+    entry = library.search("Persistent", limit=20, offset=0).entries[0]
+    assert entry.metadata.arxiv_id == "2608.33001"
+    assert entry.saved_version == 1
+    recorded = store.download_file("2608.33001", 1)
+    assert recorded is not None
+    assert recorded.filename == result.filename
+
+
 def test_unconfirmed_save_plus_pdf_saves_unpinned_before_download_fails(
     tmp_path: Path,
 ) -> None:

@@ -69,6 +69,62 @@ def test_fresh_doctor_is_redacted_read_only_and_creates_nothing(
     assert not root.exists()
 
 
+@pytest.mark.parametrize(
+    ("schema_version", "expected_downloaded"), [(4, 2), (5, 1)],
+)
+def test_doctor_counts_present_pdfs_without_migrating_older_databases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    schema_version: int, expected_downloaded: int,
+) -> None:
+    from arxiv_digest.doctor import inspect_doctor
+    from arxiv_digest.storage import database
+
+    paths = _paths(tmp_path)
+    paths.ensure()
+    scripts = tuple(
+        entry for entry in database._migration_scripts()
+        if entry[0] <= schema_version
+    )
+    assert scripts[-1][0] == schema_version
+    with monkeypatch.context() as schema:
+        schema.setattr(database, "_migration_scripts", lambda: scripts)
+        connection = open_database(paths.database_path)
+    connection.execute(
+        """INSERT INTO articles(
+               arxiv_id, title, abstract, primary_category, metadata_hash
+           ) VALUES ('2608.32031', 'Synthetic PDF Presence',
+                     'A synthetic diagnostic fixture.', 'cs.SE', ?)""",
+        ("a" * 64,),
+    )
+    for version in (1, 2):
+        connection.execute(
+            """INSERT INTO article_versions(arxiv_id, version, submitted_at)
+               VALUES ('2608.32031', ?, '2026-08-01T00:00:00+00:00')""",
+            (version,),
+        )
+        connection.execute(
+            """INSERT INTO download_files(
+                   arxiv_id, version, filename, byte_count, sha256, last_verified_at
+               ) VALUES ('2608.32031', ?, ?, 42, ?, ?)""",
+            (version, f"Synthetic Presence {version}.pdf", "d" * 64,
+             "2026-08-22T12:00:00+00:00"),
+        )
+    if schema_version >= 5:
+        connection.execute(
+            "UPDATE download_files SET is_present = 0 WHERE version = 2"
+        )
+    connection.commit()
+    connection.close()
+    before = paths.database_path.read_bytes()
+
+    report = inspect_doctor(paths)
+
+    assert report.database_status == "ok"
+    assert report.schema_version == schema_version
+    assert report.downloaded_pdf_count == expected_downloaded
+    assert paths.database_path.read_bytes() == before
+
+
 def test_doctor_hides_unfinalized_dates_until_the_new_york_cutoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -269,7 +325,7 @@ def test_initialized_doctor_reports_only_allowlisted_aggregate_state(
 
     assert report.initialized is True
     assert report.application_generation == 2
-    assert report.schema_version == 4
+    assert report.schema_version == 5
     assert report.profile_revision == 7
     assert report.projection_revision == 3
     assert report.active_category_count == 1

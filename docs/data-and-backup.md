@@ -158,6 +158,20 @@ typed path or trust a path sent by a browser request. Folder testing and **Open
 folder** use only the active, server-validated destination. Backups do not
 contain PDF bytes or an absolute machine-local destination.
 
+New downloads use all authors' surnames, in paper order, followed by the title
+and `.pdf`. Reserved filename characters are removed or replaced, and long names
+are shortened to fit the filename limit. A conflicting filename receives a
+numbered suffix, such as ` (2)`, so another paper or version is not overwritten.
+Previously recorded downloads keep their filenames, including names beginning
+with an arXiv ID. Changing the filename convention does not rename existing PDFs.
+
+When checking a newly selected folder, the app verifies recorded filenames by
+size and checksum. It can also recognize the older arXiv-ID-and-version filenames.
+Filename associations are retained when a file is absent, so switching back to
+a previous folder can recover its PDFs. An author-and-title filename alone cannot
+identify a paper version; retain the download records in a portable backup when
+moving PDFs to another installation.
+
 ## Export a backup
 
 From Settings, choose **Export backup** and save the browser download. To use
@@ -192,17 +206,17 @@ The command validates the backup format and generation before changing local
 state, asks you to choose the restored PDF destination, tests that folder, and revalidates
 the archive immediately before restore. Format-1 or generation-1 backups are
 reported as unsupported and are not imported. A valid restore builds a fresh
-schema-version-4, generation-2 database. Before replacing nonempty
+schema-version-5, generation-2 database. Before replacing nonempty
 generation-2 state, the app creates and verifies a private pre-restore recovery
 archive; failed inspection or validation leaves the current state unchanged.
 Keep that recovery archive private. After a successful import, run
 `arxiv-digest` and check your interests, Library, review progress, and PDF folder.
 
-Download-file records never carry PDF bytes. Restore registers only the exact
-named file when it already exists in the newly selected destination and its PDF
-signature, size, and checksum all match the record. Missing or nonmatching
-files are skipped; restore does not scan unrelated files or invent downloaded
-state.
+Download-file records never carry PDF bytes. Restore marks a PDF present only
+when the exact named file already exists in the newly selected destination and
+its PDF signature, size, and checksum all match the record. Missing or nonmatching
+files remain absent, while their filename associations are retained for later
+verification. Restore does not scan unrelated files or invent downloaded state.
 
 
 

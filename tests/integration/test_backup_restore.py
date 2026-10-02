@@ -97,9 +97,15 @@ def test_cli_import_requires_the_running_dashboard_to_quit(tmp_path: Path) -> No
         owner.release()
 
 
+@pytest.mark.parametrize("pdf_name", [
+    "2608.41001v1 - Portable Fictional Lattices.pdf",
+    "Example Portable Fictional Lattices.pdf",
+])
 def test_portable_profile_library_and_local_presence_round_trip(
-    tmp_path: Path,
+    tmp_path: Path, pdf_name: str,
 ) -> None:
+    from dataclasses import replace
+
     from arxiv_digest.backup import (
         export_backup,
         inspect_backup,
@@ -107,6 +113,17 @@ def test_portable_profile_library_and_local_presence_round_trip(
     )
 
     source = initialized_paths(tmp_path / "source")
+    source_store = Store(source.database_path)
+    recorded = source_store.download_file("2608.41001", 1)
+    assert recorded is not None
+    source_profile = ProfileRepository(
+        source.profile_path, source.profile_lock_path,
+    ).load()
+    assert source_profile is not None
+    if recorded.filename != pdf_name:
+        source_folder = source_profile.pdf_destination.path
+        (source_folder / recorded.filename).rename(source_folder / pdf_name)
+        source_store.record_download_file(replace(recorded, filename=pdf_name))
     archive = tmp_path / "portable.zip"
     export_backup(source, archive, clock=lambda: NOW)
     inspection = inspect_backup(archive)
@@ -114,9 +131,7 @@ def test_portable_profile_library_and_local_presence_round_trip(
     target.ensure()
     confirmed_destination = tmp_path / "target" / "Confirmed PDFs"
     confirmed_destination.mkdir()
-    expected_pdf = confirmed_destination / (
-        "2608.41001v1 - Portable Fictional Lattices.pdf"
-    )
+    expected_pdf = confirmed_destination / pdf_name
     expected_pdf.write_bytes(b"%PDF-1.7\nsynthetic private local file\n")
     unrelated_pdf = confirmed_destination / "unrelated-private-file.pdf"
     unrelated_pdf.write_bytes(b"%PDF-1.7\nmust not be scanned\n")
@@ -199,7 +214,7 @@ def test_generation_two_ledger_and_download_record_round_trip(
         ).fetchone() == (2,)
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,)]
         assert connection.execute(
             """SELECT observation_id, source, category, daily_list_date,
                       announced_version FROM source_observations
@@ -459,12 +474,69 @@ def test_restore_skips_mismatched_download_and_does_not_scan_unrelated_pdfs(
     connection = sqlite3.connect(target.database_path)
     try:
         assert connection.execute(
-            "SELECT count(*) FROM download_files"
+            "SELECT count(*) FROM download_files WHERE is_present = 1"
         ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT filename, is_present FROM download_files"
+        ).fetchone() == (expected_name, 0)
     finally:
         connection.close()
     assert (destination / expected_name).read_bytes() == mismatched
     assert unrelated_path.read_bytes() == unrelated
+
+
+def test_restore_keeps_absent_author_title_association_for_later_pdf_copy(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from arxiv_digest.backup import export_backup, inspect_backup, restore_backup
+    from arxiv_digest.downloads import DownloadManager
+
+    source = initialized_paths(tmp_path / "source")
+    source_store = Store(source.database_path)
+    recorded = source_store.download_file("2608.41001", 1)
+    assert recorded is not None
+    filename = "Example Portable Fictional Lattices.pdf"
+    source_store.record_download_file(replace(recorded, filename=filename))
+    source_store.replace_download_files(())
+    assert source_store.download_file("2608.41001", 1) is None
+    archive = tmp_path / "portable.zip"
+    export_backup(source, archive, clock=lambda: NOW)
+    inspection = inspect_backup(archive)
+    portable_download = next(
+        record for record in inspection.records if record.record_type == "download_file"
+    )
+    assert "is_present" not in dict(portable_download.payload)
+    target = empty_paths(tmp_path / "target")
+    target.ensure()
+    destination = tmp_path / "Confirmed PDFs"
+    destination.mkdir()
+
+    restore_backup(
+        target, inspection, PdfDestination("custom", destination), clock=lambda: NOW,
+    )
+
+    restored = Store(target.database_path)
+    assert restored.download_file("2608.41001", 1) is None
+    known = restored.download_files()
+    assert len(known) == 1
+    assert known[0].filename == filename
+    # Copying PDFs after restoring the backup must recover their identities.
+    (destination / filename).write_bytes(b"%PDF-1.7\nsynthetic private local file\n")
+
+    class OfflineClient:
+        def get(self, *_args, **_kwargs):
+            raise AssertionError("presence recovery must not download a PDF")
+
+    manager = DownloadManager(
+        restored, ProfileRepository(target.profile_path, target.profile_lock_path),
+        OfflineClient(), clock=lambda: NOW,
+    )
+    manager.recompute_presence(destination)
+    result = manager.download("2608.41001", 1)
+    assert result.reused_existing
+    assert result.filename == filename
 
 
 def test_nonempty_restore_creates_and_verifies_a_private_recovery_backup(
