@@ -15,13 +15,10 @@ import {
 import {
   SettingsController,
   arxivAccessPauseText,
-  renderRestoreError,
-  renderRestoreInspection,
   renderSettingsView,
 } from "./settings_view.mjs";
 import {
   categorySetupActionLabel,
-  optionalSetupActionLabel,
   renderSetupError,
   renderSetupView,
 } from "./setup_view.mjs";
@@ -31,8 +28,8 @@ import {
   clearSession,
   validatedView,
 } from "./state.mjs";
-import { renderUpdateState } from "./update_view.mjs";
-import { UpdateFlow } from "./update_flow.mjs";
+import { renderUpdateNotice } from "./update_view.mjs";
+import { ViewLifecycle } from "./view_lifecycle.mjs";
 
 const content = document.querySelector("#content");
 const status = document.querySelector("#status");
@@ -41,10 +38,6 @@ const updateNotice = document.querySelector("#update-notice");
 
 function statusText(message) {
   status.textContent = message;
-}
-
-function statusTextIfChanged(message) {
-  if (status.textContent !== message) status.textContent = message;
 }
 
 let session;
@@ -62,56 +55,58 @@ try {
 const state = new ViewState(session.view);
 let applicationClosing = false;
 let applicationQuitRequested = false;
-let updateFlow = null;
-let updateBlocksOrdinaryWork = false;
+const viewLifecycle = new ViewLifecycle(() => !applicationClosing);
+const downloadLifecycle = new ViewLifecycle(() => !applicationClosing);
 const api = new ApiClient(location.origin, session.token, fetch, () => {
   clearSession(sessionStorage);
   statusText("Your local session expired. Reopen arXiv Digest to continue.");
-}, (error) => updateFlow?.handleApiError(error));
+});
 const libraryController = new LibraryController(api);
 const interestsController = new InterestsController(api);
 const settingsController = new SettingsController(api);
 
-let updateStorage;
-let updateChannel;
-try { updateStorage = localStorage; } catch { /* Storage is optional. */ }
-try { updateChannel = new BroadcastChannel("arxiv-digest-update"); } catch { /* Broadcast is optional. */ }
-updateFlow = new UpdateFlow({
-  api, storage: updateStorage,
-  broadcast: (message) => updateChannel?.postMessage(message),
-  render: (update) => {
-    renderUpdateState(document, updateNotice, update, (version) => updateFlow.startUpdate(version));
-    const wasBlocked = updateBlocksOrdinaryWork;
-    updateBlocksOrdinaryWork = update.blocked;
-    content.inert = update.blocked;
-    navigation.inert = update.blocked;
-    document.querySelector("#quit").disabled = update.blocked && !update.allowQuit;
-    if (update.blocked && !wasBlocked) {
-      stopHeartbeat();
-      clearSettingsSyncPoll();
-      clearReviewPoll();
-      reviewRequestSequence++;
-      renderCurrentSequence++;
-      invalidateSetupLifecycle();
-      api.abortAll();
-      updateNotice.focus();
-    } else if (wasBlocked && !update.blocked && !applicationClosing) {
-      connectTab();
-      renderCurrent();
+// Observe the background release check without delaying dashboard startup.
+const updateDeadline = performance.now() + 65_000;
+let updateTimer = null;
+
+function stopUpdateNotice() {
+  clearTimeout(updateTimer);
+  updateTimer = null;
+  api.abort("release-update");
+}
+
+async function refreshUpdateNotice() {
+  if (applicationClosing) return;
+  stopUpdateNotice();
+  const fallback = { status: "manual_fallback" };
+  const timeout = setTimeout(() => {
+    api.abort("release-update");
+    renderUpdateNotice(document, updateNotice, fallback);
+  }, 5_000);
+  updateTimer = timeout;
+  let update;
+  try {
+    update = await api.json("release-update", "/api/v1/update");
+  } catch (error) {
+    if (applicationClosing || error instanceof StaleResponseError ||
+        error?.name === "AbortError" || error?.status === 401) return;
+    update = fallback;
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (applicationClosing) return;
+  if (["idle", "checking"].includes(update?.status)) {
+    if (performance.now() < updateDeadline) {
+      updateTimer = setTimeout(refreshUpdateNotice, 1_000);
+      return;
     }
-  },
-});
-if (updateChannel) updateChannel.onmessage = (event) => updateFlow.receive(event.data);
-api.requestAllowed = (path) => !updateFlow.blocksOrdinaryWork ||
-  path === "/api/v1/status" && !updateFlow.handoff || path.startsWith("/api/v1/update") ||
-  path === "/api/v1/application/quit" && updateFlow.allowQuit;
+    update = fallback;
+  }
+  renderUpdateNotice(document, updateNotice, update);
+}
 
 function jsonBody(value) {
-  return {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(value),
-  };
+  return jsonRequest("POST", value);
 }
 
 function jsonRequest(method, value) {
@@ -137,37 +132,36 @@ function tokenFreeViewUrl(view) {
   return `${location.pathname}?view=${encodeURIComponent(view)}`;
 }
 
-let reviewRequestSequence = 0;
-let reviewPollTimer = null;
-let reviewPollGeneration = 0;
+const reviewRequests = new ViewLifecycle(
+  () => !applicationClosing && state.snapshot.view === "review",
+);
+const reviewPolling = new ViewLifecycle(
+  () => !applicationClosing && state.snapshot.view === "review",
+);
 
 function clearReviewPoll() {
-  if (reviewPollTimer !== null) clearTimeout(reviewPollTimer);
-  reviewPollTimer = null;
-  reviewPollGeneration += 1;
+  reviewPolling.invalidate();
 }
 
 function reviewRequestIsCurrent(requestSequence) {
-  return !applicationClosing && !updateBlocksOrdinaryWork &&
-    requestSequence === reviewRequestSequence && state.snapshot.view === "review";
+  return reviewRequests.isCurrent(requestSequence);
 }
 
 function reviewPollIsCurrent(requestSequence, pollGeneration) {
-  return pollGeneration === reviewPollGeneration &&
+  return reviewPolling.isCurrent(pollGeneration) &&
     reviewRequestIsCurrent(requestSequence);
 }
 
 function scheduleReviewPoll(delay = 1_000) {
   clearReviewPoll();
-  const expectedSequence = reviewRequestSequence;
-  const expectedPollGeneration = reviewPollGeneration;
-  reviewPollTimer = setTimeout(async () => {
-    reviewPollTimer = null;
+  const expectedSequence = reviewRequests.capture();
+  const expectedPollGeneration = reviewPolling.capture();
+  reviewPolling.schedule(async () => {
     if (!reviewPollIsCurrent(expectedSequence, expectedPollGeneration)) return;
     let refreshSequence = expectedSequence;
     try {
       const refresh = requestReview({});
-      refreshSequence = reviewRequestSequence;
+      refreshSequence = reviewRequests.capture();
       await refresh;
     } catch (error) {
       if (error instanceof StaleResponseError || error?.name === "AbortError") return;
@@ -187,18 +181,17 @@ function arxivAccessRefreshDelay(access) {
 
 function scheduleReviewDateSyncRefresh(
   destination,
-  expectedSequence = reviewRequestSequence,
+  expectedSequence = reviewRequests.capture(),
   delay = 1_000,
   updateStatus = null,
 ) {
   clearReviewPoll();
-  const expectedPollGeneration = reviewPollGeneration;
+  const expectedPollGeneration = reviewPolling.capture();
   const trackedDestination = Object.freeze({
     date: String(destination.date),
     anchor_event_id: destination.anchor_event_id ?? null,
   });
-  reviewPollTimer = setTimeout(async () => {
-    reviewPollTimer = null;
+  reviewPolling.schedule(async () => {
     if (!reviewPollIsCurrent(expectedSequence, expectedPollGeneration)) return;
     try {
       const serviceStatus = await api.json("review-status", "/api/v1/status");
@@ -374,12 +367,16 @@ async function refreshFinishedReviewOverview(openedDay) {
 
 async function requestReview(destination = {}) {
   clearReviewPoll();
-  const requestSequence = ++reviewRequestSequence;
+  const requestSequence = reviewRequests.invalidate();
   let date = destination.date;
   if (!date) {
-    const serviceStatus = await api.json("review-status", "/api/v1/status");
+    const serviceStatus = await reviewRequests.wait(
+      api.json("review-status", "/api/v1/status"), requestSequence,
+    );
     if (!reviewRequestIsCurrent(requestSequence)) return false;
-    const summary = await api.json("review-summary", "/api/v1/review/summary");
+    const summary = await reviewRequests.wait(
+      api.json("review-summary", "/api/v1/review/summary"), requestSequence,
+    );
     if (!reviewRequestIsCurrent(requestSequence)) return false;
     const synchronizing = serviceStatus?.sync?.status === "running";
     const synchronizationPhase =
@@ -395,11 +392,11 @@ async function requestReview(destination = {}) {
       arxivAccess: serviceStatus?.arxiv_access,
       start: (oldest) => navigateReviewDate({ date: oldest }),
       retryFailed: async () => {
-        await api.json(
+        await reviewRequests.wait(api.json(
           "review-sync-start",
           "/api/v1/sync/start",
           jsonBody({ retry_failed_dates: true }),
-        );
+        ));
         statusText("Retrying failed daily-list dates…");
         return requestReview({});
       },
@@ -412,7 +409,7 @@ async function requestReview(destination = {}) {
       ) => {
         const finishedHome = content.querySelector(".review-home");
         clearReviewPoll();
-        const finishSequence = ++reviewRequestSequence;
+        const finishSequence = reviewRequests.invalidate();
         let result;
         try {
           result = await api.json(
@@ -475,10 +472,10 @@ async function requestReview(destination = {}) {
   if (destination.from_start === true) {
     parameters.set("from_start", "true");
   }
-  const [serviceStatus, page] = await Promise.all([
+  const [serviceStatus, page] = await reviewRequests.wait(Promise.all([
     api.json("review-status", "/api/v1/status"),
     api.json("review-page", `/api/v1/review/date?${parameters}`),
-  ]);
+  ]), requestSequence);
   if (!reviewRequestIsCurrent(requestSequence)) return false;
   const synchronizing = serviceStatus?.sync?.status === "running";
   const openedDestination = Object.freeze({
@@ -494,7 +491,7 @@ async function requestReview(destination = {}) {
     failure: showActionFailure,
     retryAbstracts: async (openedDay) => {
       const openedView = content.querySelector(".review-view");
-      const retrySequence = reviewRequestSequence;
+      const retrySequence = reviewRequests.capture();
       const isCurrent = () => reviewRequestIsCurrent(retrySequence) &&
         content.querySelector(".review-view") === openedView;
       try {
@@ -519,7 +516,7 @@ async function requestReview(destination = {}) {
     ) => {
       const openedView = content.querySelector(".review-view");
       clearReviewPoll();
-      const finishSequence = ++reviewRequestSequence;
+      const finishSequence = reviewRequests.invalidate();
       let result;
       try {
         result = await api.json(
@@ -623,7 +620,6 @@ async function requestReview(destination = {}) {
 }
 
 async function requestCalendar() {
-  reviewRequestSequence += 1;
   const now = new Date();
   const endDate = new Date(Date.UTC(
     now.getUTCFullYear(),
@@ -634,7 +630,9 @@ async function requestCalendar() {
   startDate.setUTCDate(startDate.getUTCDate() - 30);
   const start = startDate.toISOString().slice(0, 10);
   const end = endDate.toISOString().slice(0, 10);
-  const entries = await api.json("calendar", `/api/v1/review/calendar?start=${start}&end=${end}`);
+  const entries = await viewLifecycle.wait(
+    api.json("calendar", `/api/v1/review/calendar?start=${start}&end=${end}`),
+  );
   content.replaceChildren();
   const heading = document.createElement("h1");
   heading.textContent = "Calendar";
@@ -674,37 +672,47 @@ function projectedLibraryPage(page) {
 }
 
 function redrawLibrary() {
-  if (!libraryPage) return;
+  if (!libraryPage || applicationClosing || state.snapshot.view !== "library") return;
   renderLibraryView(document, content, projectedLibraryPage(libraryPage), libraryActions);
 }
 
+function libraryStatus(message) {
+  if (!applicationClosing && state.snapshot.view === "library") statusText(message);
+}
+
+function showLibraryFailure(error) {
+  if (!applicationClosing && state.snapshot.view === "library") showActionFailure(error);
+}
+
 async function pollLibraryDownload(jobId) {
-  if (applicationClosing || updateBlocksOrdinaryWork) return;
+  const generation = downloadLifecycle.capture();
+  if (!downloadLifecycle.isCurrent(generation)) return;
   const arxivId = libraryJobPaper.get(jobId);
-  const result = await libraryController.downloadStatus(jobId);
-  if (applicationClosing || updateBlocksOrdinaryWork) return;
+  const result = await downloadLifecycle.wait(libraryController.downloadStatus(jobId), generation);
+  if (!downloadLifecycle.isCurrent(generation)) return;
   if (arxivId) libraryDownloadState.set(arxivId, { ...result, job_id: jobId });
   redrawLibrary();
   if (result.failed || result.status === "failed") {
-    statusText("PDF download did not complete. You can retry it from the paper.");
+    libraryStatus("PDF download did not complete. You can retry it from the paper.");
     return;
   }
   if (result.complete || result.status === "completed") {
-    statusText("PDF download complete.");
+    libraryStatus("PDF download complete.");
     return;
   }
-  statusText("Downloading PDF…");
-  setTimeout(() => pollLibraryDownload(jobId).catch(showActionFailure), 350);
+  libraryStatus("Downloading PDF…");
+  downloadLifecycle.schedule(() => pollLibraryDownload(jobId).catch(showLibraryFailure), 350);
 }
 
 async function startLibraryDownload(arxivId, version) {
-  if (applicationClosing || updateBlocksOrdinaryWork) return;
-  const result = await libraryController.download(arxivId, version);
-  if (applicationClosing || updateBlocksOrdinaryWork) return;
+  const generation = downloadLifecycle.capture();
+  if (!downloadLifecycle.isCurrent(generation)) return;
+  const result = await downloadLifecycle.wait(libraryController.download(arxivId, version), generation);
+  if (!downloadLifecycle.isCurrent(generation)) return;
   libraryJobPaper.set(result.job_id, arxivId);
   libraryDownloadState.set(arxivId, { job_id: result.job_id, status: "running" });
   redrawLibrary();
-  statusText("Downloading PDF…");
+  libraryStatus("Downloading PDF…");
   await pollLibraryDownload(result.job_id);
 }
 
@@ -716,22 +724,27 @@ const libraryActions = {
     requestLibrary(libraryPage?.query ?? "", offset).catch(showActionFailure);
   },
   async remove(arxivId) {
+    const generation = viewLifecycle.capture();
     try {
       await libraryController.remove(arxivId);
       libraryDownloadState.delete(arxivId);
+      if (!viewLifecycle.isCurrent(generation)) return;
       await requestLibrary(libraryPage?.query ?? "", libraryPage?.offset ?? 0);
+      if (!viewLifecycle.isCurrent(generation)) return;
       statusText("Paper removed from the library.");
     } catch (error) {
-      showActionFailure(error);
+      if (viewLifecycle.isCurrent(generation)) showActionFailure(error);
     }
   },
   downloadPdf(arxivId, version) {
-    startLibraryDownload(arxivId, version).catch(showActionFailure);
+    startLibraryDownload(arxivId, version).catch(showLibraryFailure);
   },
   async retryPdf(jobId) {
+    const generation = downloadLifecycle.capture();
     try {
       const arxivId = libraryJobPaper.get(jobId);
       const result = await libraryController.retryDownload(jobId);
+      if (!downloadLifecycle.isCurrent(generation)) return;
       if (arxivId) {
         libraryJobPaper.set(result.job_id, arxivId);
         libraryDownloadState.set(arxivId, { job_id: result.job_id, status: "running" });
@@ -739,13 +752,13 @@ const libraryActions = {
       redrawLibrary();
       await pollLibraryDownload(result.job_id);
     } catch (error) {
-      showActionFailure(error);
+      showLibraryFailure(error);
     }
   },
 };
 
 async function requestLibrary(query = "", offset = 0) {
-  libraryPage = await libraryController.search(query, offset);
+  libraryPage = await viewLifecycle.wait(libraryController.search(query, offset));
   redrawLibrary();
 }
 
@@ -764,14 +777,14 @@ function interestsPayloadModel(payload, draft = null) {
 }
 
 function redrawInterests() {
-  if (!interestsModel) return;
+  if (!interestsModel || applicationClosing || state.snapshot.view !== "interests") return;
   renderInterestsView(document, content, interestsModel, interestsActions);
 }
 
 const interestsActions = {
   async refreshSuggestions() {
     try {
-      const payload = await interestsController.freshSuggestions();
+      const payload = await viewLifecycle.wait(interestsController.freshSuggestions());
       interestsModel = interestsPayloadModel(payload, interestsModel?.draft);
       redrawInterests();
       statusText("Suggestions refreshed. Nothing changes until you update interests.");
@@ -781,7 +794,7 @@ const interestsActions = {
   },
   async save(draft) {
     try {
-      const payload = await interestsController.save(draft);
+      const payload = await viewLifecycle.wait(interestsController.save(draft));
       interestsModel = interestsPayloadModel(payload);
       redrawInterests();
       statusText("Interests updated.");
@@ -792,7 +805,8 @@ const interestsActions = {
 };
 
 async function requestInterests() {
-  interestsModel = interestsPayloadModel(await interestsController.load());
+  const payload = await viewLifecycle.wait(interestsController.load());
+  interestsModel = interestsPayloadModel(payload);
   redrawInterests();
 }
 
@@ -800,26 +814,22 @@ let settingsModel = null;
 let settingsPickerChoice = null;
 let settingsPickerDisplayName = null;
 let settingsPickerUnavailable = false;
-let settingsSyncPollTimer = null;
-let settingsSyncPollGeneration = 0;
+const settingsLifecycle = new ViewLifecycle(
+  () => !applicationClosing && state.snapshot.view === "settings",
+);
 
 function clearSettingsSyncPoll() {
-  if (settingsSyncPollTimer !== null) clearTimeout(settingsSyncPollTimer);
-  settingsSyncPollTimer = null;
-  settingsSyncPollGeneration += 1;
+  settingsLifecycle.invalidate();
 }
 
 function settingsSyncPollIsCurrent(generation) {
-  return generation === settingsSyncPollGeneration &&
-    state.snapshot.view === "settings" &&
-    !applicationClosing && !updateBlocksOrdinaryWork;
+  return settingsLifecycle.isCurrent(generation);
 }
 
 function scheduleSettingsSyncPoll(delay = 1_000) {
-  if (settingsSyncPollTimer !== null) clearTimeout(settingsSyncPollTimer);
-  const generation = settingsSyncPollGeneration;
-  settingsSyncPollTimer = setTimeout(async () => {
-    settingsSyncPollTimer = null;
+  settingsLifecycle.cancelScheduled();
+  const generation = settingsLifecycle.capture();
+  settingsLifecycle.schedule(async () => {
     if (!settingsSyncPollIsCurrent(generation)) return;
     try {
       const serviceStatus = await api.json(
@@ -866,7 +876,7 @@ function scheduleSettingsSyncPoll(delay = 1_000) {
 }
 
 function redrawSettings() {
-  if (!settingsModel) return;
+  if (!settingsModel || !settingsLifecycle.isCurrent(settingsLifecycle.capture())) return;
   renderSettingsView(
     document,
     content,
@@ -881,13 +891,11 @@ function redrawSettings() {
 }
 
 async function requestSettings() {
-  const generation = settingsSyncPollGeneration;
-  const [settings, doctor, launcher] = await Promise.all([
+  const [settings, doctor, launcher] = await settingsLifecycle.wait(Promise.all([
     api.json("settings-load", "/api/v1/settings"),
     settingsController.doctor(),
     settingsController.launcherStatus(),
-  ]);
-  if (!settingsSyncPollIsCurrent(generation)) return;
+  ]));
   settingsModel = { ...settings, doctor, launcher };
   redrawSettings();
   if (settings.synchronizing === true) scheduleSettingsSyncPoll();
@@ -896,68 +904,9 @@ async function requestSettings() {
   }
 }
 
-function normalizedRestoreInspection(inspection) {
-  if (inspection?.summary) return inspection;
-  return {
-    ...inspection,
-    summary: {
-      categories: inspection?.category_count,
-      saved_papers: inspection?.saved_paper_count,
-      review_events: inspection?.review_event_count,
-      profile_revision: inspection?.profile_revision,
-    },
-  };
-}
-
-function showRestoreInspection(inspectionValue) {
-  const inspection = normalizedRestoreInspection(inspectionValue);
-  const pendingId = inspection.pending_restore_id;
-  const restore = async (options) => {
-    try {
-      await settingsController.restoreBackup(pendingId, options);
-      await requestSettings();
-      statusText("Backup restored after creating a pre-restore backup.");
-    } catch (error) {
-      renderRestoreError(document, content, error.message, () => restore(options));
-      statusText("Restore did not complete. Local data remains usable.");
-    }
-  };
-  renderRestoreInspection(document, content, inspection, {
-    confirmDestination: (id, choice) =>
-      settingsController.reconfirmRestoreDestination(id, choice),
-    async pickFolder() {
-      try {
-        const result = await settingsController.pickFolder();
-        const choice = result?.destination_choice ?? result?.picker_result_id;
-        if (choice) {
-          showRestoreInspection({
-            ...inspection,
-            picker_choice: choice,
-            picker_display_name: result?.display_name ?? null,
-            picker_unavailable: false,
-          });
-        } else if (result?.unavailable === true) {
-          showRestoreInspection({
-            ...inspection,
-            picker_choice: null,
-            picker_display_name: null,
-            picker_unavailable: true,
-          });
-          statusText("The native folder picker is unavailable. Choose a fallback folder.");
-        } else {
-          statusText("Folder selection was cancelled.");
-        }
-      } catch (error) {
-        showActionFailure(error);
-      }
-    },
-    restore: (_id, options) => restore(options),
-  });
-}
-
 async function startSettingsRetry(count, request) {
   if (!settingsModel || settingsModel.synchronizing === true || settingsModel.arxiv_access?.paused === true) return;
-  const generation = settingsSyncPollGeneration;
+  const generation = settingsLifecycle.capture();
   settingsModel = {
     ...settingsModel,
     synchronizing: true,
@@ -988,6 +937,7 @@ async function startSettingsRetry(count, request) {
     } catch {
       redrawSettings();
     }
+    if (!settingsLifecycle.isCurrent(generation)) return;
     showActionFailure(error);
   }
 }
@@ -1001,7 +951,7 @@ const settingsActions = {
   },
   async openFolder() {
     try {
-      await settingsController.openFolder();
+      await settingsLifecycle.wait(settingsController.openFolder());
       statusText("PDF folder opened.");
     } catch (error) {
       showActionFailure(error);
@@ -1009,7 +959,7 @@ const settingsActions = {
   },
   async pickFolder() {
     try {
-      const result = await settingsController.pickFolder();
+      const result = await settingsLifecycle.wait(settingsController.pickFolder());
       const choice = result?.destination_choice ?? result?.picker_result_id;
       if (choice) {
         settingsPickerChoice = choice;
@@ -1029,15 +979,17 @@ const settingsActions = {
     }
   },
   async testFolder(choice) {
+    const generation = settingsLifecycle.capture();
     try {
-      await settingsController.testFolder(choice);
-      await settingsController.saveTestedFolder(Number(settingsModel?.revision));
+      await settingsLifecycle.wait(settingsController.testFolder(choice));
+      await settingsLifecycle.wait(settingsController.saveTestedFolder(Number(settingsModel?.revision)));
       settingsPickerChoice = null;
       settingsPickerDisplayName = null;
       settingsPickerUnavailable = false;
       await requestSettings();
       statusText("PDF destination saved.");
     } catch (error) {
+      if (error instanceof StaleResponseError || error?.name === "AbortError") return;
       const pickerChoice = /^picker_[A-Za-z0-9_-]{8,120}$/.test(String(choice));
       if (pickerChoice) {
         settingsPickerChoice = null;
@@ -1048,6 +1000,7 @@ const settingsActions = {
       } catch {
         redrawSettings();
       }
+      if (!settingsLifecycle.isCurrent(generation)) return;
       if (pickerChoice) {
         statusText(`${error?.message || "The folder could not be used."} Choose the folder again.`);
       } else showActionFailure(error);
@@ -1055,11 +1008,11 @@ const settingsActions = {
   },
   async extendCoverage(category, newStart) {
     try {
-      await settingsController.extendCoverage(
+      await settingsLifecycle.wait(settingsController.extendCoverage(
         category,
         newStart,
         Number(settingsModel?.revision),
-      );
+      ));
       await requestSettings();
       statusText(`Historical coverage for ${category} was extended.`);
     } catch (error) {
@@ -1068,7 +1021,7 @@ const settingsActions = {
   },
   async clearCache() {
     try {
-      await settingsController.clearCache(true);
+      await settingsLifecycle.wait(settingsController.clearCache(true));
       statusText(
         "Suggestion cache deleted. Interests, synchronization checkpoints, review progress, Library papers, and downloaded PDFs were kept.",
       );
@@ -1077,7 +1030,7 @@ const settingsActions = {
     }
   },
   createLauncher() {
-    settingsController.createLauncher()
+    settingsLifecycle.wait(settingsController.createLauncher())
       .then(requestSettings)
       .then(() => statusText("Desktop launcher created."))
       .catch(showActionFailure);
@@ -1086,29 +1039,21 @@ const settingsActions = {
     this.createLauncher();
   },
   notNowLauncher() {
-    settingsController.notNowLauncher()
+    settingsLifecycle.wait(settingsController.notNowLauncher())
       .then(requestSettings)
       .then(() => statusText("Desktop launcher deferred."))
       .catch(showActionFailure);
   },
   removeLauncher() {
-    settingsController.removeLauncher()
+    settingsLifecycle.wait(settingsController.removeLauncher())
       .then(requestSettings)
       .then(() => statusText("Desktop launcher removed."))
       .catch(showActionFailure);
   },
   exportBackup() {
-    settingsController.downloadBackup()
+    settingsLifecycle.wait(settingsController.downloadBackup())
       .then(() => statusText("Portable backup downloaded."))
       .catch(showActionFailure);
-  },
-  async inspectBackup(archive) {
-    try {
-      showRestoreInspection(await settingsController.inspectBackup(archive));
-      statusText("Backup inspected. No local data has changed.");
-    } catch (error) {
-      showActionFailure(error);
-    }
   },
   quit() {
     quitApplication();
@@ -1125,70 +1070,25 @@ const setupUi = {
   categoryQuery: "",
   categoryOptions: [],
   categorySelections: new Map(),
-  paperOptions: [],
-  keywordOptions: [],
-  phraseOptions: [],
-  authorOptions: [],
-  accepted: {
-    seed_papers: new Set(),
-    keywords: new Set(),
-    phrases: new Set(),
-    authors: new Set(),
-  },
-  custom: {
-    paper_ids: [],
-    terms: [],
-    authors: [],
-  },
   coverageStart: "",
   destinationChoice: null,
   destinationDisplayName: null,
   testedDestinationToken: null,
   pickerState: "available",
-  corpusJob: null,
-  corpusPollJobId: null,
-  corpusPollGeneration: 0,
   lifecycleGeneration: 0,
   launcherChoice: null,
 };
 
 function setupLifecycleIsActive(generation) {
-  return !applicationClosing &&
-    state.snapshot.view === "setup" &&
-    setupUi.lifecycleGeneration === generation;
-}
-
-function invalidateSetupLifecycle() {
-  setupUi.lifecycleGeneration += 1;
-  invalidateCorpusPolling();
+  return viewLifecycle.isCurrent(generation) && state.snapshot.view === "setup";
 }
 
 function setupStep(draft = setupUi.draft) {
   return String(draft?.current_step ?? draft?.step ?? "categories");
 }
 
-function optionWithChecked(kind, option) {
-  const id = String(option?.suggestion_id ?? option?.id ?? option?.value ?? option ?? "");
-  return typeof option === "string"
-    ? { value: option, label: option, checked: setupUi.accepted[kind]?.has(id) }
-    : { ...option, checked: setupUi.accepted[kind]?.has(id) };
-}
-
 function setupModel() {
   const draft = setupUi.draft ?? {};
-  const observedCorpusJob = setupUi.corpusJob ?? draft.corpus_job;
-  const corpusJob = observedCorpusJob
-    ? {
-        ...observedCorpusJob,
-        can_resume:
-          observedCorpusJob.can_resume ?? draft.corpus_can_resume === true,
-      }
-    : {
-        complete: draft.corpus_complete === true,
-        corpus_hash: draft.corpus_hash,
-        reduced_breadth: draft.corpus_reduced_breadth === true,
-        can_resume: draft.corpus_can_resume === true,
-      };
   return {
     ...draft,
     categorySearchQuery: setupUi.categoryQuery,
@@ -1204,19 +1104,6 @@ function setupModel() {
       draft.recommended_coverage_start ?? draft.recommendedCoverageStart ?? "",
     coverageStart: setupUi.coverageStart || draft.coverage_start || "",
     coverageWarning: draft.coverage_warning,
-    corpusJob,
-    paperOptions: setupUi.paperOptions.map((option) => optionWithChecked("seed_papers", option)),
-    keywordOptions: setupUi.keywordOptions.map((option) => optionWithChecked("keywords", option)),
-    phraseOptions: setupUi.phraseOptions.map((option) => optionWithChecked("phrases", option)),
-    authorOptions: setupUi.authorOptions.map((option) => optionWithChecked("authors", option)),
-    acceptedSelectionCounts: {
-      seed_papers: setupUi.accepted.seed_papers.size,
-      terms: setupUi.accepted.keywords.size + setupUi.accepted.phrases.size,
-      authors: setupUi.accepted.authors.size,
-    },
-    customPaperIds: setupUi.custom.paper_ids,
-    customTerms: setupUi.custom.terms,
-    customAuthors: setupUi.custom.authors,
     destinationChoice: setupUi.destinationChoice,
     destinationDisplayName: setupUi.destinationDisplayName,
     testedDestinationToken: setupUi.testedDestinationToken,
@@ -1230,18 +1117,6 @@ function setupModel() {
 
 function redrawSetup() {
   renderSetupView(document, content, setupModel(), setupActions);
-}
-
-function focusCustomEntry(index) {
-  const inputs = [...content.querySelectorAll(".custom-entries input")];
-  const target = inputs[index] ?? content.querySelector("[data-custom-add]");
-  target?.focus();
-}
-
-function syncSetupContinueLabel() {
-  const label = optionalSetupActionLabel(setupModel());
-  const control = content.querySelector("[data-setup-continue]");
-  if (label && control) control.textContent = label;
 }
 
 function syncSetupCategoryAction() {
@@ -1259,8 +1134,7 @@ function replaceOptions(kind, payload) {
     ? payload
     : payload?.items ?? payload?.suggestions ?? payload?.categories ?? [];
   if (kind === "categories") setupUi.categoryOptions = items;
-  else if (kind === "seed_papers") setupUi.paperOptions = items;
-  else if (kind === "authors") setupUi.authorOptions = items;
+
 }
 
 async function loadSetupOptions(
@@ -1277,25 +1151,6 @@ async function loadSetupOptions(
     if (!setupLifecycleIsActive(lifecycleGeneration)) return false;
     setupUi.categoryQuery = String(query);
     replaceOptions("categories", payload);
-  } else if (step === "seed_papers") {
-    const payload = await api.json(
-      "setup-papers",
-      `/api/v1/setup/candidates/papers?q=${encodeURIComponent(query)}&offset=0`,
-    );
-    if (!setupLifecycleIsActive(lifecycleGeneration)) return false;
-    replaceOptions("seed_papers", payload);
-  } else if (step === "keywords_and_phrases" || step === "terms") {
-    const payload = await api.json("setup-terms", "/api/v1/setup/candidates/terms");
-    if (!setupLifecycleIsActive(lifecycleGeneration)) return false;
-    setupUi.keywordOptions = payload?.keywords ?? [];
-    setupUi.phraseOptions = payload?.phrases ?? [];
-  } else if (step === "authors") {
-    const payload = await api.json(
-      "setup-authors",
-      `/api/v1/setup/candidates/authors?q=${encodeURIComponent(query)}`,
-    );
-    if (!setupLifecycleIsActive(lifecycleGeneration)) return false;
-    replaceOptions("authors", payload);
   }
   return setupLifecycleIsActive(lifecycleGeneration);
 }
@@ -1307,37 +1162,11 @@ async function refreshSetup({
   const draft = await api.json("setup-draft", "/api/v1/setup/draft");
   if (!setupLifecycleIsActive(lifecycleGeneration)) return false;
   setupUi.draft = draft;
-  setupUi.corpusJob = setupUi.draft?.corpus_job ?? null;
   setupUi.coverageStart ||= setupUi.draft.coverage_start ?? "";
   if (loadOptions && !await loadSetupOptions("", lifecycleGeneration)) return false;
   if (!setupLifecycleIsActive(lifecycleGeneration)) return false;
   redrawSetup();
-  const recoveredJob = setupUi.draft?.corpus_job;
-  if (
-    recoveredJob?.status === "running" &&
-    typeof recoveredJob.job_id === "string"
-  ) {
-    startCorpusPolling(recoveredJob.job_id);
-  }
   return true;
-}
-
-function submittedCustomValues(kind) {
-  const values = setupUi.custom[kind];
-  return Array.isArray(values)
-    ? values
-        .filter((value) => typeof value === "string")
-        .map((value) => value.trim())
-        .filter(Boolean)
-    : [];
-}
-
-function customTermWordCount(value) {
-  const normalized = String(value)
-    .normalize("NFKC")
-    .replace(/[^\p{Letter}\p{Number}\p{Mark}]+/gu, " ")
-    .trim();
-  return normalized === "" ? 0 : normalized.split(/\s+/u).length;
 }
 
 async function submitSetupStep(step) {
@@ -1353,30 +1182,6 @@ async function submitSetupStep(step) {
     };
   } else if (step === "coverage") {
     payload = { revision, step, coverage_start: setupUi.coverageStart };
-  } else if (step === "seed_papers") {
-    payload = {
-      revision,
-      step,
-      accepted_suggestion_ids: [...setupUi.accepted.seed_papers],
-      custom_arxiv_ids: submittedCustomValues("paper_ids"),
-    };
-  } else if (step === "terms") {
-    const customTerms = submittedCustomValues("terms");
-    payload = {
-      revision,
-      step,
-      accepted_keyword_suggestion_ids: [...setupUi.accepted.keywords],
-      accepted_phrase_suggestion_ids: [...setupUi.accepted.phrases],
-      custom_keywords: customTerms.filter((value) => customTermWordCount(value) === 1),
-      custom_phrases: customTerms.filter((value) => customTermWordCount(value) !== 1),
-    };
-  } else if (step === "authors") {
-    payload = {
-      revision,
-      step,
-      accepted_suggestion_ids: [...setupUi.accepted.authors],
-      custom_authors: submittedCustomValues("authors"),
-    };
   } else if (step === "pdf_destination") {
     payload = {
       revision,
@@ -1425,91 +1230,6 @@ async function submitSetupStep(step) {
   await refreshSetup({ lifecycleGeneration });
 }
 
-function corpusPollIsActive(jobId, generation, lifecycleGeneration) {
-  return setupUi.corpusPollJobId === jobId &&
-    setupUi.corpusPollGeneration === generation &&
-    setupLifecycleIsActive(lifecycleGeneration);
-}
-
-function invalidateCorpusPolling() {
-  setupUi.corpusPollGeneration += 1;
-  setupUi.corpusPollJobId = null;
-}
-
-function corpusJobPresentationKey(job) {
-  return JSON.stringify([
-    job?.status,
-    job?.complete,
-    job?.failed,
-    job?.message,
-    job?.error_code,
-    job?.corpus_complete,
-    job?.minimum_met,
-    job?.setup_ready,
-    job?.can_resume,
-    job?.corpus_hash,
-    job?.reduced_breadth,
-    job?.pages_fetched,
-    job?.progress,
-  ]);
-}
-
-async function pollCorpusJob(jobId, generation, lifecycleGeneration) {
-  if (!corpusPollIsActive(jobId, generation, lifecycleGeneration)) return;
-  const job = await api.json("setup-job", `/api/v1/setup/jobs/${encodeURIComponent(jobId)}`);
-  if (!corpusPollIsActive(jobId, generation, lifecycleGeneration)) return;
-  if (!job.complete && !job.failed) {
-    const presentationChanged =
-      corpusJobPresentationKey(setupUi.corpusJob) !== corpusJobPresentationKey(job);
-    setupUi.corpusJob = job;
-    if (presentationChanged) redrawSetup();
-    statusTextIfChanged("Generating candidate corpus…");
-    setTimeout(() => pollCorpusJob(jobId, generation, lifecycleGeneration).catch((error) =>
-      handleCorpusPollFailure(jobId, generation, lifecycleGeneration, error),
-    ), 300);
-  } else {
-    invalidateCorpusPolling();
-    statusText("Checking corpus status…");
-    try {
-      const refreshed = await refreshSetup({
-        loadOptions: false,
-        lifecycleGeneration,
-      });
-      if (!refreshed) return;
-      const current = setupUi.corpusJob;
-      if (current?.status === "running") {
-        statusTextIfChanged("Generating candidate corpus…");
-      } else if (current?.failed) {
-        statusText("Corpus generation did not complete.");
-      } else {
-        statusText("Corpus generation finished.");
-      }
-    } catch (error) {
-      if (setupLifecycleIsActive(lifecycleGeneration)) showSetupFailure(error);
-    }
-  }
-}
-
-function handleCorpusPollFailure(jobId, generation, lifecycleGeneration, error) {
-  if (!corpusPollIsActive(jobId, generation, lifecycleGeneration)) return;
-  invalidateCorpusPolling();
-  if (error instanceof StaleResponseError || error?.name === "AbortError") return;
-  if (!setupLifecycleIsActive(lifecycleGeneration)) return;
-  showSetupFailure(error);
-}
-
-function startCorpusPolling(jobId) {
-  const lifecycleGeneration = setupUi.lifecycleGeneration;
-  if (!setupLifecycleIsActive(lifecycleGeneration)) return;
-  if (setupUi.corpusPollJobId === jobId) return;
-  invalidateCorpusPolling();
-  setupUi.corpusPollJobId = jobId;
-  const generation = setupUi.corpusPollGeneration;
-  pollCorpusJob(jobId, generation, lifecycleGeneration).catch((error) =>
-    handleCorpusPollFailure(jobId, generation, lifecycleGeneration, error),
-  );
-}
-
 function showSetupFailure(error) {
   if (error instanceof StaleResponseError || error?.name === "AbortError") return;
   if (state.snapshot.view !== "setup") return;
@@ -1534,20 +1254,6 @@ const setupActions = {
         if (!setupLifecycleIsActive(lifecycleGeneration)) return;
         setupUi.categoryQuery = String(query);
         replaceOptions(kind, payload);
-      } else if (kind === "seed_papers") {
-        const payload = await api.json(
-          "setup-papers",
-          `/api/v1/setup/candidates/papers?q=${encodeURIComponent(query)}&offset=0`,
-        );
-        if (!setupLifecycleIsActive(lifecycleGeneration)) return;
-        replaceOptions(kind, payload);
-      } else if (kind === "authors") {
-        const payload = await api.json(
-          "setup-authors",
-          `/api/v1/setup/candidates/authors?q=${encodeURIComponent(query)}`,
-        );
-        if (!setupLifecycleIsActive(lifecycleGeneration)) return;
-        replaceOptions(kind, payload);
       }
       if (!setupLifecycleIsActive(lifecycleGeneration)) return;
       redrawSetup();
@@ -1561,86 +1267,11 @@ const setupActions = {
       if (checked) setupUi.categorySelections.set(key, stable);
       else setupUi.categorySelections.delete(key);
       syncSetupCategoryAction();
-    } else {
-      if (checked) setupUi.accepted[kind].add(stable);
-      else setupUi.accepted[kind].delete(stable);
-      syncSetupContinueLabel();
     }
-  },
-  onCustomAdd(kind) {
-    setupUi.custom[kind].push("");
-    redrawSetup();
-    focusCustomEntry(setupUi.custom[kind].length - 1);
-  },
-  onCustomChange(kind, index, value) {
-    setupUi.custom[kind][index] = value;
-    syncSetupContinueLabel();
-  },
-  onCustomRemove(kind, index) {
-    setupUi.custom[kind].splice(index, 1);
-    redrawSetup();
-    focusCustomEntry(Math.min(index, setupUi.custom[kind].length - 1));
   },
   onCoverageChange(value) {
     setupUi.coverageStart = value;
     redrawSetup();
-  },
-  async onCorpus(mode) {
-    const lifecycleGeneration = setupUi.lifecycleGeneration;
-    if (!setupLifecycleIsActive(lifecycleGeneration)) return;
-    if (["starting", "running"].includes(setupUi.corpusJob?.status)) return;
-    setupUi.corpusJob = {
-      status: "starting",
-      complete: false,
-      failed: false,
-    };
-    statusText("Starting candidate corpus generation…");
-    redrawSetup();
-    try {
-      const result = await api.json(
-        "setup-corpus",
-        "/api/v1/setup/corpus",
-        jsonBody({ draft_revision: setupUi.draft.revision, mode }),
-      );
-      if (!setupLifecycleIsActive(lifecycleGeneration)) return;
-      setupUi.corpusJob = {
-        status: "running",
-        complete: false,
-        failed: false,
-      };
-      statusText("Generating candidate corpus…");
-      redrawSetup();
-      startCorpusPolling(result.job_id);
-    } catch (error) {
-      if (!setupLifecycleIsActive(lifecycleGeneration)) return;
-      setupUi.corpusJob = {
-        status: "failed",
-        complete: false,
-        failed: true,
-        can_resume: setupUi.draft?.corpus_can_resume === true,
-        message: error?.message || "The background operation did not complete.",
-      };
-      statusText("Corpus generation did not complete.");
-      redrawSetup();
-    }
-  },
-  async onCorpusAccept(corpusHash) {
-    const lifecycleGeneration = setupUi.lifecycleGeneration;
-    try {
-      await api.json(
-        "setup-corpus-accept",
-        "/api/v1/setup/corpus/accept",
-        jsonBody({
-          draft_revision: setupUi.draft.revision,
-          corpus_hash: corpusHash,
-        }),
-      );
-      if (!setupLifecycleIsActive(lifecycleGeneration)) return;
-      setupUi.corpusJob = null;
-      await refreshSetup({ lifecycleGeneration });
-    } catch (error) {
-      if (setupLifecycleIsActive(lifecycleGeneration)) showSetupFailure(error);
-    }
   },
   async onPickDestination() {
     const lifecycleGeneration = setupUi.lifecycleGeneration;
@@ -1712,26 +1343,23 @@ const setupActions = {
 };
 
 async function requestSetup(lifecycleGeneration) {
+  setupUi.lifecycleGeneration = lifecycleGeneration;
   await refreshSetup({ lifecycleGeneration });
 }
 
-let renderCurrentSequence = 0;
-
 async function renderCurrent() {
-  if (applicationClosing || updateBlocksOrdinaryWork) return;
-  const renderSequence = ++renderCurrentSequence;
+  if (applicationClosing) return;
+  const generation = viewLifecycle.invalidate();
   const view = state.snapshot.view;
   if (view !== "review") {
     clearReviewPoll();
-    reviewRequestSequence += 1;
+    reviewRequests.invalidate();
   }
-  if (view !== "settings") clearSettingsSyncPoll();
-  if (view !== "setup") invalidateSetupLifecycle();
-  const setupGeneration = setupUi.lifecycleGeneration;
+  clearSettingsSyncPoll();
   markNavigation(view);
   statusText("Loading local data…");
   try {
-    if (view === "setup") await requestSetup(setupGeneration);
+    if (view === "setup") await requestSetup(generation);
     else if (view === "review") await requestReview(
       state.snapshot.reviewDate ? { date: state.snapshot.reviewDate } : {},
     );
@@ -1739,25 +1367,12 @@ async function renderCurrent() {
     else if (view === "library") await requestLibrary();
     else if (view === "interests") await requestInterests();
     else if (view === "settings") await requestSettings();
-    if (
-      renderSequence !== renderCurrentSequence ||
-      state.snapshot.view !== view
-    ) return;
-    if (view !== "setup" || setupLifecycleIsActive(setupGeneration)) {
-      if (view === "setup" && setupUi.corpusJob?.status === "running") {
-        statusTextIfChanged("Generating candidate corpus…");
-      } else {
-        statusText("");
-      }
-      content.focus();
-    }
+    if (!viewLifecycle.isCurrent(generation)) return;
+    statusText("");
+    content.focus();
   } catch (error) {
     if (error instanceof StaleResponseError || error?.name === "AbortError") return;
-    if (
-      renderSequence !== renderCurrentSequence ||
-      state.snapshot.view !== view
-    ) return;
-    if (view === "setup" && !setupLifecycleIsActive(setupGeneration)) return;
+    if (!viewLifecycle.isCurrent(generation)) return;
     if (view === "setup" && error?.code === "already_configured") {
       await replaceCurrentView("interests");
       return;
@@ -1773,7 +1388,7 @@ async function renderCurrent() {
 }
 
 async function replaceCurrentView(requestedView, values = {}) {
-  if (applicationClosing || updateBlocksOrdinaryWork) return;
+  if (applicationClosing) return;
   const view = validatedView(requestedView);
   state.setView(view, values);
   history.replaceState({ view }, "", tokenFreeViewUrl(view));
@@ -1781,7 +1396,7 @@ async function replaceCurrentView(requestedView, values = {}) {
 }
 
 function navigate(requestedView, values = {}) {
-  if (applicationClosing || updateBlocksOrdinaryWork) return;
+  if (applicationClosing) return;
   const view = requestedView === "calendar" ? "calendar" : validatedView(requestedView);
   const stateValues = view === "calendar" ? { view: "calendar" } : values;
   state.setView(view === "calendar" ? "review" : view, stateValues);
@@ -1804,7 +1419,7 @@ let heartbeat = null;
 let tabDisconnect = Promise.resolve();
 
 function connectTab() {
-  if (applicationClosing || updateBlocksOrdinaryWork) return;
+  if (applicationClosing) return;
   api.json("tab-connect", "/api/v1/tabs/connect", jsonBody({ tab_id: tabId })).catch(() => {});
   if (heartbeat === null) {
     heartbeat = setInterval(() => {
@@ -1820,41 +1435,28 @@ function stopHeartbeat() {
 
 async function quitApplication() {
   if (applicationClosing) return;
-  if (updateFlow.busy && !updateFlow.allowQuit) {
-    statusText("Update preparation is in progress. Wait for its result before quitting.");
-    return;
-  }
   applicationClosing = true;
   applicationQuitRequested = true;
   stopHeartbeat();
-  updateFlow.suspend();
+  stopUpdateNotice();
   clearSettingsSyncPoll();
-  invalidateSetupLifecycle();
+  clearReviewPoll();
+  viewLifecycle.invalidate();
+  downloadLifecycle.invalidate();
   api.abortAll();
   for (const control of document.querySelectorAll("button")) {
     control.disabled = true;
   }
   statusText("Closing arXiv Digest…");
-  let declined = false;
   try {
-    const result = await api.json(
+    await api.json(
       "application-quit",
       "/api/v1/application/quit",
       { ...jsonBody({}), keepalive: true },
     );
-    if (result?.quitting === false) {
-      declined = true;
-      applicationClosing = false;
-      applicationQuitRequested = false;
-      document.querySelector("#quit").disabled = false;
-      updateFlow.resume();
-      if (!updateFlow.blocksOrdinaryWork) { connectTab(); renderCurrent(); }
-    }
   } finally {
-    if (declined) return;
-    updateFlow.stop();
     api.abortAll();
-    invalidateSetupLifecycle();
+    viewLifecycle.invalidate();
     clearSession(sessionStorage);
     content.replaceChildren();
     const message = document.createElement("h1");
@@ -1868,11 +1470,13 @@ document.querySelector("#quit").addEventListener("click", quitApplication);
 
 addEventListener("pagehide", () => {
   clearSettingsSyncPoll();
-  updateFlow.suspend();
-  if (applicationQuitRequested || updateFlow.handoff) return;
+  stopUpdateNotice();
+  if (applicationQuitRequested) return;
   applicationClosing = true;
   stopHeartbeat();
-  invalidateSetupLifecycle();
+  clearReviewPoll();
+  viewLifecycle.invalidate();
+  downloadLifecycle.invalidate();
   api.abortAll();
   tabDisconnect = api.json(
     "tab-disconnect",
@@ -1884,10 +1488,14 @@ addEventListener("pagehide", () => {
 addEventListener("pageshow", async (event) => {
   if (!event.persisted || applicationQuitRequested) return;
   applicationClosing = false;
-  updateFlow.resume();
-  if (updateFlow.blocksOrdinaryWork) return;
+  refreshUpdateNotice();
   connectTab();
   renderCurrent();
+  for (const download of libraryDownloadState.values()) {
+    if (download.status === "running") {
+      pollLibraryDownload(download.job_id).catch(showLibraryFailure);
+    }
+  }
   await tabDisconnect;
   if (!applicationClosing && !applicationQuitRequested) connectTab();
 });
@@ -1910,14 +1518,6 @@ addEventListener("popstate", (event) => {
   renderCurrent();
 });
 
-addEventListener("storage", () => updateFlow.resume());
-addEventListener("focus", () => updateFlow.resume());
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) updateFlow.resume();
-});
-
-await updateFlow.start();
-if (!updateFlow.blocksOrdinaryWork) {
-  connectTab();
-  renderCurrent();
-}
+refreshUpdateNotice();
+connectTab();
+renderCurrent();

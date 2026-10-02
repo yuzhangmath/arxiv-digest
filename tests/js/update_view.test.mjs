@@ -14,7 +14,6 @@ test("an available release renders a safe GitHub update link", () => {
 
   renderUpdateNotice(new FakeDocument(), notice, {
     status: "available_manual",
-    automatic_update: false,
     installed_version: "0.2.1",
     available_version: "0.3.0",
     url: "https://evil.test/ignore-this",
@@ -25,6 +24,7 @@ test("an available release renders a safe GitHub update link", () => {
   assert.match(notice.textContent, /installed: 0\.2\.1/);
   const links = descendants(notice, "a");
   assert.equal(links.length, 1);
+  assert.equal(descendants(notice, "button").length, 0);
   assert.equal(links[0].textContent, "View update instructions");
   assert.equal(
     links[0].getAttribute("aria-label"),
@@ -55,22 +55,10 @@ test("a missing update leaves the live region present and empty", () => {
   assert.equal(descendants(notice, "a").length, 0);
 });
 
-test("an eligible release keeps manual guidance until installation is connected", () => {
-  const notice = new FakeNode("aside");
-  renderUpdateNotice(new FakeDocument(), notice, {
-    status: "available_automatic", automatic_update: true,
-    installed_version: "0.3.0", available_version: "0.3.1",
-  });
-  assert.match(notice.textContent, /0\.3\.1 is available/);
-  assert.equal(descendants(notice, "button").length, 0);
-  assert.equal(descendants(notice, "a")[0].getAttribute("href"),
-    "https://github.com/yuzhangmath/arxiv-digest/releases/tag/v0.3.1");
-});
-
 test("inconclusive discovery uses only the canonical generic releases page", () => {
   const notice = new FakeNode("aside");
   renderUpdateNotice(new FakeDocument(), notice, {
-    status: "manual_fallback", automatic_update: false,
+    status: "manual_fallback",
     installed_version: "0.2.1", release_notes_url: "https://evil.test/",
   });
   assert.match(notice.textContent, /Could not check for updates/);
@@ -93,8 +81,8 @@ test("unchanged results preserve the live region and focused link nodes", () => 
 
 test("pending/current states stay quiet and invalid versions never become links", () => {
   for (const update of [
-    {status: "idle"}, {status: "checking", automatic_update: false},
-    {status: "current", installed_version: "0.2.1", automatic_update: false},
+    {status: "idle"}, {status: "checking"},
+    {status: "current", installed_version: "0.2.1"},
     {status: "available_manual", installed_version: "0.2.1", available_version: "../bad"},
     {status: "available_manual", installed_version: "01.2.1", available_version: "0.3.0"},
     null, {},
@@ -105,19 +93,4 @@ test("pending/current states stay quiet and invalid versions never become links"
     assert.equal(notice.textContent, "");
     assert.equal(descendants(notice, "a").length, 0);
   }
-});
-
-
-test("connected automatic updates have one native action and safe release notes", () => {
-  const notice = new FakeNode("aside");
-  const starts = [];
-  renderUpdateNotice(new FakeDocument(), notice, {
-    status: "available_automatic", automatic_update: true,
-    installed_version: "0.3.0", available_version: "0.3.1",
-  }, {onStart: (version) => starts.push(version)});
-  const button = descendants(notice, "button")[0];
-  assert.equal(button.textContent, "Update and restart");
-  button.click();
-  assert.deepEqual(starts, ["0.3.1"]);
-  assert.equal(descendants(notice, "a")[0].textContent, "View release notes");
 });

@@ -20,7 +20,7 @@ jobs:
         suite: [python, browser]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Check out source and historical tags
+      - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -31,8 +31,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           check-latest: false
-      - name: Prepare private Python for native updater validation
-        run: python scripts/ci_python.py
       - name: Set up Node.js
         if: matrix.suite == 'python'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -58,12 +56,6 @@ jobs:
           printf 'COMMIT_SHA=%s\n' "$commit_sha" >> "$GITHUB_ENV"
       - name: Build package artifacts
         run: python -m build
-      - name: Generate the updater manifest
-        run: >-
-          python scripts/update_manifest.py
-          --wheel "dist/arxiv_digest-${ARXIV_DIGEST_VERSION}-py3-none-any.whl"
-          --policy release/update-policy.json
-          --output dist/UPDATE_MANIFEST.json
       - name: Verify the local release bundle
         shell: bash
         env:
@@ -78,7 +70,7 @@ jobs:
           root = Path(os.environ["BUNDLE"])
           root.mkdir()
           version = os.environ["ARXIV_DIGEST_VERSION"]
-          names = (f"arxiv_digest-{version}-py3-none-any.whl", f"arxiv_digest-{version}.tar.gz", "UPDATE_MANIFEST.json")
+          names = (f"arxiv_digest-{version}-py3-none-any.whl", f"arxiv_digest-{version}.tar.gz")
           lines = []
           for name in names:
               shutil.copyfile(Path("dist") / name, root / name)
@@ -91,20 +83,12 @@ jobs:
           shutil.copyfile(Path("docs/releases") / f"v{version}.md", root / "RELEASE_NOTES.md")
           (root / "COMMIT_SHA").write_bytes((os.environ["COMMIT_SHA"] + "\n").encode("ascii"))
           PY_BUNDLE
-          python scripts/release_bundle.py local --bundle "$BUNDLE" --version "$ARXIV_DIGEST_VERSION" --commit "$COMMIT_SHA"
-      - name: Run update-chain tests for early native feedback
+          python scripts/publish_verifier.py --bundle "$BUNDLE" --version "$ARXIV_DIGEST_VERSION" --commit "$COMMIT_SHA"
+      - name: Run Python tests
         if: matrix.suite == 'python'
         run: |
           umask 022
-          python -m pytest tests/integration/test_update_chain.py -q --junitxml="$RUNNER_TEMP/update-chain-tests.xml" --durations=10
-      - name: Summarize update-chain test failures
-        if: failure() && matrix.suite == 'python'
-        run: python scripts/ci_test_summary.py "$RUNNER_TEMP/update-chain-tests.xml"
-      - name: Run Python tests including native installation and recovery
-        if: matrix.suite == 'python'
-        run: |
-          umask 022
-          python -m pytest tests/unit tests/integration -q --junitxml="$RUNNER_TEMP/python-tests.xml" --ignore=tests/integration/test_update_chain.py --durations=10
+          python -m pytest tests/unit tests/integration -q --junitxml="$RUNNER_TEMP/python-tests.xml" --durations=10
       - name: Summarize Python test failures
         if: failure() && matrix.suite == 'python'
         run: python scripts/ci_test_summary.py "$RUNNER_TEMP/python-tests.xml"
@@ -145,6 +129,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python -m pip install --disable-pip-version-check pipx
           umask 022
           mkdir -p "${{ runner.temp }}/pipx-bin" "${{ runner.temp }}/unrelated"
           cd "${{ runner.temp }}/unrelated"

@@ -18,25 +18,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from arxiv_digest.atomic import atomic_write
-from arxiv_digest.update_contract import ShutdownIntent
-from arxiv_digest.update_locks import (
-    BorrowedLock,
-    LockIdentity,
-    LockMode,
-    LockTimeoutError,
-    OwnedLock,
-    acquire_exclusive,
-    adopt_borrowed,
-)
+from arxiv_digest.atomic import ExclusiveLock, acquire_exclusive, atomic_write
 
 
 INACTIVITY_SECONDS = 3 * 60
 TAB_LEASE_SECONDS = 90
 
 
+
 class InstanceSecurityError(RuntimeError):
     """Runtime ownership metadata could not be trusted."""
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,9 +40,11 @@ class RuntimeDescriptor:
     started_at: str
 
 
+
 @dataclass(frozen=True, slots=True)
 class ExistingInstance:
     descriptor: RuntimeDescriptor
+
 
 
 class OwnedInstance:
@@ -70,8 +64,6 @@ class OwnedInstance:
             token=token,
         )
 
-    def duplicate_borrowed_fd(self) -> tuple[int, LockIdentity]:
-        return self._coordinator._duplicate_borrowed_fd()
 
 
 def _pid_alive(pid: int) -> bool:
@@ -82,6 +74,7 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
 
 
 def _health_probe(descriptor: RuntimeDescriptor) -> bool:
@@ -111,6 +104,7 @@ def _health_probe(descriptor: RuntimeDescriptor) -> bool:
     )
 
 
+
 def _valid_token(value: object) -> bool:
     if not isinstance(value, str) or re.fullmatch(
         r"[A-Za-z0-9_-]{43}", value
@@ -123,6 +117,7 @@ def _valid_token(value: object) -> bool:
     except (ValueError, binascii.Error):
         return False
     return len(decoded) == 32
+
 
 
 def _decode_descriptor(payload: bytes) -> RuntimeDescriptor:
@@ -156,6 +151,7 @@ def _decode_descriptor(payload: bytes) -> RuntimeDescriptor:
     return RuntimeDescriptor(**value)
 
 
+
 def _is_private_file(metadata: os.stat_result) -> bool:
     return (
         stat.S_ISREG(metadata.st_mode)
@@ -163,6 +159,7 @@ def _is_private_file(metadata: os.stat_result) -> bool:
         and stat.S_IMODE(metadata.st_mode) == 0o600
         and metadata.st_nlink == 1
     )
+
 
 
 def _file_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
@@ -176,6 +173,7 @@ def _file_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
 
 
 def _read_private_descriptor(
@@ -232,6 +230,7 @@ def _read_private_descriptor(
         os.close(descriptor)
 
 
+
 class SingleInstance:
     def __init__(
         self,
@@ -247,78 +246,9 @@ class SingleInstance:
         self._pid_alive = pid_alive
         self._health_probe = health_probe
         self._wall_clock = wall_clock
-        self._lock: OwnedLock | BorrowedLock | None = None
+        self._lock: ExclusiveLock | None = None
         self._published: RuntimeDescriptor | None = None
         self._published_identity: tuple[int, int] | None = None
-
-    def _validate_lock_path(self, fd: int, identity: LockIdentity) -> None:
-        try:
-            for metadata in (os.fstat(fd), self.lock_path.lstat(), os.fstat(fd)):
-                if not _is_private_file(metadata) or LockIdentity(
-                    metadata.st_dev, metadata.st_ino, metadata.st_uid,
-                    stat.S_IMODE(metadata.st_mode),
-                ) != identity:
-                    raise InstanceSecurityError("process lock path changed")
-            if os.get_inheritable(fd):
-                raise InstanceSecurityError("process lock descriptor is inheritable")
-        except OSError as error:
-            raise InstanceSecurityError("process lock path changed") from error
-
-    def _duplicate_borrowed_fd(self) -> tuple[int, LockIdentity]:
-        if not isinstance(self._lock, OwnedLock):
-            raise RuntimeError("cannot duplicate without process ownership")
-        descriptor = os.dup(self._lock.fileno())
-        try:
-            self._validate_lock_path(descriptor, self._lock.identity)
-            return descriptor, self._lock.identity
-        except BaseException:
-            os.close(descriptor)
-            raise
-
-    @classmethod
-    def from_borrowed(
-        cls,
-        lock_path: Path,
-        descriptor_path: Path,
-        *,
-        fd: int,
-        identity: LockIdentity,
-        pid_alive: Callable[[int], bool] = _pid_alive,
-        health_probe: Callable[[RuntimeDescriptor], bool] = _health_probe,
-        wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-    ) -> "SingleInstance":
-        instance = cls(
-            lock_path,
-            descriptor_path,
-            pid_alive=pid_alive,
-            health_probe=health_probe,
-            wall_clock=wall_clock,
-        )
-        instance._lock = adopt_borrowed(
-            fd,
-            expected_identity=identity,
-            mode=LockMode.EXCLUSIVE,
-        )
-        try:
-            instance._validate_lock_path(instance._lock.fileno(), identity)
-        except BaseException:
-            instance.close_borrowed()
-            raise
-        return instance
-
-    def close_borrowed(self) -> None:
-        if self._lock is None:
-            return
-        if not isinstance(self._lock, BorrowedLock):
-            raise RuntimeError("single-instance lock is not borrowed")
-        self._lock.close()
-        self._lock = None
-
-    def adopt_sole_ownership(self) -> None:
-        if not isinstance(self._lock, BorrowedLock):
-            raise RuntimeError("single-instance lock is not borrowed")
-        self._validate_lock_path(self._lock.fileno(), self._lock.identity)
-        self._lock = self._lock.adopt_sole_ownership()
 
     def _read_existing(self) -> RuntimeDescriptor:
         descriptor = _read_private_descriptor(self.descriptor_path)
@@ -333,19 +263,12 @@ class SingleInstance:
             raise RuntimeError("single-instance lock is already owned")
         try:
             lock = acquire_exclusive(self.lock_path, timeout=0.0)
-        except LockTimeoutError:
+        except TimeoutError:
             return ExistingInstance(self._read_existing())
         except (OSError, PermissionError) as error:
             raise InstanceSecurityError("process lock is not private") from error
         self._lock = lock
         return OwnedInstance(self)
-
-    def publish_quarantined(self, *, port: int, startup_nonce: str, token: str) -> RuntimeDescriptor:
-        """Publish health identity while the helper retains ordinary ownership."""
-        if not isinstance(self._lock, BorrowedLock):
-            raise RuntimeError("quarantined instance must have borrowed ownership")
-        self._validate_lock_path(self._lock.fileno(), self._lock.identity)
-        return self._publish(port=port, startup_nonce=startup_nonce, token=token, _quarantined=True)
 
     def _publish(
         self,
@@ -353,9 +276,8 @@ class SingleInstance:
         port: int,
         startup_nonce: str,
         token: str,
-        _quarantined: bool = False,
     ) -> RuntimeDescriptor:
-        if not isinstance(self._lock, OwnedLock) and not (_quarantined and isinstance(self._lock, BorrowedLock)):
+        if self._lock is None:
             raise RuntimeError("cannot publish without process ownership")
         if (
             not 1 <= port <= 65535
@@ -396,8 +318,6 @@ class SingleInstance:
     def release(self) -> None:
         if self._lock is None:
             return
-        if isinstance(self._lock, BorrowedLock):
-            raise RuntimeError("borrowed ownership must be closed without unlock")
         try:
             if self._published is not None:
                 try:
@@ -418,6 +338,7 @@ class SingleInstance:
                 self._published_identity = None
 
 
+
 class LifecycleController:
     def __init__(
         self,
@@ -435,9 +356,7 @@ class LifecycleController:
             "download": set(),
         }
         self._transactions = 0
-        self._shutdown_intent: ShutdownIntent | None = None
-        self._update_job: str | None = None
-        self._update_failure_quit = False
+        self._closing = False
         self._idle_since: float | None = clock()
         self._state_lock = threading.RLock()
 
@@ -461,46 +380,11 @@ class LifecycleController:
     def _has_workers(self) -> bool:
         return any(self._workers.values())
 
-    @contextmanager
-    def update_owner(self, job_id: str) -> Iterator[None]:
-        """Keep preparation alive independently of tabs and drained workers."""
-        if not isinstance(job_id, str) or not job_id:
-            raise ValueError("update job identifier must not be empty")
-        with self._state_lock:
-            if self._shutdown_intent is not None:
-                raise RuntimeError("application is closing")
-            if self._update_job is not None:
-                raise RuntimeError("an update owner is already active")
-            self._update_job = job_id
-            self._update_failure_quit = False
-            self._idle_since = None
-        try:
-            yield
-        finally:
-            with self._state_lock:
-                self._expire_leases()
-                self._update_job = None
-                self._update_failure_quit = False
-                if not self._has_workers() and not self._leases:
-                    self._idle_since = self._clock()
-
-    @property
-    def update_failure_quit_allowed(self) -> bool:
-        with self._state_lock:
-            return self._update_job is not None and self._update_failure_quit
-
-    def allow_update_failure_quit(self, job_id: str) -> None:
-        """Expose fully-quit recovery only for the guarded failed attempt."""
-        with self._state_lock:
-            if self._update_job != job_id:
-                raise RuntimeError("the update owner does not match")
-            self._update_failure_quit = True
-
     def worker_started(self, kind: str, job_id: str) -> None:
         with self._state_lock:
             if kind not in self._workers:
                 raise ValueError("worker kind must be sync or download")
-            if self._shutdown_intent is not None:
+            if self._closing:
                 raise RuntimeError("application is closing")
             self._workers[kind].add(job_id)
             self._idle_since = None
@@ -528,32 +412,16 @@ class LifecycleController:
                 self._transactions -= 1
 
     @property
-    def shutdown_intent(self) -> ShutdownIntent | None:
-        with self._state_lock:
-            return self._shutdown_intent
-
-    @property
     def is_closing(self) -> bool:
         with self._state_lock:
-            return self._shutdown_intent is not None
-
-    def request_shutdown(self, intent: ShutdownIntent) -> bool:
-        if not isinstance(intent, ShutdownIntent):
-            raise TypeError("shutdown intent must be a ShutdownIntent")
-        with self._state_lock:
-            if self._shutdown_intent is not None:
-                return False
-            if (
-                intent is ShutdownIntent.QUIT
-                and self._update_job is not None
-                and not self._update_failure_quit
-            ):
-                return False
-            self._shutdown_intent = intent
-            return True
+            return self._closing
 
     def request_quit(self) -> bool:
-        return self.request_shutdown(ShutdownIntent.QUIT)
+        with self._state_lock:
+            if self._closing:
+                return False
+            self._closing = True
+            return True
 
     def _expire_leases(self) -> None:
         now = self._clock()
@@ -574,12 +442,11 @@ class LifecycleController:
 
     def should_stop(self) -> bool:
         with self._state_lock:
-            if self._shutdown_intent is not None:
+            if self._closing:
                 return self._transactions == 0
             self._expire_leases()
             return (
-                self._update_job is None
-                and not self._has_workers()
+                not self._has_workers()
                 and not self._leases
                 and self._idle_since is not None
                 and self._clock() - self._idle_since >= self._inactivity_seconds

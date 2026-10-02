@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 
+
 def _coordination_paths(root: Path):
     from arxiv_digest.paths import resolve_paths
 
@@ -24,104 +25,81 @@ def _coordination_paths(root: Path):
     )
 
 
+
 def _operation_guard(root: Path):
     from arxiv_digest.desktop_launcher import launcher_operation_guard
 
     return partial(launcher_operation_guard, _coordination_paths(root))
 
 
-def test_launcher_operation_guard_holds_both_locks_and_releases_on_error(
-    tmp_path: Path,
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_explicit_launcher_repair_removes_historical_recovery_wrapper(
+    tmp_path: Path, platform: str,
 ) -> None:
+    import shlex
+    from arxiv_digest.desktop_launcher import DesktopLauncherManager, LauncherState
+
+    executable = tmp_path / "arxiv-digest"
+    executable.write_bytes(b"synthetic executable")
+    recovery = tmp_path / "data/update-recovery/recover-arxiv-digest"
+    manager = DesktopLauncherManager(
+        platform=platform, home=tmp_path, executable=executable,
+        operation_guard=_operation_guard(tmp_path), legacy_recovery_wrapper=recovery,
+    )
+    manager.install()
+    wrapper = shlex.quote(str(recovery))
+    if platform == "darwin":
+        payload = (
+            f"#!/bin/sh\nif [ -e {wrapper} ] || [ -L {wrapper} ]; then\n"
+            f"  {wrapper} || exit $?\nfi\nexec '{executable}'\n"
+        ).encode()
+        launcher = manager.target / "Contents/MacOS/arxiv-digest"
+        launcher.write_bytes(payload)
+        manifest = manager.target / "Contents/Resources/ownership.json"
+        ownership = json.loads(manifest.read_text())
+        ownership["executable_sha256"] = hashlib.sha256(payload).hexdigest()
+        manifest.write_text(json.dumps(ownership, sort_keys=True, separators=(",", ":")) + "\n")
+    else:
+        script = (
+            f"if [ -e {wrapper} ] || [ -L {wrapper} ]; then {wrapper} || exit $?; "
+            f"fi; exec {shlex.quote(str(executable))}"
+        ).replace("$", "\\$")
+        launcher = manager.target
+        launcher.write_text(launcher.read_text().replace(f'Exec="{executable}"', f'Exec=/bin/sh -c "{script}"'))
+    assert manager.status().state is LauncherState.OUTDATED
+    assert manager.install().state is LauncherState.INSTALLED
+    assert b"recover-arxiv-digest" not in launcher.read_bytes()
+    assert not recovery.exists()
+
+
+
+def test_launcher_guard_releases_ownership_after_error(tmp_path: Path) -> None:
     from arxiv_digest.desktop_launcher import launcher_operation_guard
-    from arxiv_digest.update_locks import acquire_exclusive, acquire_shared
+    from arxiv_digest.atomic import acquire_exclusive
 
     paths = _coordination_paths(tmp_path)
     with pytest.raises(RuntimeError, match="operation failed"):
         with launcher_operation_guard(paths, timeout=0.1):
-            for path in (
-                paths.update_transition_lock_path,
-                paths.launcher_operation_lock_path,
-            ):
-                with pytest.raises(TimeoutError):
-                    acquire_exclusive(path, timeout=0)
-            # A CLI invocation already holding SH can enter the same boundary.
-            shared = acquire_shared(paths.update_transition_lock_path, timeout=0)
-            shared.release()
+            with pytest.raises(TimeoutError):
+                acquire_exclusive(paths.launcher_operation_lock_path, timeout=0)
             raise RuntimeError("operation failed")
-
-    for path in (
-        paths.update_transition_lock_path,
-        paths.launcher_operation_lock_path,
-    ):
-        exclusive = acquire_exclusive(path, timeout=0)
-        exclusive.release()
+    lock = acquire_exclusive(paths.launcher_operation_lock_path, timeout=0)
+    lock.release()
 
 
-def test_launcher_guard_acquires_transition_before_launcher_and_releases_in_reverse(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import arxiv_digest.desktop_launcher as launchers
 
-    paths = _coordination_paths(tmp_path)
-    events: list[str] = []
-    original_shared = launchers.acquire_shared
-    original_exclusive = launchers.acquire_exclusive
-
-    class RecordedLock:
-        def __init__(self, lock, name):
-            self.lock = lock
-            self.name = name
-
-        def release(self):
-            events.append(f"release:{self.name}")
-            self.lock.release()
-
-    def shared(path, **kwargs):
-        assert path == paths.update_transition_lock_path
-        lock = original_shared(path, **kwargs)
-        events.append("acquire:transition-shared")
-        return RecordedLock(lock, "transition-shared")
-
-    def exclusive(path, **kwargs):
-        assert path == paths.launcher_operation_lock_path
-        lock = original_exclusive(path, **kwargs)
-        events.append("acquire:launcher-exclusive")
-        return RecordedLock(lock, "launcher-exclusive")
-
-    monkeypatch.setattr(launchers, "acquire_shared", shared)
-    monkeypatch.setattr(launchers, "acquire_exclusive", exclusive)
-
-    with launchers.launcher_operation_guard(paths, timeout=0.1):
-        events.append("operation")
-
-    assert events == [
-        "acquire:transition-shared",
-        "acquire:launcher-exclusive",
-        "operation",
-        "release:launcher-exclusive",
-        "release:transition-shared",
-    ]
-
-
-@pytest.mark.parametrize("held_lock", ["transition", "launcher"])
 def test_launcher_lock_timeout_precedes_status_and_leaves_target_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held_lock: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from arxiv_digest.desktop_launcher import (
         DesktopLauncherManager,
         launcher_operation_guard,
     )
-    from arxiv_digest.update_locks import acquire_exclusive
+    from arxiv_digest.atomic import acquire_exclusive
 
     paths = _coordination_paths(tmp_path)
-    paths.ensure_update_coordination()
-    path = (
-        paths.update_transition_lock_path
-        if held_lock == "transition"
-        else paths.launcher_operation_lock_path
-    )
-    owner = acquire_exclusive(path, timeout=0)
+    owner = acquire_exclusive(paths.launcher_operation_lock_path, timeout=0)
     executable = tmp_path / "arxiv-digest"
     executable.write_bytes(b"synthetic executable")
     manager = DesktopLauncherManager(
@@ -139,9 +117,9 @@ def test_launcher_lock_timeout_precedes_status_and_leaves_target_untouched(
         assert not manager.target.exists()
     finally:
         owner.release()
-    # A failed second acquisition must not strand the first shared lock.
-    replacement = acquire_exclusive(paths.update_transition_lock_path, timeout=0)
+    replacement = acquire_exclusive(paths.launcher_operation_lock_path, timeout=0)
     replacement.release()
+
 
 
 def test_concurrent_launcher_remove_waits_for_install_verification(
@@ -152,7 +130,7 @@ def test_concurrent_launcher_remove_waits_for_install_verification(
         LauncherState,
         launcher_operation_guard,
     )
-    from arxiv_digest.update_locks import acquire_exclusive
+    from arxiv_digest.atomic import acquire_exclusive
 
     executable = tmp_path / "arxiv-digest"
     executable.write_bytes(b"synthetic executable")
@@ -210,7 +188,7 @@ def test_concurrent_launcher_remove_waits_for_install_verification(
         assert not remove_status.wait(0.03)
         assert installer.target.exists()
         with pytest.raises(TimeoutError):
-            acquire_exclusive(paths.update_transition_lock_path, timeout=0)
+            acquire_exclusive(paths.launcher_operation_lock_path, timeout=0)
     finally:
         finish_verification.set()
         install_thread.join(2)
@@ -221,6 +199,7 @@ def test_concurrent_launcher_remove_waits_for_install_verification(
     assert not remove_thread.is_alive()
     assert remove_status.is_set()
     assert remover_status().state is LauncherState.ABSENT
+
 
 
 @pytest.mark.parametrize("operation", ["install", "remove"])
@@ -286,6 +265,7 @@ def test_launcher_guard_covers_initial_status_mutation_and_verification(
     ]
 
 
+
 def _write_v1_macos_launcher(home: Path, executable: Path) -> Path:
     app = home / "Applications/arXiv Digest.app"
     macos = app / "Contents/MacOS"
@@ -323,6 +303,7 @@ def _write_v1_macos_launcher(home: Path, executable: Path) -> Path:
     return app
 
 
+
 def test_macos_launcher_is_owned_atomic_idempotent_and_foreground(
     tmp_path: Path,
 ) -> None:
@@ -355,6 +336,7 @@ def test_macos_launcher_is_owned_atomic_idempotent_and_foreground(
     assert launcher.read_bytes() == first_bytes
 
 
+
 def test_macos_launcher_includes_custom_app_icon(tmp_path: Path) -> None:
     from arxiv_digest.desktop_launcher import DesktopLauncherManager
 
@@ -375,6 +357,7 @@ def test_macos_launcher_includes_custom_app_icon(tmp_path: Path) -> None:
         "<key>CFBundleIconFile</key><string>arxiv-digest.icns</string>" in plist
     )
     assert icon.read_bytes().startswith(b"icns")
+
 
 
 def test_macos_launcher_refuses_a_tampered_app_icon(tmp_path: Path) -> None:
@@ -404,6 +387,7 @@ def test_macos_launcher_refuses_a_tampered_app_icon(tmp_path: Path) -> None:
         manager.install()
 
 
+
 def test_macos_launcher_upgrades_an_exact_owned_v1_bundle(tmp_path: Path) -> None:
     from arxiv_digest.desktop_launcher import DesktopLauncherManager, LauncherState
 
@@ -419,6 +403,7 @@ def test_macos_launcher_upgrades_an_exact_owned_v1_bundle(tmp_path: Path) -> Non
     assert manager.status().state.value == "outdated"
     assert manager.install().state is LauncherState.INSTALLED
     assert (app / "Contents/Resources/arxiv-digest.icns").is_file()
+
 
 
 def test_macos_launcher_preserves_extra_files_in_an_owned_bundle(
@@ -449,6 +434,7 @@ def test_macos_launcher_preserves_extra_files_in_an_owned_bundle(
     assert sentinel.read_text() == "preserve me"
 
 
+
 def test_macos_launcher_refuses_unowned_or_tampered_targets(tmp_path: Path) -> None:
     from arxiv_digest.desktop_launcher import (
         DesktopLauncherManager,
@@ -474,6 +460,7 @@ def test_macos_launcher_refuses_unowned_or_tampered_targets(tmp_path: Path) -> N
     with pytest.raises(LauncherCollisionError):
         manager.remove()
     assert sentinel.read_text() == "preserve me"
+
 
 
 def test_linux_launcher_has_absolute_exec_marker_and_safe_remove(
@@ -502,6 +489,7 @@ def test_linux_launcher_has_absolute_exec_marker_and_safe_remove(
     assert "Terminal=false" in payload
     assert manager.remove().state is LauncherState.ABSENT
     assert not desktop.exists()
+
 
 
 def test_launcher_requires_an_absolute_installed_console_entry(tmp_path: Path) -> None:

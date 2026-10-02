@@ -84,8 +84,6 @@ function deeplyFrozenRecord(value) {
 
 export class ViewState {
   constructor(view, initial = {}) {
-    this.sequence = 0;
-    this.latest = new Map();
     this.current = deeplyFrozenRecord({
       view: validatedView(view),
       ...initial,
@@ -99,17 +97,5 @@ export class ViewState {
   setView(view, values = {}) {
     this.current = deeplyFrozenRecord({ view: validatedView(view), ...values });
     return this.current;
-  }
-
-  begin(key) {
-    const request = Object.freeze({ key: String(key), id: ++this.sequence });
-    this.latest.set(request.key, request.id);
-    return request;
-  }
-
-  commit(request, values) {
-    if (!request || this.latest.get(request.key) !== request.id) return false;
-    this.current = deeplyFrozenRecord({ ...this.current, ...values });
-    return true;
   }
 }

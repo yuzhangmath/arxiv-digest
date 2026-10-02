@@ -8,7 +8,7 @@ paths, or identifying Git metadata to a contribution.
 
 - [Development setup](#development-setup)
 - [Test changes](#test-changes)
-- [Updater and release verification](#updater-and-release-verification)
+- [Release verification](#release-verification)
 - [Privacy review](#privacy-review)
 - [Pull requests](#pull-requests)
 
@@ -62,59 +62,35 @@ history and can cause a whole-repository scan to report private working data.
 Browser changes must pass both Chromium and WebKit. Packaging changes must
 preserve the exact migration, static-asset, license, and notice inventories.
 
-## Updater and release verification
+## Release verification
 
-Use Python 3.11 or newer and Node.js 24.19.0. Automatic installation supports
-only pipx 1.16.7 with its `pip` backend. Run installer, interruption, snapshot
-replay, inherited-lock, and relaunch tests in wholly temporary synthetic pipx,
-HOME/XDG, cache, log, trash, shared, bin, man, completion, and temporary roots.
-Application tests continue to deny non-loopback network access. Never run a
-production updater against the installed personal application as a fixture.
+Use Python 3.11 or newer and Node.js 24.19.0. Keep installation smoke tests in
+wholly temporary synthetic HOME/XDG and pipx directories. Application tests
+deny non-loopback network access; never use the installed personal application
+as a fixture.
 
 Keep `ARXIV_DIGEST_RELEASE_ARTIFACT_DIR` set to the exact fresh candidate build
 for all artifact checks. An explicit value must be absolute; tests never fall
 back to ignored `dist` artifacts when it is set. Ordinary developer use may
-omit it and use `dist`. Rebuild only when candidate source changes invalidate
-the artifact evidence, and validate wheel, sdist, exact package resources,
-manifest, checksums, notes, and commit identity against the same candidate.
+omit it and use `dist`. Rebuild when source changes invalidate the candidate,
+and validate the wheel, sdist, exact package resources, checksums, release
+notes, and commit identity against that same candidate.
 
-The 0.3.0 release remains the manual bootstrap: its manifest has updater protocol 1,
-application-data generation 2, `automatic_update: false`, and
-`automatic_update_from: null`. The 0.3.1 policy retains protocol 1 and generation
-2, enables automatic installation from 0.3.0 inclusive to 0.3.1 exclusive, and
-keeps the prerelease channel. Preserve the published bootstrap policy when
-checking historical artifacts. Verify the actual 0.2.1 manual upgrade separately
-from clean-wheel and public-CLI smoke. Synthetic consecutive
-0.3.0 → 0.3.1 → 0.3.2 coverage must use real canonical-tag bootstrap metadata,
-production discovery/coordinator/helper/recovery, and protected provenance; a
-hand-authored eligibility record or a mocked installation is not that evidence.
+Release validation runs on macOS and Linux with Python 3.11 and the current
+Python release. Both browser engines are required on each platform. Follow
+`.github/workflows/` for the single candidate build, source/tag/channel checks,
+privacy gates, isolated pipx smoke, and `SHA256SUMS`. Report unavailable native
+coverage explicitly; mocked platform branches do not establish readiness.
 
-Both macOS and Linux native installation/recovery results are required before
-release, using Python 3.11 and the current Python release on each platform.
-The release workflow builds one candidate bundle, then runs Python and browser
-validation in separate concurrent jobs for each OS/Python combination. All eight
-native jobs validate that bundle at its verified source commit, and publication
-depends on every job succeeding. Each browser job covers Chromium and WebKit.
-Python jobs run the update-chain integration file first for prompt failure
-feedback, then exclude that file from the remaining unit/integration run so every
-test still runs once. Both suites report their ten slowest tests.
-Report unavailable native coverage explicitly.
-Passing mocked platform branches does not establish native platform readiness.
+The read-only build job produces the candidate. The write-enabled publish job
+verifies downloaded bytes with its embedded standard-library verifier and
+never executes downloaded project code. Existing releases are verified without
+modification. Do not stage, commit, tag, publish, or upload generated artifacts
+without authorization.
 
-Follow the maintained workflows in `.github/workflows/` for the single isolated
-build, verified source/tag/channel identity, privacy gates, pipx smoke,
-`UPDATE_MANIFEST.json`, and `SHA256SUMS`. The read-only build job produces the
-candidate. The write-enabled publish job verifies downloaded bytes using only
-its embedded standard-library verifier and never executes downloaded project
-code. Existing releases are verified without modification. Do not stage,
-commit, tag, publish, or upload generated artifacts without authorization.
-
-Release requirement: `arxiv-digest doctor` must remain read-only for profiles,
-databases, and network access. Pending or blocked update recovery must produce
-only redacted status, without running recovery or exposing local paths.
-Updater preflight can initialize private
-coordination directories and lock files; fresh-install smoke should allow that
-while still requiring no profile, database, or running-server descriptor.
+`arxiv-digest doctor` must remain read-only for profiles and databases and make
+no network requests. Fresh-install smoke must leave no profile, database, or
+running-server descriptor.
 
 ## Privacy review
 

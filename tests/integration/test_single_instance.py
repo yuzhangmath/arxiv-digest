@@ -7,91 +7,6 @@ from pathlib import Path
 import pytest
 
 
-def test_owned_instance_duplicates_a_validated_close_only_descriptor(
-    tmp_path,
-) -> None:
-    from arxiv_digest.web.lifecycle import SingleInstance
-
-    instance = SingleInstance(
-        tmp_path / "runtime.lock",
-        tmp_path / "runtime.json",
-    )
-    ownership = instance.acquire()
-    try:
-        descriptor, identity = ownership.duplicate_borrowed_fd()
-        try:
-            metadata = os.fstat(descriptor)
-            assert metadata.st_dev == identity.device
-            assert metadata.st_ino == identity.inode
-            assert metadata.st_uid == identity.uid
-            assert identity.mode == 0o600
-            assert os.get_inheritable(descriptor) is False
-        finally:
-            os.close(descriptor)
-    finally:
-        instance.release()
-
-
-def test_borrowed_single_instance_cleanup_closes_without_unlocking_owner(
-    tmp_path,
-) -> None:
-    from arxiv_digest.update_locks import acquire_exclusive
-    from arxiv_digest.web.lifecycle import SingleInstance
-
-    lock_path = tmp_path / "runtime.lock"
-    descriptor_path = tmp_path / "runtime.json"
-    owner = SingleInstance(lock_path, descriptor_path)
-    ownership = owner.acquire()
-    descriptor, identity = ownership.duplicate_borrowed_fd()
-    borrowed = SingleInstance.from_borrowed(
-        lock_path,
-        descriptor_path,
-        fd=descriptor,
-        identity=identity,
-    )
-
-    borrowed.close_borrowed()
-
-    with pytest.raises(TimeoutError):
-        acquire_exclusive(lock_path, timeout=0.02)
-    owner.release()
-    replacement = acquire_exclusive(lock_path, timeout=0.1)
-    replacement.release()
-
-
-def test_borrowed_instance_can_adopt_sole_ownership_after_helper_close(
-    tmp_path,
-) -> None:
-    from arxiv_digest.update_locks import acquire_exclusive
-    from arxiv_digest.web.lifecycle import OwnedInstance, SingleInstance
-
-    lock_path = tmp_path / "runtime.lock"
-    descriptor_path = tmp_path / "runtime.json"
-    helper_owner = acquire_exclusive(lock_path, timeout=0.1)
-    child_fd = os.dup(helper_owner.fileno())
-    child = SingleInstance.from_borrowed(
-        lock_path,
-        descriptor_path,
-        fd=child_fd,
-        identity=helper_owner.identity,
-    )
-    helper_close_only = helper_owner.transfer_close_only()
-    helper_close_only.close()
-
-    child.adopt_sole_ownership()
-    OwnedInstance(child).publish(
-        port=43123, startup_nonce="nonce_abcd12345678", token="A" * 43,
-    )
-    assert descriptor_path.is_file()
-    with pytest.raises(TimeoutError):
-        acquire_exclusive(lock_path, timeout=0.02)
-    child.release()
-    child.release()
-    assert not descriptor_path.exists()
-
-    replacement = acquire_exclusive(lock_path, timeout=0.1)
-    replacement.release()
-
 
 def test_second_claim_verifies_private_descriptor_and_returns_existing(tmp_path) -> None:
     from arxiv_digest.web.lifecycle import ExistingInstance, SingleInstance
@@ -126,6 +41,7 @@ def test_second_claim_verifies_private_descriptor_and_returns_existing(tmp_path)
         owner.release()
 
 
+
 def test_untrusted_lock_or_runtime_metadata_is_rejected(tmp_path) -> None:
     from arxiv_digest.web.lifecycle import InstanceSecurityError, SingleInstance
 
@@ -136,6 +52,7 @@ def test_untrusted_lock_or_runtime_metadata_is_rejected(tmp_path) -> None:
 
     with pytest.raises(InstanceSecurityError, match="process lock"):
         SingleInstance(lock_path, tmp_path / "runtime.json").acquire()
+
 
 
 def test_contender_rejects_world_readable_runtime_descriptor(tmp_path) -> None:
@@ -164,6 +81,7 @@ def test_contender_rejects_world_readable_runtime_descriptor(tmp_path) -> None:
         owner.release()
 
 
+
 def test_owner_rejects_non_base64url_lifetime_tokens(tmp_path) -> None:
     from arxiv_digest.web.lifecycle import SingleInstance
 
@@ -180,6 +98,7 @@ def test_owner_rejects_non_base64url_lifetime_tokens(tmp_path) -> None:
             )
     finally:
         owner.release()
+
 
 
 def test_contender_rejects_runtime_descriptor_path_substitution(
@@ -223,89 +142,6 @@ def test_contender_rejects_runtime_descriptor_path_substitution(
         owner.release()
 
 
-@pytest.mark.parametrize("substitution", ["different", "symlink"])
-def test_borrowed_instance_requires_the_actual_lock_path_and_closes_bad_fd(
-    tmp_path: Path, substitution: str,
-) -> None:
-    from arxiv_digest.update_locks import acquire_exclusive
-    from arxiv_digest.web.lifecycle import InstanceSecurityError, SingleInstance
-
-    lock_path = tmp_path / "runtime.lock"
-    descriptor_path = tmp_path / "runtime.json"
-    owner = SingleInstance(lock_path, descriptor_path)
-    ownership = owner.acquire()
-    fd, identity = ownership.duplicate_borrowed_fd()
-    supplied_path = tmp_path / "other.lock"
-    if substitution == "symlink":
-        supplied_path.symlink_to(lock_path)
-    else:
-        supplied_path.touch(mode=0o600)
-    try:
-        with pytest.raises(InstanceSecurityError, match="lock path"):
-            SingleInstance.from_borrowed(
-                supplied_path, descriptor_path, fd=fd, identity=identity,
-            )
-        with pytest.raises(OSError):
-            os.fstat(fd)
-        with pytest.raises(TimeoutError):
-            acquire_exclusive(lock_path, timeout=0.02)
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        owner.release()
-
-
-def test_instance_transfer_rechecks_the_current_lock_path(tmp_path: Path) -> None:
-    from arxiv_digest.web.lifecycle import InstanceSecurityError, SingleInstance
-
-    lock_path = tmp_path / "runtime.lock"
-    owner = SingleInstance(lock_path, tmp_path / "runtime.json")
-    ownership = owner.acquire()
-    lock_path.rename(tmp_path / "original.lock")
-    lock_path.touch(mode=0o600)
-    try:
-        with pytest.raises(InstanceSecurityError, match="lock path"):
-            fd, _ = ownership.duplicate_borrowed_fd()
-            os.close(fd)
-    finally:
-        owner.release()
-
-
-def test_only_borrowed_instance_can_adopt_and_only_owner_can_release(
-    tmp_path: Path,
-) -> None:
-    from arxiv_digest.update_locks import acquire_exclusive
-    from arxiv_digest.web.lifecycle import SingleInstance
-
-    lock_path = tmp_path / "runtime.lock"
-    descriptor_path = tmp_path / "runtime.json"
-    owner = SingleInstance(lock_path, descriptor_path)
-    ownership = owner.acquire()
-    ownership.publish(
-        port=43123, startup_nonce="nonce_abcd12345678", token="A" * 43,
-    )
-    fd, identity = ownership.duplicate_borrowed_fd()
-    child = SingleInstance.from_borrowed(
-        lock_path, descriptor_path, fd=fd, identity=identity,
-    )
-    try:
-        with pytest.raises(RuntimeError, match="not borrowed"):
-            owner.adopt_sole_ownership()
-        with pytest.raises(RuntimeError, match="without unlock"):
-            child.release()
-        assert descriptor_path.is_file()
-        child.close_borrowed()
-        child.close_borrowed()
-        assert descriptor_path.is_file()
-        with pytest.raises(TimeoutError):
-            acquire_exclusive(lock_path, timeout=0.02)
-    finally:
-        child.close_borrowed()
-        owner.release()
-    assert not descriptor_path.exists()
-
 
 @pytest.mark.parametrize("change", ["permissions", "content"])
 def test_runtime_descriptor_must_remain_private_and_stable_during_read(
@@ -346,11 +182,12 @@ def test_runtime_descriptor_must_remain_private_and_stable_during_read(
         owner.release()
 
 
+
 @pytest.mark.parametrize("replacement", ["file", "symlink"])
 def test_release_preserves_a_replaced_runtime_descriptor(
     tmp_path: Path, replacement: str,
 ) -> None:
-    from arxiv_digest.update_locks import acquire_exclusive
+    from arxiv_digest.atomic import acquire_exclusive
     from arxiv_digest.web.lifecycle import SingleInstance
 
     lock_path = tmp_path / "runtime.lock"
@@ -374,6 +211,7 @@ def test_release_preserves_a_replaced_runtime_descriptor(
     replacement_owner.release()
 
 
+
 @pytest.mark.parametrize("flag", ["O_NOFOLLOW", "O_CLOEXEC"])
 def test_runtime_descriptor_read_requires_safe_open_flags(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str,
@@ -383,28 +221,3 @@ def test_runtime_descriptor_read_requires_safe_open_flags(
     monkeypatch.setattr(lifecycle.os, flag, 0)
     with pytest.raises(lifecycle.InstanceSecurityError, match="unsupported"):
         lifecycle._read_private_descriptor(tmp_path / "runtime.json")
-
-
-def test_sole_ownership_transition_rejects_replaced_lock_path(tmp_path: Path) -> None:
-    from arxiv_digest.update_locks import acquire_exclusive
-    from arxiv_digest.web.lifecycle import InstanceSecurityError, SingleInstance
-
-    lock_path = tmp_path / "runtime.lock"
-    helper_owner = acquire_exclusive(lock_path, timeout=0.1)
-    child = SingleInstance.from_borrowed(
-        lock_path, tmp_path / "runtime.json",
-        fd=os.dup(helper_owner.fileno()), identity=helper_owner.identity,
-    )
-    helper_owner.transfer_close_only().close()
-    old_path = tmp_path / "original.lock"
-    lock_path.rename(old_path)
-    lock_path.touch(mode=0o600)
-    try:
-        with pytest.raises(InstanceSecurityError, match="lock path"):
-            child.adopt_sole_ownership()
-        with pytest.raises(TimeoutError):
-            acquire_exclusive(old_path, timeout=0.02)
-    finally:
-        child.close_borrowed()
-    replacement_owner = acquire_exclusive(old_path, timeout=0.1)
-    replacement_owner.release()

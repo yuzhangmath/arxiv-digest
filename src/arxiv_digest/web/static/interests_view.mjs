@@ -65,10 +65,6 @@ export class InterestsDraft {
     this.dirty = false;
   }
 
-  noteSearch(_query) {}
-  noteSuggestionViewed(_suggestionId) {}
-  notePage(_page) {}
-
   setSuggested(field, value, selected) {
     this.#assertField(field);
     const text = normalizedText(value);

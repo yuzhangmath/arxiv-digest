@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
@@ -11,12 +12,90 @@ from arxiv_digest.models import EnrichmentStatus
 from arxiv_digest.profile import PdfDestination, Profile, ProfileCategory
 from arxiv_digest.storage.database import open_database
 from arxiv_digest.storage.store import EnrichmentDayRecord, Store
+from arxiv_digest.sync import SyncService
 from arxiv_digest.web.api import ApiRequest, ApiRouter
 
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=timezone.utc)
 TOKEN = "A" * 43
 HOST = "127.0.0.1:43123"
+
+
+def _settings_runtime(tmp_path, store, profile, *, clock=lambda: NOW):
+    runtime = _DefaultRuntime(
+        SimpleNamespace(), SimpleNamespace(load=lambda: profile),
+        SimpleNamespace(), SimpleNamespace(), output=lambda _message: None,
+    )
+    runtime.store = store
+    runtime.sync = SyncService(store, None, None, None, clock=clock)
+    runtime.setup = SimpleNamespace(launcher_settings=lambda: SimpleNamespace(
+        operation="none", error_code=None, retry_available=False,
+    ))
+    runtime.candidates = SimpleNamespace(cache=SimpleNamespace(root=tmp_path / "cache"))
+    return runtime
+
+
+@pytest.mark.parametrize("day", (date(2026, 8, 20), date(2026, 5, 20)))
+@pytest.mark.parametrize("pending_recorded", (True, False))
+def test_status_and_settings_keep_mixed_failed_pending_date_visible(
+    tmp_path, day, pending_recorded,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    store = Store(database_path)
+    for category in ("cs.SE", "math.LO"):
+        store.ensure_category_state(category, category.replace(".", ":"), day)
+        if pending_recorded:
+            store.ensure_catchup_targets(category, (day,))
+    store.record_enrichment_day(EnrichmentDayRecord(
+        category="cs.SE", mailing_date=day, source="catchup",
+        status=EnrichmentStatus.FAILED, fetched_at=NOW,
+        error_code="catchup_http_406", error_message="Daily-list retrieval failed.",
+    ))
+    profile = Profile(
+        schema_version=2, revision=1,
+        category_coverage=tuple(
+            ProfileCategory(category, day) for category in ("cs.SE", "math.LO")
+        ),
+        keywords=(), phrases=(), authors=(), seed_papers=(),
+        pdf_destination=PdfDestination("downloads", tmp_path / "pdfs"),
+    )
+    runtime = _settings_runtime(tmp_path, store, profile)
+
+    status = runtime.status({})
+    settings = runtime._settings_get({})
+
+    progress = status["daily_list_progress"]
+    coverage = settings["daily_list_coverage"]
+    unavailable = int(day < date(2026, 5, 25))
+    assert progress["status"] == "failed"
+    for progress_key, coverage_key, expected in (
+        ("target_dates", "target", 1),
+        ("checked_dates", "checked", 1),
+        ("failed_dates", "failed", 1),
+        ("pending_dates", "pending", 0),
+        ("dates_with_papers", "with_papers", 0),
+        ("empty_dates", "empty", 0),
+        ("unavailable_dates", "unavailable", unavailable),
+    ):
+        assert progress[progress_key] == coverage[coverage_key] == expected
+    progress_categories = {item["category"]: item for item in progress["categories"]}
+    settings_categories = {item["category"]: item for item in coverage["categories"]}
+    assert (
+        progress_categories["cs.SE"]["failed_dates"]
+        == settings_categories["cs.SE"]["failed"] == 1
+    )
+    assert (
+        progress_categories["math.LO"]["pending_dates"]
+        == settings_categories["math.LO"]["pending"] == int(pending_recorded)
+    )
+    assert settings_categories["cs.SE"]["retryable_failed_dates"] == (
+        [] if unavailable else [day.isoformat()]
+    )
+    assert settings_categories["cs.SE"]["failed_date_errors"] == [
+        {"date": day.isoformat(), "error_code": "catchup_http_406"},
+    ]
+    assert status["metadata_sync"]["categories"] == settings["metadata_sync"]["categories"]
 
 
 @pytest.mark.parametrize("status", tuple(EnrichmentStatus))
@@ -37,25 +116,14 @@ def test_settings_excludes_unfinalized_dates_until_new_york_cutoff(
         ),
     ))
     observed_at = datetime(2026, 8, 20, 23, 59, 59, tzinfo=timezone.utc)
-    runtime = object.__new__(_DefaultRuntime)
-    runtime.profiles = SimpleNamespace(load=lambda: Profile(
+    profile = Profile(
         schema_version=2, revision=1,
         category_coverage=(ProfileCategory("cs.SE", day),),
         keywords=(), phrases=(), authors=(), seed_papers=(),
         pdf_destination=PdfDestination("downloads", tmp_path / "pdfs"),
-    ))
-    runtime.status = lambda _payload: {"sync": None, "offline": False}
-    runtime.sync = SimpleNamespace(catchup_window_days=90)
-    runtime.store = store
-    runtime.setup = SimpleNamespace(
-        clock=lambda: observed_at,
-        launcher_settings=lambda: SimpleNamespace(
-            operation="none", error_code=None, retry_available=False,
-        ),
     )
-    runtime.launcher = None
-    runtime.candidates = SimpleNamespace(
-        cache=SimpleNamespace(root=tmp_path / "missing-cache"),
+    runtime = _settings_runtime(
+        tmp_path, store, profile, clock=lambda: observed_at,
     )
     records_before = store.catchup_day_records("cs.SE")
 
@@ -171,16 +239,7 @@ def test_settings_separates_redacted_persisted_status_aggregates(
         seed_papers=(),
         pdf_destination=PdfDestination("documents", destination),
     )
-    profiles = SimpleNamespace(load=lambda: profile)
-    runtime = _DefaultRuntime(
-        SimpleNamespace(),
-        profiles,
-        SimpleNamespace(),
-        SimpleNamespace(),
-        output=lambda _message: None,
-    )
-    runtime.store = store
-    runtime.sync = SimpleNamespace(catchup_window_days=90)
+    runtime = _settings_runtime(tmp_path, store, profile)
     runtime._active_sync_job = "sync_status_fixture"
     runtime._jobs["sync_status_fixture"] = {
         "job_id": "sync_status_fixture",
@@ -193,12 +252,6 @@ def test_settings_separates_redacted_persisted_status_aggregates(
             "total": 1,
         },
     }
-    runtime.setup = SimpleNamespace(
-        clock=lambda: NOW,
-        launcher_settings=lambda: SimpleNamespace(
-            operation="none", error_code=None, retry_available=False
-        )
-    )
     cache_root = tmp_path / "candidate-cache"
     cache_root.mkdir()
     (cache_root / "manifest.json").write_text("{}", encoding="utf-8")
@@ -297,41 +350,59 @@ def test_settings_reads_terminal_sync_status_before_storage_snapshot(
     store.category_sync_state = lambda category: (
         calls.append("state") or original_state(category)
     )
-    runtime = object.__new__(_DefaultRuntime)
-    runtime.profiles = SimpleNamespace(
-        load=lambda: Profile(
-            schema_version=2,
-            revision=1,
-            category_coverage=(
-                ProfileCategory("math.AT", date(2026, 8, 1)),
-            ),
-            keywords=(),
-            phrases=(),
-            authors=(),
-            seed_papers=(),
-            pdf_destination=PdfDestination("documents", tmp_path),
-        )
+    profile = Profile(
+        schema_version=2,
+        revision=1,
+        category_coverage=(
+            ProfileCategory("math.AT", date(2026, 8, 1)),
+        ),
+        keywords=(),
+        phrases=(),
+        authors=(),
+        seed_papers=(),
+        pdf_destination=PdfDestination("documents", tmp_path),
     )
-    runtime.status = lambda _payload: calls.append("status") or {
-        "sync": None,
-        "offline": False,
-    }
-    runtime.sync = SimpleNamespace(catchup_window_days=90)
-    runtime.store = store
-    runtime.setup = SimpleNamespace(
-        clock=lambda: NOW,
-        launcher_settings=lambda: SimpleNamespace(
-            operation="none", error_code=None, retry_available=False
-        )
-    )
-    runtime.launcher = None
-    runtime.candidates = SimpleNamespace(
-        cache=SimpleNamespace(root=tmp_path / "missing-cache")
-    )
+    runtime = _settings_runtime(tmp_path, store, profile)
+
+    class ObservedJobs(dict):
+        def get(self, key, default=None):
+            calls.append("status")
+            return super().get(key, default)
+
+    runtime._active_sync_job = "sync_finished"
+    runtime._jobs = ObservedJobs(sync_finished={"status": "completed"})
 
     runtime._settings_get({})
 
     assert calls[:2] == ["status", "state"]
+
+
+def test_settings_uses_one_profile_when_interests_change_during_snapshot(tmp_path) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    store = Store(database_path)
+    day = date(2026, 8, 20)
+    for category in ("cs.SE", "math.LO"):
+        store.ensure_category_state(category, category.replace(".", ":"), day)
+    profile = Profile(
+        schema_version=2, revision=1,
+        category_coverage=(ProfileCategory("cs.SE", day),),
+        keywords=(), phrases=(), authors=(), seed_papers=(),
+        pdf_destination=PdfDestination("downloads", tmp_path / "pdfs"),
+    )
+    revised = replace(
+        profile, revision=2, category_coverage=(ProfileCategory("math.LO", day),),
+    )
+    runtime = _settings_runtime(tmp_path, store, profile)
+    profiles = iter((profile,))
+    runtime.profiles.load = lambda: next(profiles, revised)
+
+    settings = runtime._settings_get({})
+
+    assert settings["revision"] == 1
+    assert [item["category"] for item in settings["daily_list_coverage"]["categories"]] == ["cs.SE"]
+    assert [item["category"] for item in settings["metadata_sync"]["categories"]] == ["cs.SE"]
+    assert runtime.profiles.load() == revised
 
 
 def test_settings_coverage_publishes_revised_profile_and_starts_sync(

@@ -13,16 +13,14 @@ from socket import SHUT_RDWR, socket
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
-from arxiv_digest.maintenance import MaintenanceBarrier
 from arxiv_digest.web.api import (
-    BACKUP_BODY_LIMIT,
+    JSON_BODY_LIMIT,
     ApiRequest,
     ApiResponse,
     ApiRouter,
     Handler,
     KnownPaper,
     error_response,
-    request_body_limit,
 )
 from arxiv_digest.web.lifecycle import LifecycleController
 
@@ -41,7 +39,7 @@ _DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 _MAX_REQUEST_TIMEOUT_SECONDS = 60.0
 _DEFAULT_MAX_REQUEST_THREADS = 32
 _MAX_REQUEST_THREADS = 128
-_DEFAULT_MAX_PENDING_BACKUP_INSPECTIONS = 2
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +54,7 @@ _STATIC_SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store",
 }
+
 
 
 class _DashboardHttpServer(ThreadingHTTPServer):
@@ -156,6 +155,7 @@ class _DashboardHttpServer(ThreadingHTTPServer):
             self._request_finished()
 
 
+
 class LoopbackServer:
     def __init__(
         self,
@@ -165,13 +165,8 @@ class LoopbackServer:
         logger: Callable[[str], None] | None = None,
         static_assets: Mapping[str, StaticAsset] | None = None,
         lifecycle: LifecycleController | None = None,
-        maintenance: MaintenanceBarrier | None = None,
         request_timeout: float = _DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_request_threads: int = _DEFAULT_MAX_REQUEST_THREADS,
-        max_pending_backup_inspections: int = (
-            _DEFAULT_MAX_PENDING_BACKUP_INSPECTIONS
-        ),
-        max_pending_backup_bytes: int = BACKUP_BODY_LIMIT,
     ) -> None:
         if (
             not isfinite(request_timeout)
@@ -189,45 +184,19 @@ class LoopbackServer:
             raise ValueError(
                 "maximum request threads must be between 1 and 128"
             )
-        if (
-            type(max_pending_backup_inspections) is not int
-            or max_pending_backup_inspections < 1
-            or max_pending_backup_inspections
-            > _DEFAULT_MAX_PENDING_BACKUP_INSPECTIONS
-        ):
-            raise ValueError(
-                "pending backup inspections must be between 1 and 2"
-            )
-        if (
-            type(max_pending_backup_bytes) is not int
-            or max_pending_backup_bytes < 1
-            or max_pending_backup_bytes > BACKUP_BODY_LIMIT
-        ):
-            raise ValueError(
-                "pending backup bytes must be between 1 and the backup body limit"
-            )
         self.host = LOOPBACK_HOST
         self.port = 0
         self.token = secrets.token_urlsafe(32)
         self.startup_nonce = secrets.token_urlsafe(24)
         self.lifecycle = lifecycle or LifecycleController()
-        self.maintenance = maintenance
         self._handlers = dict(handlers)
         status_handler = self._handlers.get("status")
-        self._cached_status: dict[str, Any] = {"startup_nonce": self.startup_nonce}
-        self._cached_status_lock = threading.Lock()
 
         def status(payload: dict[str, Any]) -> dict[str, Any]:
-            if self.maintenance is not None and self.maintenance.update_active:
-                with self._cached_status_lock:
-                    return dict(self._cached_status)
             supplied = {} if status_handler is None else status_handler(payload)
             if not isinstance(supplied, Mapping):
                 raise TypeError("status handler must return a mapping")
-            result = {**supplied, "startup_nonce": self.startup_nonce}
-            with self._cached_status_lock:
-                self._cached_status = result
-            return result
+            return {**supplied, "startup_nonce": self.startup_nonce}
 
         self._handlers["status"] = status
         self._handlers["tabs_connect"] = self._connect_tab
@@ -249,35 +218,6 @@ class LoopbackServer:
         self._stopped = threading.Event()
         self._request_timeout = float(request_timeout)
         self._max_request_threads = max_request_threads
-        self._max_pending_backup_inspections = max_pending_backup_inspections
-        self._max_pending_backup_bytes = max_pending_backup_bytes
-        self._backup_body_lock = threading.Lock()
-        self._pending_backup_inspections = 0
-        self._pending_backup_bytes = 0
-
-    def _reserve_backup_body(self, byte_count: int) -> bool:
-        with self._backup_body_lock:
-            if (
-                self._pending_backup_inspections
-                >= self._max_pending_backup_inspections
-                or self._pending_backup_bytes + byte_count
-                > self._max_pending_backup_bytes
-            ):
-                return False
-            self._pending_backup_inspections += 1
-            self._pending_backup_bytes += byte_count
-            return True
-
-    def _release_backup_body(self, byte_count: int) -> None:
-        with self._backup_body_lock:
-            if (
-                self._pending_backup_inspections < 1
-                or byte_count < 0
-                or byte_count > self._pending_backup_bytes
-            ):
-                raise RuntimeError("backup body admission accounting is invalid")
-            self._pending_backup_inspections -= 1
-            self._pending_backup_bytes -= byte_count
 
     def _connect_tab(self, payload: dict[str, Any]) -> dict[str, bool]:
         self.lifecycle.connect(payload["tab_id"])
@@ -318,8 +258,6 @@ class LoopbackServer:
                     host=host,
                     handlers=owner._handlers,
                     known_paper=owner._known_paper,
-                    maintenance=owner.maintenance,
-                    allow_update_quit=lambda: owner.lifecycle.update_failure_quit_allowed,
                 )
                 framing_request = ApiRequest(
                     method=self.command,
@@ -357,7 +295,7 @@ class LoopbackServer:
                         )
                     )
                     return
-                if length > request_body_limit(self.command, self.path):
+                if length > JSON_BODY_LIMIT:
                     self.close_connection = True
                     self._send(
                         error_response(
@@ -367,50 +305,28 @@ class LoopbackServer:
                         )
                     )
                     return
-                is_backup_inspection = (
-                    self.command == "POST"
-                    and urlsplit(self.path).path
-                    == "/api/v1/backup/inspect"
-                )
-                reserved_backup_bytes: int | None = None
-                if is_backup_inspection:
-                    if not owner._reserve_backup_body(length):
-                        self.close_connection = True
-                        self._send(
-                            error_response(
-                                429,
-                                "backup_capacity",
-                                "Another backup inspection is already in progress.",
-                            )
+                body = self.rfile.read(length) if length else b""
+                if len(body) != length:
+                    self.close_connection = True
+                    self._send(
+                        error_response(
+                            400,
+                            "incomplete_body",
+                            "The request body ended before Content-Length.",
                         )
-                        return
-                    reserved_backup_bytes = length
-                try:
-                    body = self.rfile.read(length) if length else b""
-                    if len(body) != length:
-                        self.close_connection = True
-                        self._send(
-                            error_response(
-                                400,
-                                "incomplete_body",
-                                "The request body ended before Content-Length.",
-                            )
+                    )
+                    return
+                owner._httpd.finish_request_input(self.connection)
+                with owner.lifecycle.transaction():
+                    response = router.dispatch(
+                        ApiRequest(
+                            method=self.command,
+                            target=self.path,
+                            headers=headers,
+                            body=body,
                         )
-                        return
-                    owner._httpd.finish_request_input(self.connection)
-                    with owner.lifecycle.transaction():
-                        response = router.dispatch(
-                            ApiRequest(
-                                method=self.command,
-                                target=self.path,
-                                headers=headers,
-                                body=body,
-                            )
-                        )
-                        self._send(response)
-                finally:
-                    if reserved_backup_bytes is not None:
-                        owner._release_backup_body(reserved_backup_bytes)
+                    )
+                    self._send(response)
                 owner._logger(f"{self.command} {self.path.split('?', 1)[0]}")
 
             def _handle_static(self) -> None:

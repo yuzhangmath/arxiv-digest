@@ -41,6 +41,26 @@ def _json(response):
     return json.loads(response.body)
 
 
+@pytest.mark.parametrize("operation", ["inspect", "restore"])
+def test_backup_import_is_available_only_through_the_cli(operation: str) -> None:
+    from arxiv_digest.web.api import ApiRouter
+
+    called = []
+    router = ApiRouter(
+        token=TOKEN,
+        host=HOST,
+        handlers={f"backup_{operation}": lambda payload: called.append(payload) or {}},
+    )
+    response = router.dispatch(_request(
+        "POST", f"/api/v1/backup/{operation}", origin=ORIGIN,
+        body=b"synthetic archive" if operation == "inspect" else b"{}",
+        content_type="application/zip" if operation == "inspect" else "application/json",
+    ))
+
+    assert response.status == 404
+    assert called == []
+
+
 def test_every_api_call_requires_the_lifetime_bearer_token() -> None:
     from arxiv_digest.web.api import ApiRouter
 
@@ -647,22 +667,9 @@ def test_api_v1_route_surface_is_exact() -> None:
         {
             ("GET", "/api/v1/status"),
             ("GET", "/api/v1/update"),
-            ("POST", "/api/v1/update/start"),
-            ("GET", "/api/v1/update/jobs/{job_id}"),
-            ("POST", "/api/v1/update/jobs/{job_id}/commit"),
-            ("POST", "/api/v1/update/jobs/{job_id}/handoff-ack"),
-            ("GET", "/api/v1/update/receipt"),
-            ("POST", "/api/v1/update/receipt/{receipt_id}/ack"),
             ("GET", "/api/v1/categories"),
             ("GET", "/api/v1/setup/draft"),
             ("PUT", "/api/v1/setup/draft"),
-            ("POST", "/api/v1/setup/corpus"),
-            ("POST", "/api/v1/setup/corpus/accept"),
-            ("GET", "/api/v1/setup/jobs/{job_id}"),
-            ("GET", "/api/v1/setup/candidates/papers"),
-            ("GET", "/api/v1/setup/candidates/terms"),
-            ("GET", "/api/v1/setup/candidates/authors"),
-            ("POST", "/api/v1/setup/papers/lookup"),
             ("POST", "/api/v1/setup/folder/pick"),
             ("POST", "/api/v1/setup/folder/test"),
             ("POST", "/api/v1/setup/complete"),
@@ -697,8 +704,6 @@ def test_api_v1_route_surface_is_exact() -> None:
             ("POST", "/api/v1/settings/launcher/not-now"),
             ("POST", "/api/v1/settings/launcher/remove"),
             ("GET", "/api/v1/backup/export"),
-            ("POST", "/api/v1/backup/inspect"),
-            ("POST", "/api/v1/backup/restore"),
             ("POST", "/api/v1/application/quit"),
         }
     )
@@ -842,9 +847,6 @@ def test_setup_draft_accepts_only_the_exact_discriminated_step_shapes() -> None:
     shapes = (
         {"step": "categories", "selections": [{"category": "cs.SE", "set_spec": "cs:SE"}]},
         {"step": "coverage", "coverage_start": "2026-07-23"},
-        {"step": "seed_papers", "accepted_suggestion_ids": ["suggest_1234"], "custom_arxiv_ids": ["2608.02001"]},
-        {"step": "terms", "accepted_keyword_suggestion_ids": [], "accepted_phrase_suggestion_ids": ["suggest_5678"], "custom_keywords": ["orbit"], "custom_phrases": ["lattice flow"]},
-        {"step": "authors", "accepted_suggestion_ids": [], "custom_authors": ["Aster Vale"]},
         {"step": "pdf_destination", "tested_destination_token": "destination_abcd1234"},
         {"step": "review", "confirmed": True, "profile_summary_sha256": "a" * 64},
     )
@@ -1211,15 +1213,7 @@ def test_setup_draft_projection_uses_a_read_only_home_relative_destination_path(
         updated_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
     )
 
-    corpus_job = {
-        "job_id": "setup_reload1234",
-        "status": "running",
-        "complete": False,
-        "failed": False,
-    }
-    projected = project_setup_draft(
-        SetupDraftPayload(draft, corpus_job=corpus_job)
-    )
+    projected = project_setup_draft(SetupDraftPayload(draft))
     encoded = json.dumps(projected)
 
     assert projected["current_step"] == "review"
@@ -1240,11 +1234,11 @@ def test_setup_draft_projection_uses_a_read_only_home_relative_destination_path(
         == "~/Private Project/PDFs"
     )
     assert len(projected["profile_summary_sha256"]) == 64
-    assert projected["corpus_job"] == corpus_job
+    assert "corpus_job" not in projected
     assert str(destination) not in encoded
 
 
-def test_setup_draft_get_reports_a_resumable_partial_candidate_cache() -> None:
+def test_setup_draft_get_does_not_require_or_load_candidate_data() -> None:
     from arxiv_digest.application import _DefaultRuntime
     from arxiv_digest.setup import CategorySelection, SetupDraft, SetupStep
     from arxiv_digest.web.api import project_setup_draft
@@ -1253,7 +1247,7 @@ def test_setup_draft_get_reports_a_resumable_partial_candidate_cache() -> None:
     draft = SetupDraft(
         schema_version=1,
         revision=2,
-        current_step=SetupStep.CANDIDATE_CORPUS,
+        current_step=SetupStep.PDF_DESTINATION,
         categories=(CategorySelection("synthetic.alpha", "synthetic:alpha"),),
         coverage_start=date(2026, 7, 1),
         coverage_warning=None,
@@ -1284,7 +1278,8 @@ def test_setup_draft_get_reports_a_resumable_partial_candidate_cache() -> None:
 
     payload = runtime.handlers()["setup_draft_get"]({})
 
-    assert project_setup_draft(payload)["corpus_can_resume"] is True
+    assert project_setup_draft(payload)["current_step"] == "pdf_destination"
+    assert "corpus_can_resume" not in project_setup_draft(payload)
 
 
 def test_default_service_graph_accepts_the_revision_zero_categories_step(
@@ -1354,7 +1349,6 @@ def test_default_service_graph_accepts_the_revision_zero_categories_step(
 
 def test_application_quit_handler_adapts_shutdown_acceptance_to_api_payload() -> None:
     from arxiv_digest.application import _DefaultRuntime
-    from arxiv_digest.update_contract import ShutdownIntent
     from arxiv_digest.web.lifecycle import LifecycleController
 
     runtime = object.__new__(_DefaultRuntime)
@@ -1362,7 +1356,7 @@ def test_application_quit_handler_adapts_shutdown_acceptance_to_api_payload() ->
     runtime.lifecycle = LifecycleController()
 
     assert runtime.handlers()["application_quit"]({}) == {"quitting": True}
-    assert runtime.lifecycle.shutdown_intent is ShutdownIntent.QUIT
+    assert runtime.lifecycle.is_closing
 
 
 def test_oai_set_specs_map_to_categories_without_changing_exact_pairs() -> None:
@@ -1489,259 +1483,6 @@ def test_setup_authorizes_only_category_pairs_returned_to_the_browser() -> None:
     assert response.status == 400
     assert _json(response)["error"]["code"] == "domain_error"
     assert mutations == []
-
-
-def test_failed_browser_restore_retains_validated_pending_inspection(
-    tmp_path, monkeypatch
-) -> None:
-    import arxiv_digest.backup
-    from arxiv_digest.application import _DefaultRuntime
-    from arxiv_digest.maintenance import MaintenanceBarrier
-
-    archive = tmp_path / "pending.zip"
-    archive.write_bytes(b"validated")
-    inspection = SimpleNamespace(path=archive)
-    runtime = object.__new__(_DefaultRuntime)
-    runtime._pending_restores_lock = threading.RLock()
-    runtime._restore_cleanup_timer = None
-    runtime._restore_shutdown = False
-    runtime._pending_restore_reservations = {}
-    runtime._pending_restores = {
-        "restore_abcd1234": (time.monotonic(), inspection)
-    }
-    picker_choice = SimpleNamespace(kind="custom")
-    runtime._picker_choices = {"picker_abcd1234": picker_choice}
-    runtime.folder = SimpleNamespace(validate=lambda choice: "destination")
-    runtime.paths = SimpleNamespace()
-    runtime.maintenance = MaintenanceBarrier()
-    runtime._candidate_state_lock = threading.RLock()
-    runtime._expire_pending_restores = lambda: None
-    monkeypatch.setattr(
-        arxiv_digest.backup,
-        "restore_backup",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            ValueError("safe restore refusal")
-        ),
-    )
-
-    with __import__("pytest").raises(ValueError, match="safe restore"):
-        runtime._backup_restore(
-            {
-                "pending_restore_id": "restore_abcd1234",
-                "destination_choice": "picker_abcd1234",
-                "cancel_active": False,
-            }
-        )
-
-    assert "restore_abcd1234" in runtime._pending_restores
-    assert runtime._picker_choices["picker_abcd1234"] is picker_choice
-    assert archive.read_bytes() == b"validated"
-
-
-def test_browser_backup_inspection_returns_safe_renderable_summary(
-    tmp_path, monkeypatch
-) -> None:
-    import arxiv_digest.backup
-    from arxiv_digest.application import _DefaultRuntime
-
-    runtime = object.__new__(_DefaultRuntime)
-    runtime.paths = SimpleNamespace(cache_dir=tmp_path)
-    runtime._pending_restores_lock = threading.RLock()
-    runtime._restore_cleanup_timer = None
-    runtime._restore_shutdown = False
-    runtime._pending_restore_reservations = {}
-    runtime._pending_restores = {}
-    manifest = SimpleNamespace(
-        format_version=2,
-        application_version="0.2.0",
-        created_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
-    )
-    profile = SimpleNamespace(
-        revision=4,
-        categories=("cs.SE", "cs.LG"),
-    )
-
-    def inspect(path):
-        return SimpleNamespace(
-            path=path,
-            manifest=manifest,
-            profile=profile,
-            records=(
-                SimpleNamespace(record_type="saved_paper"),
-                SimpleNamespace(record_type="canonical_event"),
-                SimpleNamespace(record_type="canonical_event"),
-            ),
-        )
-
-    monkeypatch.setattr(arxiv_digest.backup, "inspect_backup", inspect)
-
-    result = runtime._backup_inspect({"archive": b"synthetic zip bytes"})
-
-    assert result["summary"] == {
-        "categories": 2,
-        "saved_papers": 1,
-        "review_events": 2,
-        "profile_revision": 4,
-    }
-    pending = runtime._pending_restores[result["pending_restore_id"]][1]
-    pending.path.unlink()
-
-
-def test_browser_backup_inspection_bounds_concurrent_pending_archives(
-    tmp_path, monkeypatch
-) -> None:
-    import arxiv_digest.application as application
-    import arxiv_digest.backup
-    from arxiv_digest.application import _DefaultRuntime
-
-    runtime = object.__new__(_DefaultRuntime)
-    runtime.maintenance = application.MaintenanceBarrier()
-    runtime.paths = SimpleNamespace(cache_dir=tmp_path)
-    runtime._pending_restores_lock = threading.RLock()
-    runtime._restore_cleanup_timer = None
-    runtime._restore_shutdown = False
-    runtime._pending_restore_reservations = {}
-    runtime._pending_restores = {}
-    manifest = SimpleNamespace(
-        format_version=2,
-        application_version="0.2.0",
-        created_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
-    )
-    profile = SimpleNamespace(revision=1, categories=())
-    ready = threading.Barrier(2)
-    inspected: list[object] = []
-
-    def inspect(path):
-        inspected.append(path)
-        ready.wait(timeout=2)
-        return SimpleNamespace(
-            path=path,
-            manifest=manifest,
-            profile=profile,
-            records=(),
-        )
-
-    monkeypatch.setattr(arxiv_digest.backup, "inspect_backup", inspect)
-    monkeypatch.setattr(application, "_MAX_PENDING_RESTORES", 2)
-    outcomes: list[str] = []
-
-    def submit() -> None:
-        try:
-            runtime._backup_inspect({"archive": b"validated"})
-        except ValueError as error:
-            outcomes.append(str(error))
-        else:
-            outcomes.append("accepted")
-
-    threads = [threading.Thread(target=submit) for _ in range(6)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=3)
-
-    assert all(not thread.is_alive() for thread in threads)
-    assert outcomes.count("accepted") == 2
-    assert outcomes.count("too many pending restore inspections") == 4
-    assert len(inspected) == 2
-    assert len(runtime._pending_restores) == 2
-    assert len(tuple(tmp_path.glob(".arxiv-digest-restore-*.zip"))) == 2
-    runtime._close_runtime()
-
-
-def test_browser_backup_inspection_bounds_total_pending_archive_bytes(
-    tmp_path, monkeypatch
-) -> None:
-    import arxiv_digest.application as application
-    import arxiv_digest.backup
-    from arxiv_digest.application import _DefaultRuntime
-
-    runtime = object.__new__(_DefaultRuntime)
-    runtime.maintenance = application.MaintenanceBarrier()
-    runtime.paths = SimpleNamespace(cache_dir=tmp_path)
-    runtime._pending_restores_lock = threading.RLock()
-    runtime._restore_cleanup_timer = None
-    runtime._restore_shutdown = False
-    runtime._pending_restore_reservations = {}
-    runtime._pending_restores = {}
-    manifest = SimpleNamespace(
-        format_version=2,
-        application_version="0.2.0",
-        created_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
-    )
-    profile = SimpleNamespace(revision=1, categories=())
-    monkeypatch.setattr(
-        arxiv_digest.backup,
-        "inspect_backup",
-        lambda path: SimpleNamespace(
-            path=path,
-            manifest=manifest,
-            profile=profile,
-            records=(),
-        ),
-    )
-    monkeypatch.setattr(application, "_MAX_PENDING_RESTORE_BYTES", 12)
-
-    runtime._backup_inspect({"archive": b"12345678"})
-    with __import__("pytest").raises(
-        ValueError, match="pending restore storage limit exceeded"
-    ):
-        runtime._backup_inspect({"archive": b"abcdefgh"})
-
-    assert len(runtime._pending_restores) == 1
-    assert len(tuple(tmp_path.glob(".arxiv-digest-restore-*.zip"))) == 1
-    runtime._close_runtime()
-
-
-def test_runtime_shutdown_removes_pending_backup_uploads(tmp_path) -> None:
-    from arxiv_digest.application import _DefaultRuntime
-    from arxiv_digest.maintenance import MaintenanceBarrier
-
-    archive = tmp_path / ".arxiv-digest-restore-pending.zip"
-    archive.write_bytes(b"sensitive portable backup")
-    archive.chmod(0o600)
-    timer = SimpleNamespace(cancelled=False)
-    timer.cancel = lambda: setattr(timer, "cancelled", True)
-    runtime = object.__new__(_DefaultRuntime)
-    runtime.maintenance = MaintenanceBarrier()
-    runtime._pending_restores_lock = threading.RLock()
-    runtime._restore_shutdown = False
-    runtime._pending_restore_reservations = {}
-    runtime._restore_cleanup_timer = timer
-    runtime._pending_restores = {
-        "restore_abcd1234": (
-            time.monotonic(),
-            SimpleNamespace(path=archive),
-        )
-    }
-
-    runtime._close_runtime()
-
-    assert not archive.exists()
-    assert runtime._pending_restores == {}
-    assert timer.cancelled
-
-
-def test_runtime_startup_removes_only_owned_private_restore_uploads(
-    tmp_path,
-) -> None:
-    from arxiv_digest.application import _DefaultRuntime
-
-    stale = tmp_path / ".arxiv-digest-restore-stale.zip"
-    stale.write_bytes(b"stale sensitive backup")
-    stale.chmod(0o600)
-    unsafe = tmp_path / ".arxiv-digest-restore-unsafe.zip"
-    unsafe.write_bytes(b"not owned by the private-temp contract")
-    unsafe.chmod(0o644)
-    unrelated = tmp_path / "candidate-cache.json"
-    unrelated.write_text("{}", encoding="utf-8")
-    runtime = object.__new__(_DefaultRuntime)
-    runtime.paths = SimpleNamespace(cache_dir=tmp_path)
-
-    runtime._cleanup_orphaned_restore_uploads()
-
-    assert not stale.exists()
-    assert unsafe.exists()
-    assert unrelated.exists()
 
 
 def test_interests_api_projects_bounded_current_corpus_suggestions_without_saving(
@@ -1895,11 +1636,6 @@ def test_interests_api_projects_bounded_current_corpus_suggestions_without_savin
     assert result["suggestions"]["keywords"][0]["value"] == "property testing"
     assert result["suggestions"]["phrases"][0]["value"] == "fault localization"
     assert result["suggestions"]["authors"][0]["name"] == "Beta Researcher"
-    assert all(
-        item["suggestion_id"].startswith("suggest_")
-        for field in ("seed_papers", "keywords", "phrases", "authors")
-        for item in result["suggestions"][field]
-    )
     assert calls == [
         (
             corpus,
@@ -2189,8 +1925,9 @@ def test_interests_readd_uses_fresh_coverage_not_the_retained_boundary() -> None
     assert sync_starts == [{"follow_up": True}]
 
 
+@pytest.mark.parametrize("has_previous_build", [False, True])
 def test_fresh_interests_suggestions_resume_the_current_profile_candidate_corpus(
-    monkeypatch,
+    monkeypatch, has_previous_build,
 ) -> None:
     import arxiv_digest.candidates
     from arxiv_digest.application import _DefaultRuntime
@@ -2254,7 +1991,7 @@ def test_fresh_interests_suggestions_resume_the_current_profile_candidate_corpus
     runtime._candidate_build = SimpleNamespace(
         corpus=SimpleNamespace(categories=("cs.SE",)),
         corpus_hash="b" * 64,
-    )
+    ) if has_previous_build else None
     runtime._category_values = ()
     runtime._issued_category_pairs = set()
     runtime._suggestions = {}
@@ -2278,164 +2015,6 @@ def test_fresh_interests_suggestions_resume_the_current_profile_candidate_corpus
         ("cs.LG", "cs:LG", date(2026, 8, 1)),
     ]
     assert runtime._candidate_build is rebuilt
-
-
-def test_setup_suggestions_rerank_from_every_current_draft_selection(
-    monkeypatch,
-) -> None:
-    import arxiv_digest.candidates
-    from arxiv_digest.application import _DefaultRuntime
-
-    seed = SimpleNamespace(paper=SimpleNamespace(arxiv_id="2608.00001"))
-    corpus = SimpleNamespace(
-        documents=(seed,), categories=("synthetic.alpha",)
-    )
-    accepted = {
-        "corpus_hash": "a" * 64,
-        "categories": (SimpleNamespace(category="synthetic.alpha"),),
-    }
-    drafts = iter(
-        (
-                SimpleNamespace(
-                    **accepted,
-                    seed_papers=(seed,),
-                keywords=(),
-                phrases=(),
-                authors=(),
-            ),
-                SimpleNamespace(
-                    **accepted,
-                    seed_papers=(seed,),
-                keywords=("testing",),
-                phrases=("software quality",),
-                authors=(),
-            ),
-                SimpleNamespace(
-                    **accepted,
-                    seed_papers=(seed,),
-                keywords=("testing",),
-                phrases=("software quality",),
-                authors=("Aster Vale",),
-            ),
-        )
-    )
-    calls: list[tuple[object, tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = []
-
-    def build_suggestions(value, seeds, terms, authors):
-        calls.append((value, seeds, terms, authors))
-        return object()
-
-    monkeypatch.setattr(
-        arxiv_digest.candidates, "build_suggestions", build_suggestions
-    )
-    runtime = object.__new__(_DefaultRuntime)
-    runtime._candidate_build = SimpleNamespace(
-        corpus=corpus,
-        corpus_hash="a" * 64,
-    )
-    runtime.setup = SimpleNamespace(load_draft=lambda: next(drafts))
-
-    runtime._candidate_suggestions()
-    runtime._candidate_suggestions()
-    runtime._candidate_suggestions()
-
-    assert calls == [
-        (corpus, ("2608.00001",), (), ()),
-        (
-            corpus,
-            ("2608.00001",),
-            ("testing", "software quality"),
-            (),
-        ),
-        (
-            corpus,
-            ("2608.00001",),
-            ("testing", "software quality"),
-            ("Aster Vale",),
-        ),
-    ]
-
-
-def test_setup_candidate_endpoint_hydrates_the_accepted_cache_after_restart(
-    tmp_path,
-) -> None:
-    from arxiv_digest.application import _DefaultRuntime
-    from arxiv_digest.candidates import (
-        CandidateCache,
-        CandidateCategoryShard,
-        CandidateCorpusBuilder,
-        CandidateDocument,
-        candidate_corpus_hash,
-        derive_candidate_corpus,
-    )
-    from arxiv_digest.models import PaperMetadata, PaperVersion
-
-    now = datetime(2026, 8, 22, 12, tzinfo=timezone.utc)
-    document = CandidateDocument(
-        paper=PaperMetadata(
-            arxiv_id="2608.00001",
-            title="Restart-safe candidate",
-            authors=("Aster Vale",),
-            abstract="Persisted candidate corpus evidence.",
-            primary_category="synthetic.alpha",
-            categories=("synthetic.alpha",),
-        ),
-        versions=(PaperVersion(1, now),),
-        eligible_categories=("synthetic.alpha",),
-        evidence_dates=(date(2026, 8, 22),),
-    )
-    shard = CandidateCategoryShard(
-        schema_version=1,
-        category="synthetic.alpha",
-        set_spec="synthetic:alpha",
-        window_start=date(2026, 5, 25),
-        window_end=date(2026, 8, 22),
-        created_at=now,
-        source_hashes=("a" * 64,),
-        documents=(document,),
-        completed_strata=tuple(range(18)),
-        continuation_by_stratum=(),
-        pages_fetched=18,
-        exhausted=True,
-    )
-    cache = CandidateCache(tmp_path, clock=lambda: now)
-    cache.save_shard(shard)
-    corpus = derive_candidate_corpus((shard,), categories=("synthetic.alpha",))
-    draft = SimpleNamespace(
-        revision=4,
-        categories=(
-            SimpleNamespace(
-                category="synthetic.alpha",
-                set_spec="synthetic:alpha",
-            ),
-        ),
-        coverage_start=date(2026, 7, 1),
-        corpus_hash=candidate_corpus_hash(corpus),
-        seed_papers=(),
-        keywords=(),
-        phrases=(),
-        authors=(),
-    )
-    runtime = object.__new__(_DefaultRuntime)
-    runtime.setup = SimpleNamespace(load_draft=lambda: draft)
-    runtime.candidates = CandidateCorpusBuilder(object(), cache, clock=lambda: now)
-    runtime._candidate_build = None
-    runtime._suggestions = {}
-    runtime._suggestion_ids = {}
-
-    result = runtime._candidate_papers({"q": "restart-safe", "offset": 0})
-
-    assert result["items"][0]["arxiv_id"] == "2608.00001"
-    assert result["items"][0]["suggestion_id"].startswith("suggest_")
-    assert runtime._candidate_build.corpus_hash == draft.corpus_hash
-
-    runtime._candidate_build = None
-    terms = runtime._candidate_terms({})
-    assert terms["keywords"] or terms["phrases"]
-
-    runtime._candidate_build = None
-    authors = runtime._candidate_authors({"q": "aster"})
-    assert authors["items"][0]["name"] == "Aster Vale"
 
 
 def test_runtime_projects_durable_mailing_evidence_into_candidate_documents() -> None:
@@ -2503,102 +2082,3 @@ def test_runtime_projects_durable_mailing_evidence_into_candidate_documents() ->
         date(2026, 8, 21),
     )
     assert documents[1].eligible_categories == ("cs.LG",)
-
-
-def test_update_latch_rejects_reads_mutations_and_unknown_routes_before_handlers() -> None:
-    from arxiv_digest.maintenance import MaintenanceBarrier
-    from arxiv_digest.web.api import ApiRouter
-
-    barrier = MaintenanceBarrier()
-    calls = []
-    router = ApiRouter(
-        token=TOKEN, host=HOST, maintenance=barrier,
-        handlers={
-            "settings_get": lambda payload: calls.append("settings"),
-            "backup_export": lambda payload: calls.append("backup"),
-            "library_save": lambda payload: calls.append("save"),
-        },
-        known_paper=lambda arxiv_id: calls.append("known-paper") or True,
-    )
-    requests = (
-        _request("GET", "/api/v1/settings"),
-        _request("GET", "/api/v1/backup/export"),
-        _request("GET", "/api/v1/not-a-route"),
-        _request("POST", "/api/v1/library/2501.00001/save", origin=ORIGIN),
-        _request("POST", "/api/v1/application/quit", origin=ORIGIN),
-    )
-    with barrier.update_latch():
-        for request in requests:
-            response = router.dispatch(request)
-            assert response.status == 409
-            assert _json(response)["error"]["code"] == "update_in_progress"
-        # Authority checks still take precedence over maintenance state.
-        assert router.dispatch(_request("GET", "/api/v1/settings", token=None)).status == 401
-    assert calls == []
-
-
-def test_update_latch_admission_is_rechecked_after_http_preflight() -> None:
-    from arxiv_digest.maintenance import MaintenanceBarrier
-    from arxiv_digest.web.api import ApiRouter
-
-    barrier = MaintenanceBarrier()
-    calls = []
-    router = ApiRouter(
-        token=TOKEN, host=HOST, maintenance=barrier,
-        handlers={"settings_get": lambda payload: calls.append("settings")},
-    )
-    request = _request("GET", "/api/v1/settings")
-    assert router.preflight(request) is None
-    with barrier.update_latch():
-        response = router.dispatch(request)
-        assert response.status == 409
-    assert calls == []
-
-
-def test_update_latch_allows_cached_control_and_guarded_failure_quit() -> None:
-    from arxiv_digest.maintenance import MaintenanceBarrier
-    from arxiv_digest.web.api import ApiRouter
-
-    barrier = MaintenanceBarrier()
-    allow_quit = False
-    router = ApiRouter(
-        token=TOKEN, host=HOST, maintenance=barrier,
-        allow_update_quit=lambda: allow_quit,
-        handlers={
-            "status": lambda payload: {"startup_nonce": "cached-fixture"},
-            "update": lambda payload: {"status": "preparing"},
-            "application_quit": lambda payload: {"quitting": True},
-        },
-    )
-    with barrier.update_latch():
-        with barrier.exclusive(timeout=0):
-            assert router.dispatch(_request("GET", "/api/v1/status")).status == 200
-            assert router.dispatch(_request("GET", "/api/v1/update")).status == 200
-            allow_quit = True
-            assert router.dispatch(_request("POST", "/api/v1/application/quit", origin=ORIGIN)).status == 200
-
-
-def test_update_control_routes_have_closed_bodies_canonical_ids_and_accepted_status() -> None:
-    from arxiv_digest.web.api import ApiRouter, JsonPayload
-
-    identifier = "a" * 64
-    calls = []
-    def start(payload):
-        calls.append(payload)
-        return JsonPayload(202, {"job_id": identifier, "state": "running", "phase": "downloading"})
-    router = ApiRouter(token=TOKEN, host=HOST, handlers={"update_start": start})
-    response = router.dispatch(_request("POST", "/api/v1/update/start", origin=ORIGIN,
-        body=b'{"target_version":"0.3.1"}', content_type="application/json"))
-    assert response.status == 202
-    assert _json(response)["data"]["job_id"] == identifier
-    for body in (b'{"target_version":"01.3.1"}', b'{"target_version":"0.3.1","url":"x"}'):
-        assert router.dispatch(_request("POST", "/api/v1/update/start", origin=ORIGIN,
-            body=body, content_type="application/json")).status == 400
-    assert calls == [{"target_version": "0.3.1"}]
-    for path in (f"/api/v1/update/jobs/{identifier}", f"/api/v1/update/jobs/{identifier}/commit",
-        f"/api/v1/update/jobs/{identifier}/handoff-ack", "/api/v1/update/receipt",
-        f"/api/v1/update/receipt/{identifier}/ack"):
-        method = "GET" if path.endswith(identifier) or path.endswith("receipt") else "POST"
-        assert router.dispatch(_request(method, path, origin=ORIGIN, body=b'{}' if method == "POST" else b'',
-            content_type="application/json")).status == 503
-    assert router.dispatch(_request("GET", "/api/v1/update/jobs/" + "A" * 64)).status == 404

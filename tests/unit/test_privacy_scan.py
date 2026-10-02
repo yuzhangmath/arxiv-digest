@@ -1404,7 +1404,7 @@ def test_public_documentation_uses_only_the_confirmed_generation_two_model() -> 
         "recovered daily-list membership",
         "hidden support",
         "coverage gaps",
-        "candidate corpus does not populate Review, Calendar, or Library",
+        "optional Interests sample does not populate Review, Calendar, or Library",
         "Library is independent",
         "application-data generation 2",
         "portable backup format 2",

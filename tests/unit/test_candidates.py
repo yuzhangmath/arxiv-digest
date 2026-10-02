@@ -142,16 +142,14 @@ def test_candidate_cache_round_trips_exact_shard_and_expires_after_seven_days(
     assert cache.load_shard("synthetic.alpha", "synthetic:alpha") is None
 
 
-def test_candidate_cache_hydrates_only_the_exact_persisted_corpus_hash(
+def test_candidate_cache_derives_suggestions_from_persisted_shards_after_restart(
     tmp_path,
 ) -> None:
     from arxiv_digest.candidates import (
         CandidateCache,
         CandidateCategoryShard,
-        candidate_corpus_hash,
         derive_candidate_corpus,
     )
-    from arxiv_digest.models import CategoryConfig
 
     created_at = datetime(2026, 8, 22, 12, tzinfo=timezone.utc)
     shard = CandidateCategoryShard(
@@ -173,22 +171,12 @@ def test_candidate_cache_hydrates_only_the_exact_persisted_corpus_hash(
     expected = derive_candidate_corpus(
         (shard,), categories=("synthetic.alpha",)
     )
-    configs = (
-        CategoryConfig(
-            "synthetic.alpha",
-            "synthetic:alpha",
-            date(2026, 7, 1),
-        ),
-    )
-
-    assert cache.load_accepted_corpus(
-        configs,
-        expected_hash=candidate_corpus_hash(expected),
+    restarted = CandidateCache(tmp_path, clock=lambda: created_at)
+    persisted = restarted.load_shard("synthetic.alpha", "synthetic:alpha")
+    assert persisted is not None
+    assert restarted.derive_corpus(
+        (persisted,), categories=("synthetic.alpha",),
     ) == expected
-    assert cache.load_accepted_corpus(
-        configs,
-        expected_hash="f" * 64,
-    ) is None
 
 
 def test_candidate_cache_rejects_non_integer_schema_and_oversized_payload(tmp_path) -> None:

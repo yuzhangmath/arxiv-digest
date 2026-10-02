@@ -825,10 +825,10 @@ class SyncService:
                 for category, config in config_by_category.items()
                 if config.coverage_start <= day
             )
-            if not applicable or CatchupDayStatus.PENDING in applicable:
-                global_pending.append(day)
-            elif CatchupDayStatus.FAILED in applicable:
+            if CatchupDayStatus.FAILED in applicable:
                 global_failed.append(day)
+            elif not applicable or CatchupDayStatus.PENDING in applicable:
+                global_pending.append(day)
             elif CatchupDayStatus.COMPLETE in applicable:
                 global_with_papers.append(day)
             else:

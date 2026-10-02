@@ -102,16 +102,12 @@ test("malformed fragment tokens are rejected and explicit Quit clears the tab", 
   assert.equal(browser.storage.getItem(TOKEN_STORAGE_KEY), null);
 });
 
-test("immutable view state ignores a response older than the current request", () => {
+test("navigation replaces immutable view state without retaining the old page", () => {
   const state = new ViewState("review", { page: 1 });
-  const older = state.begin("review-page");
-  const newer = state.begin("review-page");
-
-  assert.equal(state.commit(older, { page: 2 }), false);
   assert.deepEqual(state.snapshot, { view: "review", page: 1 });
-  assert.equal(state.commit(newer, { page: 3 }), true);
-  assert.deepEqual(state.snapshot, { view: "review", page: 3 });
+  state.setView("library");
+  assert.deepEqual(state.snapshot, { view: "library" });
   assert.throws(() => {
-    state.snapshot.page = 4;
+    state.snapshot.view = "review";
   }, TypeError);
 });

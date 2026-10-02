@@ -9,11 +9,12 @@ interests, identifiers, or local paths.
 - [The dashboard does not open](#the-dashboard-does-not-open)
 - [WSL cannot open the Windows browser](#wsl-cannot-open-the-windows-browser)
 - [First-run setup cannot load live data](#first-run-setup-cannot-load-live-data)
+- [Interests suggestions do not load](#interests-suggestions-do-not-load)
 - [Synchronization is offline or partial](#synchronization-is-offline-or-partial)
 - [Review or Calendar has coverage gaps](#review-or-calendar-has-coverage-gaps)
 - [PDF actions fail](#pdf-actions-fail)
 - [The launcher is missing](#the-launcher-is-missing)
-- [An update or restart did not finish](#an-update-or-restart-did-not-finish)
+- [Updating the app](#updating-the-app)
 - [A backup will not import](#a-backup-will-not-import)
 - [Clean reset with recovery copy](#clean-reset-with-recovery-copy)
 
@@ -25,21 +26,12 @@ Open a terminal and run:
 arxiv-digest doctor
 ```
 
-During ordinary startup, `doctor` reads profile and database state without
-changing it and makes no network requests. Updater preflight may initialize
-private coordination directories and lock files, including on a fresh
-installation. Ordinary diagnostics do not create a profile, database, or
-running dashboard. Their output contains versions, statuses, and aggregate counts, not
-paper titles, authors, keywords, IDs, error details, tokens, or paths. You may
-paste this redacted output into ChatGPT and describe the visible symptom. Do
-not attach the database, profile, backup, or downloaded PDFs.
-
-When update recovery is pending or blocked, `doctor` reports
-`Update recovery: pending` or `Update recovery: blocked` and exits with status
-3. It does not attempt recovery, open profile or database state, or print local
-paths. This output can also be shared. Follow
-[update recovery guidance](#an-update-or-restart-did-not-finish) to resolve the
-unfinished update separately.
+`doctor` reads profile and database state without changing it or making
+network requests. It does not create a profile, database, or running dashboard.
+Its output contains versions, statuses, and aggregate counts, not paper titles,
+authors, keywords, IDs, error details, tokens, or paths. You may paste this
+redacted output into ChatGPT and describe the visible symptom. Do not attach
+the database, profile, backup, or downloaded PDFs.
 
 ## The dashboard does not open
 
@@ -86,12 +78,21 @@ inside WSL.
 
 ## First-run setup cannot load live data
 
-First-run setup needs a live connection to arXiv to list categories and build
-the candidate sample. Keep the terminal open. If the connection was
-interrupted and no cached work is available, select **Retry corpus**; an
-incomplete candidate-building attempt offers **Resume corpus** or **Restart
-corpus**. If the same error returns after connectivity is restored, select
-**Quit**, run `arxiv-digest doctor`, and share only its redacted output.
+First-run setup needs a live connection to arXiv to list categories. Keep the
+terminal open and select **Retry** after connectivity returns. Once categories
+are available, choose coverage and a PDF folder, test it, and confirm the
+profile. Personalization is optional and available later in **Interests**.
+If the same error returns after connectivity is restored, select **Quit**, run
+`arxiv-digest doctor`, and share only its redacted output.
+
+## Interests suggestions do not load
+
+Choose **Refresh suggestions** in Interests to build or resume the optional
+90-day paper sample. This uses live arXiv data and each attempt is capped at
+five minutes. If an attempt is interrupted or the sample needs more data,
+refresh again after connectivity returns. You can keep reviewing papers and
+add custom interests without waiting for suggestions. Selections and custom
+entries change your profile only after **Update interests**.
 
 ## Synchronization is offline or partial
 
@@ -150,7 +151,9 @@ date.
 Settings shows the target, checked, with-papers, confirmed-empty, failed,
 pending, and unavailable counts per category. Retry a failed date while it is
 still in the supported recovery window. If it is outside that window, the gap
-remains visible and the queue remains incomplete.
+remains visible and the queue remains incomplete. When one category failed and
+another is pending on the same date, the overall date counts as failed in both
+Status and Settings; per-category counts retain the pending work.
 
 Missing abstracts are separate from daily-list coverage. You can read and save
 the confirmed papers and complete the date with **Finish date** or **Finish all**.
@@ -166,7 +169,7 @@ The curl fallback also applies to the OAI GetRecord requests made by **Retry
 missing abstracts**. It can help when HTTP 406 is preventing access to an
 existing abstract; it cannot supply an abstract absent from arXiv's response.
 
-The setup candidate corpus does not populate Review, Calendar, or Library.
+The optional Interests sample does not populate Review, Calendar, or Library.
 Library is independent of daily-list coverage: a saved paper stays saved when
 its category is removed, and saving a paper does not create a Review event.
 
@@ -185,65 +188,32 @@ the filesystem, or **Remove** to delete only the exact managed launcher. You
 can always reopen the app by opening a terminal and running `arxiv-digest`.
 There is no scheduled background startup.
 
-## An update or restart did not finish
+## Updating the app
 
-A manual link is expected when installing the 0.3.0 bootstrap from an older
-version, or for unsupported pipx versions or installation layouts, changed
-dependencies, and unverified local provenance. Eligible 0.3.0 installations
-can update automatically to 0.3.1 once that release is published; quit and
-relaunch the app to run a new check.
-Use the [manual upgrade instructions](installation.md#upgrade-within-application-data-generation-2).
-Do not change installation metadata to make the automatic-update check pass.
+The dashboard's update notice links to release notes and manual instructions.
+It does not install an update or restart the app. Follow the
+[manual upgrade instructions](installation.md#upgrade-within-application-data-generation-2),
+then run `arxiv-digest doctor` to verify the version. If the release check is
+inconclusive, the notice links to the public releases page so you can check
+manually. Restarting the app runs a fresh check.
 
-During normal preparation, background work finishes before the app closes. A
-safe preparation failure restores normal use; retry canceled PDF downloads and
-candidate-corpus jobs manually. **Updating and restarting** in the old tab is
-handoff guidance, not confirmation that installation succeeded. Wait for the
-new dashboard, which reports the final update or restoration result. If it does
-not appear after a few minutes, run `arxiv-digest` again.
-
-If the application reports an unresolved handoff, external installation change,
-or failed recovery, fully quit all remaining arXiv Digest processes first. Do
-not run pipx, replace an exposed executable, or delete a journal, snapshot,
-retained wheel, launcher, or lock file while recovery is unresolved. Reopening
-uses the protected recovery state and refuses to overwrite an unexpected live
-installation. Keep the private recovery data available for diagnosis.
-
-If the normal command cannot load because its installed files are incomplete,
-invoke the application-owned recovery wrapper. On macOS:
-
-```bash
-"$HOME/Library/Application Support/arxiv-digest/update-recovery/recover-arxiv-digest" --explicit-recovery
-```
-
-On Linux with the default data directory:
-
-```bash
-"$HOME/.local/share/arxiv-digest/update-recovery/recover-arxiv-digest" --explicit-recovery
-```
-
-If an absolute `XDG_DATA_HOME` was configured for this installation, use its
-`arxiv-digest/update-recovery/recover-arxiv-digest` wrapper instead. The wrapper
-accepts only no arguments for ordinary recovery or the exact
-`--explicit-recovery` flag for an explicitly requested guarded retry. Both paths
-validate the copied runtime and acquire all required locks before touching state.
-The wrapper is created by verified updater preparation; a missing wrapper is not a reason
-to construct one or edit a journal by hand. Its fixed interpreter and arguments
-come from protected local state. Follow any further explicit recovery refusal
-and keep the files intact.
-
-The updater preserves downloaded PDFs and makes a private raw copy before
-replacing data opened by a failed target. If recovery cannot be verified, it
-stops and shows recovery guidance; it does not claim that a dashboard reopened.
-Share only `doctor`'s redacted output in ordinary reports. Recovery plans,
-backups, snapshots, raw copies, and logs may contain private data and paths.
+If an older version has an unfinished automatic update, resolve it with that
+version before upgrading. Keep its recovery files, snapshots, and backups
+intact; the current app does not use or delete them. Refresh an existing
+desktop launcher after upgrading with `arxiv-digest install-launcher`.
 
 ## A backup will not import
 
+Select **Quit**, wait for the app to stop, then run
+`arxiv-digest import BACKUP.zip` in a terminal, replacing `BACKUP.zip` with your
+backup's path. Settings provides export and these restore instructions. The
+import command asks you to choose a local PDF destination and tests it.
+
 Import is inspect-first and rejects changed, oversized, encrypted, malformed,
-or path-traversing archives. A failed inspection makes no change. A failed
-restore leaves the same session usable and preserves the prior state; for a
-non-empty destination the app verifies a private pre-restore recovery backup.
+or path-traversing archives. A failed inspection makes no change. Before
+replacing existing state, the app creates and verifies a private pre-restore
+recovery backup. Archive revalidation and crash recovery preserve the restore
+safeguards described in [Inspect and import](data-and-backup.md#inspect-and-import).
 Portable backup format 2 is the only supported format; format-1 and
 generation-1 archives are rejected before local state changes.
 

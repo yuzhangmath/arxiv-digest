@@ -22,12 +22,6 @@ test("only selected suggestions and typed custom values change interests", () =>
     authors: [],
     seed_papers: [],
   });
-  const before = draft.snapshot();
-  draft.noteSearch("spectral");
-  draft.noteSuggestionViewed("suggestion_term_1");
-  draft.notePage(3);
-  assert.deepEqual(draft.snapshot(), before);
-
   draft.setSuggested("keywords", "new keyword", true);
   draft.addCustom("phrases", "custom phrase");
   draft.addCustom("authors", "Example Author");

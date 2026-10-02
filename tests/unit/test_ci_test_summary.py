@@ -51,7 +51,6 @@ def test_workflows_preserve_pytest_failure_and_only_summarize_failed_jobs() -> N
         workflow = (root / ".github/workflows" / name).read_text()
         assert "continue-on-error:" not in workflow
         for label, tests, report, suite_name in (
-            ("update-chain", "tests/integration/test_update_chain.py", "update-chain-tests.xml", "python"),
             ("Python", "tests/unit tests/integration", "python-tests.xml", "python"),
             ("browser", "tests/browser", "browser-tests.xml", "browser"),
         ):

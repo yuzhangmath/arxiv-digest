@@ -444,32 +444,6 @@ class CandidateCache:
     ) -> CandidateCorpus:
         return derive_candidate_corpus(shards, categories=categories)
 
-    def load_accepted_corpus(
-        self,
-        categories: Iterable[CategoryConfig],
-        *,
-        expected_hash: str,
-    ) -> CandidateCorpus | None:
-        """Hydrate an accepted corpus only when its persisted identity matches."""
-
-        configs = tuple(categories)
-        _validate_category_configs(configs)
-        if not isinstance(expected_hash, str) or _SHA256_RE.fullmatch(
-            expected_hash
-        ) is None:
-            raise ValueError("expected candidate corpus hash must be lowercase SHA-256")
-        shards = []
-        for config in configs:
-            shard = self.load_shard(config.category, config.oai_set_spec)
-            if shard is None:
-                return None
-            shards.append(shard)
-        corpus = derive_candidate_corpus(
-            tuple(shards),
-            categories=tuple(config.category for config in configs),
-        )
-        return corpus if candidate_corpus_hash(corpus) == expected_hash else None
-
 
 class CandidateCorpusBuilder:
     """Construct a bounded 90-day suggestion sample with resumable shards."""

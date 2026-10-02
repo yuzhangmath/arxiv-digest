@@ -11,8 +11,10 @@ import pytest
 from urllib.parse import urlsplit
 
 
+
 def _decode_token(token: str) -> bytes:
     return base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+
 
 
 def test_server_binds_ephemeral_ipv4_loopback_with_fresh_256_bit_token() -> None:
@@ -49,10 +51,11 @@ def test_server_binds_ephemeral_ipv4_loopback_with_fresh_256_bit_token() -> None
         first.stop()
 
 
+
 @pytest.mark.parametrize("method,target,authorized,expected_status", [
     ("GET", "/api/v1/status", True, 200),
     ("GET", "/api/v1/status", False, 401),
-    ("POST", "/api/v1/update/receipt/" + "c" * 64 + "/ack", True, 500),
+    ("POST", "/api/v1/sync/start", True, 500),
     ("GET", "/index.html", False, 200),
     ("GET", "/missing.html", False, 404),
 ])
@@ -61,11 +64,11 @@ def test_single_request_connections_advertise_close_before_client_reuse(
 ) -> None:
     from arxiv_digest.web.server import LoopbackServer, StaticAsset
 
-    def failed_acknowledgement(_payload):
-        raise RuntimeError("synthetic failed acknowledgement")
+    def failed_sync(_payload):
+        raise RuntimeError("synthetic failed sync")
 
     server = LoopbackServer(
-        handlers={"status": lambda _: {"state": "ready"}, "update_receipt_ack": failed_acknowledgement},
+        handlers={"status": lambda _: {"state": "ready"}, "sync_start": failed_sync},
         static_assets={"/index.html": StaticAsset(content_type="text/html", data=b"synthetic dashboard")},
     )
     server.start()
@@ -94,6 +97,7 @@ def test_single_request_connections_advertise_close_before_client_reuse(
     finally:
         connection.close()
         server.stop()
+
 
 
 @pytest.mark.parametrize("incomplete_part", ["connection", "headers", "body"])
@@ -125,6 +129,7 @@ def test_incomplete_requests_are_closed_after_the_server_deadline(
         connection.close()
     finally:
         server.stop()
+
 
 
 def test_excess_connections_do_not_spawn_unbounded_request_threads() -> None:
@@ -195,93 +200,6 @@ def test_excess_connections_do_not_spawn_unbounded_request_threads() -> None:
     assert first_errors == []
 
 
-def test_backup_admission_rejects_before_reading_an_excess_body() -> None:
-    from arxiv_digest.web.server import LoopbackServer
-
-    first_entered = Event()
-    release_first = Event()
-
-    def inspect(_payload: dict) -> dict[str, bool]:
-        first_entered.set()
-        assert release_first.wait(timeout=2)
-        return {"inspected": True}
-
-    server = LoopbackServer(
-        handlers={"backup_inspect": inspect},
-        max_pending_backup_inspections=1,
-    )
-    server.start()
-    first_errors: list[BaseException] = []
-
-    def first_request() -> None:
-        try:
-            connection = http.client.HTTPConnection(
-                server.host,
-                server.port,
-                timeout=2,
-            )
-            connection.request(
-                "POST",
-                "/api/v1/backup/inspect",
-                body=b"first",
-                headers={
-                    "Host": f"{server.host}:{server.port}",
-                    "Authorization": f"Bearer {server.token}",
-                    "Origin": f"http://{server.host}:{server.port}",
-                    "Content-Type": "application/zip",
-                },
-            )
-            response = connection.getresponse()
-            response.read()
-            connection.close()
-        except BaseException as error:  # pragma: no cover - reported below
-            first_errors.append(error)
-
-    thread = Thread(target=first_request)
-    thread.start()
-    try:
-        assert first_entered.wait(timeout=1)
-        excess = http.client.HTTPConnection(server.host, server.port, timeout=1)
-        excess.putrequest("POST", "/api/v1/backup/inspect", skip_host=True)
-        excess.putheader("Host", f"{server.host}:{server.port}")
-        excess.putheader("Authorization", f"Bearer {server.token}")
-        excess.putheader("Origin", f"http://{server.host}:{server.port}")
-        excess.putheader("Content-Type", "application/zip")
-        excess.putheader("Content-Length", "1")
-        excess.endheaders()
-
-        response = excess.getresponse()
-        response_payload = json.loads(response.read())
-        assert response.status == 429
-        assert response_payload["error"]["code"] == "backup_capacity"
-        excess.close()
-    finally:
-        release_first.set()
-        thread.join(timeout=2)
-        server.stop()
-
-    assert not thread.is_alive()
-    assert first_errors == []
-
-
-def test_backup_admission_enforces_aggregate_bytes() -> None:
-    from arxiv_digest.web.server import LoopbackServer
-
-    server = LoopbackServer(
-        handlers={},
-        max_pending_backup_inspections=2,
-        max_pending_backup_bytes=10,
-    )
-
-    assert server._reserve_backup_body(7) is True
-    assert server._reserve_backup_body(4) is False
-    assert server._reserve_backup_body(3) is True
-    server._release_backup_body(7)
-    server._release_backup_body(3)
-    assert server._reserve_backup_body(10) is True
-    server._release_backup_body(10)
-
-
 def test_slow_drip_cannot_extend_the_total_request_input_deadline() -> None:
     from arxiv_digest.web.server import LoopbackServer
 
@@ -336,6 +254,7 @@ def test_slow_drip_cannot_extend_the_total_request_input_deadline() -> None:
     assert not thread.is_alive()
 
 
+
 def test_static_allowlist_csp_and_launch_fragment_do_not_expose_token() -> None:
     from arxiv_digest.web.server import CSP, LoopbackServer, StaticAsset
 
@@ -369,6 +288,7 @@ def test_static_allowlist_csp_and_launch_fragment_do_not_expose_token() -> None:
         assert launch.fragment == f"token={server.token}&view=review"
     finally:
         server.stop()
+
 
 
 def test_server_wires_authenticated_tab_leases_and_graceful_quit() -> None:
@@ -416,6 +336,7 @@ def test_server_wires_authenticated_tab_leases_and_graceful_quit() -> None:
             raise AssertionError("lifecycle did not stop after the quit response")
     finally:
         server.stop()
+
 
 
 @pytest.mark.parametrize("method", ("TRACE", "CONNECT"))
@@ -467,6 +388,7 @@ def test_uncommon_http_methods_use_controlled_security_responses(
         server.stop()
 
 
+
 def test_malformed_http_body_metadata_gets_json_security_response() -> None:
     from arxiv_digest.web.server import LoopbackServer
 
@@ -493,6 +415,7 @@ def test_malformed_http_body_metadata_gets_json_security_response() -> None:
         assert not any(name.startswith("access-control-") for name in headers)
     finally:
         server.stop()
+
 
 
 def test_index_allows_only_one_valid_token_free_view_query() -> None:
@@ -530,6 +453,7 @@ def test_index_allows_only_one_valid_token_free_view_query() -> None:
         server.stop()
 
 
+
 def test_packaged_static_allowlist_includes_manifest_fonts_and_license() -> None:
     from arxiv_digest.application import _packaged_static_assets
 
@@ -544,6 +468,7 @@ def test_packaged_static_allowlist_includes_manifest_fonts_and_license() -> None
     assert assets["/vendor/katex/LICENSE"].content_type == (
         "text/plain; charset=utf-8"
     )
+
 
 
 def test_default_application_starts_once_from_an_unrelated_directory(
@@ -573,6 +498,7 @@ def test_default_application_starts_once_from_an_unrelated_directory(
     assert launch.fragment.endswith("&view=setup")
     assert (root / "data/state.sqlite3").is_file()
     assert not (root / "data/runtime.json").exists()
+
 
 
 def test_server_stop_waits_for_admitted_handler_completion() -> None:

@@ -84,51 +84,6 @@ function pdfDestinationSummaryDetail(document, summary) {
   return detail;
 }
 
-function frozenSnapshot(suggestions, custom) {
-  return Object.freeze({
-    suggestions: Object.freeze([...suggestions]),
-    custom: Object.freeze([...custom]),
-  });
-}
-
-export class SetupSelectionState {
-  constructor({ suggestions = [], custom = [] } = {}) {
-    this.suggestions = new Set(copiedStrings(suggestions));
-    this.custom = copiedStrings(custom);
-  }
-
-  get snapshot() {
-    return frozenSnapshot(this.suggestions, this.custom);
-  }
-
-  setSuggestion(suggestionId, checked) {
-    if (checked) this.suggestions.add(String(suggestionId));
-    else this.suggestions.delete(String(suggestionId));
-  }
-
-  setCustom(index, value) {
-    if (!Number.isInteger(index) || index < 0 || index >= this.custom.length) {
-      throw new RangeError("Unknown custom entry");
-    }
-    this.custom[index] = String(value);
-  }
-
-  addCustom(value = "") {
-    this.custom.push(String(value));
-  }
-
-  removeCustom(index) {
-    if (!Number.isInteger(index) || index < 0 || index >= this.custom.length) {
-      throw new RangeError("Unknown custom entry");
-    }
-    this.custom.splice(index, 1);
-  }
-
-  noteSearch(_query) {}
-  noteDetailsOpened(_suggestionId) {}
-  notePage(_page) {}
-}
-
 function element(document, tag, text, className = "") {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -155,8 +110,6 @@ function inputWithLabel(document, labelText, type = "text") {
 function canonicalStep(value) {
   return {
     initial_coverage: "coverage",
-    candidate_corpus: "corpus",
-    keywords_and_phrases: "terms",
     desktop_launcher: "launcher",
   }[value] ?? value;
 }
@@ -181,42 +134,10 @@ function optionLabel(source) {
   );
 }
 
-function hasOptionalSelections(options, customValues) {
-  return (
-    (Array.isArray(options) && options.some((option) => option?.checked === true)) ||
-    copiedStrings(customValues).some((value) => value.trim() !== "")
-  );
-}
-
 export function categorySetupActionLabel(count) {
   const total = Number.isInteger(count) && count > 0 ? count : 0;
   if (total === 0) return "Continue";
   return `Continue with ${total} selected ${total === 1 ? "category" : "categories"}`;
-}
-
-export function optionalSetupActionLabel(model) {
-  const step = canonicalStep(String(model?.current_step ?? model?.step ?? ""));
-  const acceptedCount = Number(model?.acceptedSelectionCounts?.[step] ?? 0);
-  if (step === "seed_papers") {
-    return acceptedCount > 0 || hasOptionalSelections(model?.paperOptions, model?.customPaperIds)
-      ? "Continue with selected seed papers"
-      : "Continue without seed papers";
-  }
-  if (step === "terms") {
-    const termOptions = [
-      ...(Array.isArray(model?.keywordOptions) ? model.keywordOptions : []),
-      ...(Array.isArray(model?.phraseOptions) ? model.phraseOptions : []),
-    ];
-    return acceptedCount > 0 || hasOptionalSelections(termOptions, model?.customTerms)
-      ? "Continue with selected terms"
-      : "Continue without terms";
-  }
-  if (step === "authors") {
-    return acceptedCount > 0 || hasOptionalSelections(model?.authorOptions, model?.customAuthors)
-      ? "Continue with selected authors"
-      : "Continue without author preferences";
-  }
-  return null;
 }
 
 export function isMathematicsCategory(source) {
@@ -325,38 +246,6 @@ function searchControl(
   return group;
 }
 
-function customEntries(document, kind, values, actions, labelText) {
-  const section = element(document, "section", undefined, "custom-entries");
-  section.append(element(document, "h3", labelText));
-  for (const [index, value] of copiedStrings(values).entries()) {
-    const row = element(document, "div", undefined, "custom-entry");
-    const { label, input } = inputWithLabel(document, `${labelText} ${index + 1}`);
-    input.value = value;
-    input.addEventListener("input", () =>
-      actions.onCustomChange?.(kind, index, input.value),
-    );
-    const remove = button(
-      document,
-      "Remove",
-      () => actions.onCustomRemove?.(kind, index),
-    );
-    remove.setAttribute(
-      "aria-label",
-      `Remove ${labelText.toLocaleLowerCase("en-US")} ${index + 1}`,
-    );
-    row.append(label, remove);
-    section.append(row);
-  }
-  const add = button(
-    document,
-    `Add ${labelText.toLocaleLowerCase("en-US")}`,
-    () => actions.onCustomAdd?.(kind),
-  );
-  add.setAttribute("data-custom-add", kind);
-  section.append(add);
-  return section;
-}
-
 export function renderSetupError(document, container, message, retry) {
   let notice = container.querySelector(".error-banner");
   if (!notice) {
@@ -379,7 +268,7 @@ export function renderSetupView(document, container, model, actions = {}) {
     element(
       document,
       "p",
-      "Only checked suggestions and custom entries become interests. Searching, opening details, navigating, and changing pages never change your profile.",
+      "Choose your categories, review history, and PDF folder. After setup, open Interests to add seed papers, terms, and authors or generate suggestions.",
       "selection-guidance",
     ),
   );
@@ -447,164 +336,6 @@ export function renderSetupView(document, container, model, actions = {}) {
       (!coverageMin || input.value >= coverageMin) &&
       (!coverageMax || input.value <= coverageMax),
     );
-  } else if (step === "corpus") {
-    const job = model?.corpusJob ?? {};
-    const working = job.status === "starting" || job.status === "running";
-    const workingMessage = job.status === "starting"
-      ? "Starting corpus generation… This can take up to five minutes."
-      : "Generating corpus… This can take up to five minutes.";
-    const defaultMessage = working
-      ? workingMessage
-      : job.failed
-        ? "Corpus generation did not complete."
-        : job.complete && job.corpus_complete === true
-          ? "Corpus ready."
-          : job.complete && job.minimum_met === true
-            ? job.can_resume
-              ? "This corpus pass finished. The required minimum is ready; resume for broader coverage or accept reduced breadth."
-              : "This corpus pass finished. The required minimum is ready; accept reduced breadth to continue or restart generation."
-            : job.complete
-              ? job.can_resume
-                ? "This corpus pass finished, but more papers are needed."
-                : "This corpus pass finished, but more papers are needed. Restart generation to try again."
-          : "arXiv Digest will gather a bounded sample of recent papers from your selected categories. It uses this sample to suggest seed papers, terms, and authors in the next steps. Candidate papers do not populate Review, Calendar, or Library.";
-    const progress = element(
-      document,
-      "p",
-      String(job.message ?? defaultMessage),
-    );
-    if (job.failed) progress.setAttribute("role", "alert");
-    view.append(progress);
-    if (working) {
-      view.setAttribute("aria-busy", "true");
-      if (job.message) {
-        view.append(
-          element(
-            document,
-            "p",
-            workingMessage,
-            "working-detail",
-          ),
-        );
-      }
-      const activity = element(document, "progress", undefined, "corpus-progress");
-      activity.setAttribute("aria-label", "Corpus generation in progress");
-      view.append(activity);
-      canContinue = false;
-    } else if (!job.complete) {
-      const startLabel = job.can_resume
-        ? "Resume corpus"
-        : job.failed
-          ? "Retry corpus"
-          : "Generate corpus";
-      view.append(
-        button(document, startLabel, () =>
-          actions.onCorpus?.(job.can_resume ? "resume" : "restart"),
-        ),
-      );
-      if (job.can_resume) {
-        view.append(button(document, "Restart corpus", () => actions.onCorpus?.("restart")));
-      }
-      canContinue = false;
-    } else {
-      if (job.corpus_complete === true) {
-        canContinue = typeof job.corpus_hash === "string";
-        continueLabel = "Use this corpus and continue";
-      } else {
-        canContinue = false;
-        if (job.can_resume) {
-          view.append(button(document, "Resume corpus", () => actions.onCorpus?.("resume")));
-        }
-        view.append(button(document, "Restart corpus", () => actions.onCorpus?.("restart")));
-        if (!job.minimum_met) {
-          view.append(
-            element(
-              document,
-              "p",
-              job.can_resume
-                ? "The candidate corpus is below the required minimum. Resume or restart generation before continuing."
-                : "The candidate corpus is below the required minimum. Restart generation before continuing.",
-              "warning",
-            ),
-          );
-        } else {
-          view.append(
-            element(
-              document,
-              "p",
-              job.can_resume
-                ? "The required minimum is available. You can resume for broader suggestions or explicitly accept this reduced breadth."
-                : "The required minimum is available. Explicitly accept this reduced breadth to continue, or restart generation.",
-              "warning",
-            ),
-          );
-          continueLabel = "Accept reduced breadth and continue";
-          canContinue = typeof job.corpus_hash === "string";
-        }
-      }
-      if (job.reduced_breadth) {
-        view.append(element(document, "p", "The bounded corpus used reduced breadth.", "warning"));
-      }
-    }
-  } else if (step === "seed_papers") {
-    view.append(
-      element(
-        document,
-        "p",
-        "Choose papers that represent what you want to read. arXiv Digest uses selected seed papers to boost textually similar papers in future reviews and tailor the term and author suggestions that follow. This step is optional. Selecting a seed paper does not populate Review, Calendar, or Library; it does not save the paper or download its PDF. You can add or change these later in Interests.",
-        "step-guidance",
-      ),
-    );
-    view.append(
-      searchControl(
-        document,
-        "seed_papers",
-        actions,
-        "Search by title, author, or arXiv ID",
-      ),
-    );
-    view.append(suggestionChecklist(document, "seed_papers", model?.paperOptions, actions));
-    view.append(customEntries(document, "paper_ids", model?.customPaperIds, actions, "Custom paper ID"));
-    continueLabel = optionalSetupActionLabel(model);
-  } else if (step === "terms") {
-    view.append(
-      element(
-        document,
-        "p",
-        "Optional. Choose or add terms that describe work you want to prioritize. You can change them later in Interests.",
-        "step-guidance",
-      ),
-    );
-    view.append(element(document, "h3", "Suggested terms"));
-    const termSuggestions = suggestionChecklist(
-      document,
-      "keywords",
-      model?.keywordOptions,
-      actions,
-    );
-    suggestionChecklist(
-      document,
-      "phrases",
-      model?.phraseOptions,
-      actions,
-      termSuggestions,
-    );
-    view.append(termSuggestions);
-    view.append(customEntries(document, "terms", model?.customTerms, actions, "Custom term"));
-    continueLabel = optionalSetupActionLabel(model);
-  } else if (step === "authors") {
-    view.append(
-      element(
-        document,
-        "p",
-        "Optional. Choose authors whose work you want to prioritize. You can add or change these later in Interests.",
-        "step-guidance",
-      ),
-    );
-    view.append(searchControl(document, "authors", actions, "Search authors"));
-    view.append(suggestionChecklist(document, "authors", model?.authorOptions, actions));
-    view.append(customEntries(document, "authors", model?.customAuthors, actions, "Custom author"));
-    continueLabel = optionalSetupActionLabel(model);
   } else if (step === "pdf_destination") {
     const selected = String(model?.destinationChoice ?? "");
     const hasSelectedFolder = /^picker_[A-Za-z0-9_-]{8,120}$/.test(selected);
@@ -715,8 +446,7 @@ export function renderSetupView(document, container, model, actions = {}) {
   }
 
   const continueButton = button(document, continueLabel, () => {
-    if (step === "corpus") actions.onCorpusAccept?.(model?.corpusJob?.corpus_hash);
-    else actions.onSubmit?.(step);
+    actions.onSubmit?.(step);
     actions.onContinue?.();
   });
   continueButton.dataset.setupContinue = "";

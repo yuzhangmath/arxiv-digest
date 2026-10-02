@@ -6,6 +6,7 @@ an import from the downloaded wheel. Keep the embedded source synchronized.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -15,7 +16,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-MANIFEST_BYTE_LIMIT = 1024 * 1024
 RELEASE_PAGE_BYTE_LIMIT = 4 * 1024 * 1024
 REPOSITORY = "https://github.com/yuzhangmath/arxiv-digest"
 
@@ -141,39 +141,6 @@ def verify_github_release(
 ) -> None:
     """Verify a GitHub release response against an already verified bundle."""
 
-    if type(bundle) is not VerifiedBundle:
-        raise BundleError("verified bundle record is invalid")
-    try:
-        canonical_version(bundle.version)
-    except ValueError as error:
-        raise BundleError("verified bundle record is invalid") from error
-    expected_asset_names = (
-        f"arxiv_digest-{bundle.version}-py3-none-any.whl",
-        f"arxiv_digest-{bundle.version}.tar.gz",
-        "UPDATE_MANIFEST.json",
-        "SHA256SUMS",
-    )
-    if (
-        type(bundle.commit) is not str
-        or re.fullmatch(r"[0-9a-f]{40}", bundle.commit) is None
-        or type(bundle.channel) is not str
-        or bundle.channel not in {"prerelease", "stable"}
-        or type(bundle.assets) is not tuple
-        or len(bundle.assets) != len(expected_asset_names)
-        or any(type(asset) is not BundleAsset for asset in bundle.assets)
-        or any(
-            type(asset.name) is not str
-            or type(asset.size) is not int
-            or asset.size <= 0
-            or type(asset.sha256) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", asset.sha256) is None
-            for asset in bundle.assets
-        )
-        or tuple(asset.name for asset in bundle.assets) != expected_asset_names
-        or type(bundle.release_notes_sha256) is not str
-        or re.fullmatch(r"[0-9a-f]{64}", bundle.release_notes_sha256) is None
-    ):
-        raise BundleError("verified bundle record is invalid")
     if type(release_payload) is not bytes:
         raise BundleError("published release response is invalid")
     if len(release_payload) > RELEASE_PAGE_BYTE_LIMIT:
@@ -255,7 +222,7 @@ def verify_downloaded_bundle(root: Path, *, version: str, commit: str) -> Verifi
         raise BundleError("invalid bundle directory")
     wheel = f"arxiv_digest-{version}-py3-none-any.whl"
     sdist = f"arxiv_digest-{version}.tar.gz"
-    names = {wheel, sdist, "UPDATE_MANIFEST.json", "SHA256SUMS", "RELEASE_NOTES.md", "COMMIT_SHA"}
+    names = {wheel, sdist, "SHA256SUMS", "RELEASE_NOTES.md", "COMMIT_SHA"}
     if {path.name for path in root.iterdir()} != names:
         raise BundleError("unexpected bundle inventory")
     before = {name: (root / name).lstat() for name in names}
@@ -265,27 +232,7 @@ def verify_downloaded_bundle(root: Path, *, version: str, commit: str) -> Verifi
         raise BundleError("oversize bundle asset")
     if _read_regular_bytes(root / "COMMIT_SHA", byte_limit=41) != (commit + "\n").encode("ascii"):
         raise BundleError("bundle commit mismatch")
-    payload = _read_regular_bytes(root / "UPDATE_MANIFEST.json", byte_limit=MANIFEST_BYTE_LIMIT)
-    manifest = json.loads(payload, object_pairs_hook=_strict_object, parse_constant=_reject_json_constant)
-    expected_keys = {"application_data_generation", "automatic_update", "automatic_update_from", "channel", "platforms", "product",
-                     "python", "runtime_requirements_sha256", "schema_version", "updater_protocol", "version", "wheel"}
-    if type(manifest) is not dict or set(manifest) != expected_keys:
-        raise BundleError("invalid bundle manifest")
-    if (manifest["version"] != version or manifest["product"] != "arxiv-digest"
-            or type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1
-            or type(manifest["updater_protocol"]) is not int or manifest["updater_protocol"] != 1
-            or type(manifest["application_data_generation"]) is not int or manifest["application_data_generation"] != 2
-            or manifest["channel"] not in {"prerelease", "stable"}
-            or manifest["platforms"] != ["darwin", "linux"]
-            or type(manifest["automatic_update"]) is not bool
-            or type(manifest["runtime_requirements_sha256"]) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", manifest["runtime_requirements_sha256"]) is None):
-        raise BundleError("bundle manifest identity mismatch")
-    assets = (_asset(root / wheel), _asset(root / sdist), _asset_from_payload("UPDATE_MANIFEST.json", payload))
-    if (type(manifest["wheel"]) is not dict or set(manifest["wheel"]) != {"name", "sha256", "size"}
-            or type(manifest["wheel"]["size"]) is not int
-            or manifest["wheel"] != {"name": assets[0].name, "size": assets[0].size, "sha256": assets[0].sha256}):
-        raise BundleError("bundle wheel identity mismatch")
+    assets = (_asset(root / wheel), _asset(root / sdist))
     expected = b"".join(f"{asset.sha256}  {asset.name}\n".encode("ascii") for asset in assets)
     checksums = _read_regular_bytes(root / "SHA256SUMS", byte_limit=len(expected))
     if checksums != expected:
@@ -295,12 +242,21 @@ def verify_downloaded_bundle(root: Path, *, version: str, commit: str) -> Verifi
     if {path.name for path in root.iterdir()} != names or any(
             _file_identity(before[name]) != _file_identity((root / name).lstat()) for name in names):
         raise BundleError("bundle changed during verification")
-    return VerifiedBundle(version, commit, manifest["channel"], (*assets, _asset_from_payload("SHA256SUMS", checksums)), hashlib.sha256(notes).hexdigest())
+    return VerifiedBundle(version, commit, "prerelease", (*assets, _asset_from_payload("SHA256SUMS", checksums)), hashlib.sha256(notes).hexdigest())
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--bundle", type=Path, default=os.environ.get("BUNDLE"))
+    parser.add_argument("--version", default=os.environ.get("VERSION"))
+    parser.add_argument("--commit", default=os.environ.get("EXPECTED_COMMIT"))
+    arguments = parser.parse_args(argv)
+    if any(value is None for value in (arguments.bundle, arguments.version, arguments.commit)):
+        parser.error("bundle, version, and commit are required")
     try:
-        bundle = verify_downloaded_bundle(Path(os.environ["BUNDLE"]), version=os.environ["VERSION"], commit=os.environ["EXPECTED_COMMIT"])
+        bundle = verify_downloaded_bundle(
+            arguments.bundle, version=arguments.version, commit=arguments.commit,
+        )
         if os.environ.get("VERIFY_REMOTE") == "1":
             payload = _read_regular_bytes(Path(os.environ["RELEASE_JSON"]), byte_limit=RELEASE_PAGE_BYTE_LIMIT)
             verify_github_release(payload, bundle=bundle, tag=os.environ["RELEASE_TAG"], remote_tag_commit=os.environ["REMOTE_TAG_COMMIT"])

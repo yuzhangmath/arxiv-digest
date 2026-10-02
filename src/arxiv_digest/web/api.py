@@ -16,7 +16,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, urlsplit
 
 from arxiv_digest.maintenance import (
-    MaintenanceBarrier, MaintenanceTimeoutError, UpdateInProgressError, WorkActiveError,
+    MaintenanceTimeoutError, WorkActiveError,
 )
 from arxiv_digest.sources.xml import parse_arxiv_id
 
@@ -25,10 +25,7 @@ JSON_BODY_LIMIT = 64 * 1024
 BACKUP_BODY_LIMIT = 64 * 1024 * 1024
 QUERY_TEXT_LIMIT = 200
 QUERY_STRING_LIMIT = 2048
-_UPDATE_CONTROL_OPERATIONS = frozenset({
-    "status", "update", "update_start", "update_job", "update_commit",
-    "update_handoff_ack", "update_receipt", "update_receipt_ack",
-})
+
 
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 Handler = Callable[[dict[str, Any]], Any]
@@ -36,8 +33,10 @@ KnownPaper = Callable[[str], bool]
 Validator = Callable[[Any], bool]
 
 
+
 class _DuplicateJsonKey(ValueError):
     pass
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +47,7 @@ class ApiRequest:
     body: bytes = b""
 
 
+
 @dataclass(frozen=True, slots=True)
 class ApiResponse:
     status: int
@@ -55,16 +55,12 @@ class ApiResponse:
     body: bytes
 
 
+
 @dataclass(frozen=True, slots=True)
 class BinaryPayload:
     data: bytes
     filename: str = "arxiv-digest-backup.zip"
 
-
-@dataclass(frozen=True, slots=True)
-class JsonPayload:
-    status: int
-    data: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,15 +72,15 @@ class ReviewPagePayload:
     latest_known_versions: Mapping[str, int] = field(default_factory=dict)
 
 
+
 @dataclass(frozen=True, slots=True)
 class SetupDraftPayload:
     """Marker for the browser-safe projection of a durable setup draft."""
 
     draft: Any
-    corpus_can_resume: bool = False
-    corpus_job: Mapping[str, Any] | None = None
     coverage_min: date | None = None
     coverage_max: date | None = None
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +88,7 @@ class RouteSpec:
     method: Literal["GET", "POST", "PUT"]
     template: str
     operation: str
-    body_kind: Literal["none", "json", "zip"] = "none"
+    body_kind: Literal["none", "json"] = "none"
     required: frozenset[str] = frozenset()
     optional: frozenset[str] = frozenset()
     validators: Mapping[str, Validator] | None = None
@@ -102,26 +98,32 @@ class RouteSpec:
     known_paper_field: str | None = None
 
 
+
 def _is_int(value: Any) -> bool:
     return type(value) is int and value >= 0
+
 
 
 def _is_positive_int(value: Any) -> bool:
     return type(value) is int and value >= 1
 
 
+
 def _is_text(value: Any) -> bool:
     return isinstance(value, str) and 0 < len(value) <= QUERY_TEXT_LIMIT
+
 
 
 def _is_optional_text(value: Any) -> bool:
     return isinstance(value, str) and len(value) <= QUERY_TEXT_LIMIT
 
 
+
 def _is_id(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(
         r"[A-Za-z0-9_-]{8,128}", value
     ) is not None
+
 
 
 def _is_iso_date(value: Any) -> bool:
@@ -133,10 +135,12 @@ def _is_iso_date(value: Any) -> bool:
         return False
 
 
+
 def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(
         r"[0-9a-f]{64}", value
     ) is not None
+
 
 
 def _is_arxiv_id(value: Any) -> bool:
@@ -149,8 +153,10 @@ def _is_arxiv_id(value: Any) -> bool:
     return base == value and version is None
 
 
+
 def _is_optional_version(value: Any) -> bool:
     return value is None or _is_positive_int(value)
+
 
 
 def _is_string_list(value: Any) -> bool:
@@ -159,6 +165,7 @@ def _is_string_list(value: Any) -> bool:
         and len(value) <= 2_000
         and all(_is_text(item) for item in value)
     )
+
 
 
 def _is_category_selections(value: Any) -> bool:
@@ -173,6 +180,7 @@ def _is_category_selections(value: Any) -> bool:
             for item in value
         )
     )
+
 
 
 def _is_category_configs(value: Any) -> bool:
@@ -190,6 +198,7 @@ def _is_category_configs(value: Any) -> bool:
     )
 
 
+
 def _is_destination_choice(value: Any) -> bool:
     return value in {"downloads", "documents"} or (
         isinstance(value, str)
@@ -197,10 +206,12 @@ def _is_destination_choice(value: Any) -> bool:
     )
 
 
+
 def _is_tested_destination_token(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(
         r"destination_[A-Za-z0-9_-]{8,112}", value
     ) is not None
+
 
 
 def _is_offset_text(value: Any) -> bool:
@@ -219,12 +230,13 @@ COMMON_SECURITY_HEADERS = {
 }
 
 
+
 def _route(
     method: Literal["GET", "POST", "PUT"],
     template: str,
     operation: str,
     *,
-    body_kind: Literal["none", "json", "zip"] = "none",
+    body_kind: Literal["none", "json"] = "none",
     required: tuple[str, ...] = (),
     optional: tuple[str, ...] = (),
     validators: Mapping[str, Validator] | None = None,
@@ -252,22 +264,9 @@ _R = _route
 _ROUTES = (
     _R("GET", "/api/v1/status", "status"),
     _R("GET", "/api/v1/update", "update"),
-    _R("POST", "/api/v1/update/start", "update_start", body_kind="json", required=("target_version",), validators={"target_version": lambda value: isinstance(value, str) and len(value) <= 64 and re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", value) is not None}),
-    _R("GET", "/api/v1/update/jobs/{job_id}", "update_job"),
-    _R("POST", "/api/v1/update/jobs/{job_id}/commit", "update_commit", body_kind="json"),
-    _R("POST", "/api/v1/update/jobs/{job_id}/handoff-ack", "update_handoff_ack", body_kind="json"),
-    _R("GET", "/api/v1/update/receipt", "update_receipt"),
-    _R("POST", "/api/v1/update/receipt/{receipt_id}/ack", "update_receipt_ack", body_kind="json"),
     _R("GET", "/api/v1/categories", "categories", query_optional=("q",), query_validators={"q": _is_optional_text}),
     _R("GET", "/api/v1/setup/draft", "setup_draft_get"),
     _R("PUT", "/api/v1/setup/draft", "setup_draft_put", body_kind="json"),
-    _R("POST", "/api/v1/setup/corpus", "setup_corpus", body_kind="json", required=("draft_revision", "mode"), validators={"draft_revision": _is_int, "mode": lambda value: value in {"resume", "restart"}}),
-    _R("POST", "/api/v1/setup/corpus/accept", "setup_corpus_accept", body_kind="json", required=("draft_revision", "corpus_hash"), validators={"draft_revision": _is_int, "corpus_hash": _is_sha256}),
-    _R("GET", "/api/v1/setup/jobs/{job_id}", "setup_job"),
-    _R("GET", "/api/v1/setup/candidates/papers", "setup_candidate_papers", query_optional=("q", "offset"), query_validators={"q": _is_optional_text, "offset": _is_offset_text}),
-    _R("GET", "/api/v1/setup/candidates/terms", "setup_candidate_terms"),
-    _R("GET", "/api/v1/setup/candidates/authors", "setup_candidate_authors", query_optional=("q",), query_validators={"q": _is_optional_text}),
-    _R("POST", "/api/v1/setup/papers/lookup", "setup_paper_lookup", body_kind="json", required=("draft_revision", "arxiv_id"), validators={"draft_revision": _is_int, "arxiv_id": _is_arxiv_id}),
     _R("POST", "/api/v1/setup/folder/pick", "setup_folder_pick", body_kind="json", required=("draft_revision",), validators={"draft_revision": _is_int}),
     _R("POST", "/api/v1/setup/folder/test", "setup_folder_test", body_kind="json", required=("draft_revision", "destination_choice"), validators={"draft_revision": _is_int, "destination_choice": _is_destination_choice}),
     _R("POST", "/api/v1/setup/complete", "setup_complete", body_kind="json", required=("draft_revision", "launcher_choice"), validators={"draft_revision": _is_int, "launcher_choice": lambda value: value in {"create", "not_now"}}),
@@ -313,18 +312,14 @@ _ROUTES = (
     _R("POST", "/api/v1/settings/launcher/not-now", "settings_launcher_not_now"),
     _R("POST", "/api/v1/settings/launcher/remove", "settings_launcher_remove"),
     _R("GET", "/api/v1/backup/export", "backup_export"),
-    _R("POST", "/api/v1/backup/inspect", "backup_inspect", body_kind="zip"),
-    _R("POST", "/api/v1/backup/restore", "backup_restore", body_kind="json", required=("pending_restore_id", "destination_choice", "cancel_active"), validators={"pending_restore_id": _is_id, "destination_choice": _is_destination_choice, "cancel_active": lambda value: type(value) is bool}),
     _R("POST", "/api/v1/application/quit", "application_quit"),
 )
 
 API_ROUTE_SURFACE = frozenset((route.method, route.template) for route in _ROUTES)
 API_OPERATIONS = frozenset(route.operation for route in _ROUTES)
 _DYNAMIC_PATTERN = re.compile(
-    r"(?P<prefix>/api/v1/(?:setup/jobs|downloads))/(?P<job_id>[A-Za-z0-9_-]{8,128})"
+    r"(?P<prefix>/api/v1/downloads)/(?P<job_id>[A-Za-z0-9_-]{8,128})"
 )
-_UPDATE_JOB_PATTERN = re.compile(r"/api/v1/update/jobs/(?P<job_id>[a-f0-9]{64})(?P<suffix>/(?:commit|handoff-ack))?")
-_UPDATE_RECEIPT_PATTERN = re.compile(r"/api/v1/update/receipt/(?P<receipt_id>[a-f0-9]{64})/ack")
 
 
 _SETUP_DRAFT_FIELDS: dict[
@@ -332,12 +327,10 @@ _SETUP_DRAFT_FIELDS: dict[
 ] = {
     "categories": (frozenset({"selections"}), {"selections": _is_category_selections}),
     "coverage": (frozenset({"coverage_start"}), {"coverage_start": _is_iso_date}),
-    "seed_papers": (frozenset({"accepted_suggestion_ids", "custom_arxiv_ids"}), {"accepted_suggestion_ids": _is_string_list, "custom_arxiv_ids": lambda values: _is_string_list(values) and all(_is_arxiv_id(value) for value in values)}),
-    "terms": (frozenset({"accepted_keyword_suggestion_ids", "accepted_phrase_suggestion_ids", "custom_keywords", "custom_phrases"}), {"accepted_keyword_suggestion_ids": _is_string_list, "accepted_phrase_suggestion_ids": _is_string_list, "custom_keywords": _is_string_list, "custom_phrases": _is_string_list}),
-    "authors": (frozenset({"accepted_suggestion_ids", "custom_authors"}), {"accepted_suggestion_ids": _is_string_list, "custom_authors": _is_string_list}),
     "pdf_destination": (frozenset({"tested_destination_token"}), {"tested_destination_token": _is_tested_destination_token}),
     "review": (frozenset({"confirmed", "profile_summary_sha256"}), {"confirmed": lambda value: value is True, "profile_summary_sha256": _is_sha256}),
 }
+
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:
@@ -346,6 +339,7 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
         (value for key, value in headers.items() if key.casefold() == folded),
         None,
     )
+
 
 
 def _review_event_label(event: Any) -> str | None:
@@ -367,12 +361,14 @@ def _review_event_label(event: Any) -> str | None:
     return None
 
 
+
 def _review_version_label(event: Any) -> str:
     if event.announced_version is None:
         return "Version not confirmed"
     if event.announced_version == 1:
         return ""
     return f"Version v{event.announced_version}"
+
 
 
 def project_review_page(payload: ReviewPagePayload) -> dict[str, JsonValue]:
@@ -461,6 +457,7 @@ def project_review_page(payload: ReviewPagePayload) -> dict[str, JsonValue]:
     }
 
 
+
 def _destination_display_path(path: Path, *, home: Path | None = None) -> str:
     """Return a read-only display path, abbreviating the current home as ~."""
 
@@ -471,6 +468,7 @@ def _destination_display_path(path: Path, *, home: Path | None = None) -> str:
     except ValueError:
         return str(destination)
     return "~" if not relative.parts else f"~/{relative.as_posix()}"
+
 
 
 def project_setup_draft(payload: SetupDraftPayload) -> dict[str, JsonValue]:
@@ -535,14 +533,6 @@ def project_setup_draft(payload: SetupDraftPayload) -> dict[str, JsonValue]:
         "coverage_min": coverage_min.isoformat(),
         "coverage_max": coverage_max.isoformat(),
         "coverage_warning": draft.coverage_warning,
-        "corpus_hash": draft.corpus_hash,
-        "corpus_categories": list(draft.corpus_categories),
-        "corpus_complete": draft.corpus_complete,
-        "corpus_reduced_breadth": draft.corpus_reduced_breadth,
-        "corpus_can_resume": payload.corpus_can_resume,
-        "corpus_job": (
-            None if payload.corpus_job is None else _jsonable(payload.corpus_job)
-        ),
         "seed_papers": [item.paper.arxiv_id for item in draft.seed_papers],
         "keywords": list(draft.keywords),
         "phrases": list(draft.phrases),
@@ -558,6 +548,7 @@ def project_setup_draft(payload: SetupDraftPayload) -> dict[str, JsonValue]:
         "created_at": draft.created_at.isoformat(),
         "updated_at": draft.updated_at.isoformat(),
     }
+
 
 
 def _jsonable(value: Any) -> JsonValue:
@@ -589,6 +580,7 @@ def _jsonable(value: Any) -> JsonValue:
     raise TypeError("domain response is not JSON serializable")
 
 
+
 def _json_response(
     status: int,
     value: JsonValue,
@@ -606,6 +598,7 @@ def _json_response(
             json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n"
         ).encode("utf-8"),
     )
+
 
 
 def _error(
@@ -626,10 +619,12 @@ def _error(
     )
 
 
+
 def error_response(status: int, code: str, message: str) -> ApiResponse:
     """Build a security-header-complete API error for HTTP framing failures."""
 
     return _error(status, code, message)
+
 
 
 def _strict_json_object(body: bytes) -> dict[str, Any]:
@@ -654,6 +649,7 @@ def _strict_json_object(body: bytes) -> dict[str, Any]:
     return value
 
 
+
 def _match_route(
     method: str,
     path: str,
@@ -661,15 +657,6 @@ def _match_route(
     path_routes = tuple(route for route in _ROUTES if route.template == path)
     dynamic = _DYNAMIC_PATTERN.fullmatch(path)
     path_values: dict[str, Any] = {}
-    update_job = _UPDATE_JOB_PATTERN.fullmatch(path)
-    update_receipt = _UPDATE_RECEIPT_PATTERN.fullmatch(path)
-    if update_job is not None:
-        template = "/api/v1/update/jobs/{job_id}" + (update_job.group("suffix") or "")
-        path_routes = tuple(route for route in _ROUTES if route.template == template)
-        path_values = {"job_id": update_job.group("job_id")}
-    elif update_receipt is not None:
-        path_routes = tuple(route for route in _ROUTES if route.operation == "update_receipt_ack")
-        path_values = {"receipt_id": update_receipt.group("receipt_id")}
     if dynamic is not None:
         template = (
             "/api/v1/setup/jobs/{job_id}"
@@ -688,17 +675,6 @@ def _match_route(
     )
 
 
-def request_body_limit(method: str, target: str) -> int:
-    """Return the maximum body size without decoding or invoking a route."""
-
-    split = urlsplit(target)
-    route, _, _ = _match_route(method, split.path)
-    return (
-        BACKUP_BODY_LIMIT
-        if route is not None and route.body_kind == "zip"
-        else JSON_BODY_LIMIT
-    )
-
 
 class ApiRouter:
     def __init__(
@@ -708,8 +684,6 @@ class ApiRouter:
         host: str,
         handlers: Mapping[str, Handler],
         known_paper: KnownPaper | None = None,
-        maintenance: MaintenanceBarrier | None = None,
-        allow_update_quit: Callable[[], bool] = lambda: False,
     ) -> None:
         if not token:
             raise ValueError("API token must not be blank")
@@ -717,15 +691,6 @@ class ApiRouter:
         self.host = host
         self.handlers = dict(handlers)
         self.known_paper = known_paper or (lambda arxiv_id: True)
-        self.maintenance = maintenance
-        self.allow_update_quit = allow_update_quit
-
-    def _allowed_during_update(self, request: ApiRequest) -> bool:
-        route, _, _ = _match_route(request.method, urlsplit(request.target).path)
-        return route is not None and (
-            route.operation in _UPDATE_CONTROL_OPERATIONS
-            or route.operation == "application_quit" and self.allow_update_quit()
-        )
 
     def preflight(self, request: ApiRequest) -> ApiResponse | None:
         """Validate request authority before an HTTP adapter reads its body."""
@@ -756,11 +721,6 @@ class ApiRouter:
                 "origin_required",
                 "Mutations require the dashboard's exact local origin.",
             )
-        if (
-            self.maintenance is not None and self.maintenance.update_active
-            and not self._allowed_during_update(request)
-        ):
-            return _error(409, "update_in_progress", "An application update is in progress.")
         return None
 
     def _decode_query(
@@ -794,7 +754,7 @@ class ApiRouter:
             return None, _error(
                 400, "invalid_request", "A query field is invalid."
             )
-        if route.operation in {"library", "setup_candidate_papers"}:
+        if route.operation == "library":
             payload.setdefault("q", "")
             payload.setdefault("offset", "0")
         if "offset" in payload:
@@ -850,7 +810,7 @@ class ApiRouter:
         request: ApiRequest,
     ) -> tuple[dict[str, Any] | None, ApiResponse | None]:
         if not request.body:
-            if route.required or route.operation in {"update_commit", "update_handoff_ack", "update_receipt_ack"}:
+            if route.required:
                 return None, _error(
                     400, "invalid_request", "A JSON body is required."
                 )
@@ -902,17 +862,6 @@ class ApiRouter:
         preflight_error = self.preflight(request)
         if preflight_error is not None:
             return preflight_error
-        if self.maintenance is None:
-            return self._dispatch_admitted(request)
-        try:
-            with self.maintenance.handler(
-                allow_during_update=self._allowed_during_update(request),
-            ):
-                return self._dispatch_admitted(request)
-        except UpdateInProgressError:
-            return _error(409, "update_in_progress", "An application update is in progress.")
-
-    def _dispatch_admitted(self, request: ApiRequest) -> ApiResponse:
         split = urlsplit(request.target)
         path = split.path
         route, path_values, allowed = _match_route(request.method, path)
@@ -927,10 +876,7 @@ class ApiRouter:
             return _error(
                 404, "route_not_found", "The API route does not exist."
             )
-        body_limit = (
-            BACKUP_BODY_LIMIT if route.body_kind == "zip" else JSON_BODY_LIMIT
-        )
-        if len(request.body) > body_limit:
+        if len(request.body) > JSON_BODY_LIMIT:
             return _error(
                 413,
                 "body_too_large",
@@ -949,24 +895,6 @@ class ApiRouter:
                 return body_error
             assert body_payload is not None
             payload.update(body_payload)
-        elif route.body_kind == "zip":
-            media_type = (
-                (_header(request.headers, "Content-Type") or "")
-                .split(";", 1)[0]
-                .strip()
-                .casefold()
-            )
-            if media_type != "application/zip":
-                return _error(
-                    415,
-                    "unsupported_media_type",
-                    "This route requires application/zip.",
-                )
-            if not request.body:
-                return _error(
-                    400, "invalid_request", "A backup archive is required."
-                )
-            payload["archive"] = request.body
         if (
             route.known_paper_field is not None
             and not self.known_paper(payload[route.known_paper_field])
@@ -1005,21 +933,14 @@ class ApiRouter:
                     },
                     result.data,
                 )
-            response_status = 200
-            if isinstance(result, JsonPayload):
-                if result.status not in {200, 202}:
-                    raise ValueError("invalid JSON success response status")
-                response_status, result = result.status, result.data
             return _json_response(
-                response_status,
+                200,
                 {
                     "api_version": "v1",
                     "ok": True,
                     "data": _jsonable(result),
                 },
             )
-        except UpdateInProgressError:
-            return _error(409, "update_in_progress", "An application update is in progress.")
         except WorkActiveError:
             return _error(
                 409,
@@ -1046,9 +967,8 @@ class ApiRouter:
                 and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", code)
                 else "domain_error"
             )
-            from arxiv_digest.update_coordinator import UpdateRequestError
             return _error(
-                409 if isinstance(error, UpdateRequestError) else 400,
+                400,
                 safe_code,
                 (
                     str(error)

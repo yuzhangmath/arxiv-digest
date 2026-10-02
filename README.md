@@ -5,8 +5,12 @@ and Linux, keeps its durable state on your computer, and opens a loopback-only
 dashboard in your browser. There is no cloud account, telemetry, or API key.
 It is an independent project and is not affiliated with or endorsed by arXiv.
 
-This guide covers version 0.3.1. The `@v0.3.1` commands below require that tag on the
-[releases page](https://github.com/yuzhangmath/arxiv-digest/releases).
+This guide describes the current unreleased checkout, including its shorter
+setup, manual updates, and terminal backup restore. The `@v0.3.1` commands
+below install the published release; follow the
+[v0.3.1 guide](https://github.com/yuzhangmath/arxiv-digest/blob/v0.3.1/README.md)
+for that release's workflow. See the [Unreleased changes](CHANGELOG.md#unreleased)
+for changes since that tag.
 Already using an earlier version? Follow the
 [upgrade guide](docs/installation.md#upgrade-within-application-data-generation-2)
 to back up, replace the program, and verify your saved state.
@@ -30,7 +34,7 @@ arxiv-digest init
 - [Daily use](#daily-use)
 - [Useful commands](#useful-commands)
 - [Privacy and local data](#privacy-and-local-data)
-- [Updates and recovery](#updates-and-recovery)
+- [Updates](#updates)
 - [Maintenance and troubleshooting](#maintenance-and-troubleshooting)
 - [Documentation](#documentation)
 - [License](#license)
@@ -175,28 +179,27 @@ The command starts a local server and opens the dashboard in your browser.
 Keep the terminal process running while you use the dashboard. Setup guides
 you through these choices:
 
-1. Choose one or more arXiv categories.
+1. Choose one or more arXiv categories. Loading the category list requires
+   internet access to arXiv.
 2. Choose the start of confirmed historical daily-list coverage. The
    recommended starting point is 30 days ago.
-3. Let the app build a bounded 90-day candidate sample from live arXiv data.
-   This requires internet access. Each candidate-building attempt is capped at
-   five minutes; if more data is needed or the connection is interrupted, the
-   dashboard offers **Resume corpus** or **Restart corpus**.
-4. Review candidate papers and optionally choose seed papers, terms, and
-   authors. The **Terms** step presents multiword **Suggested terms** and one
-   **Custom term** control. A one-word custom term is saved as a keyword; a
-   custom term of 2–12 words is saved as a phrase. Setup and Interests present
-   both together as terms while preserving that classification. Only
-   checked suggestions and nonblank entries you explicitly type become
-   interests; searching, navigating, and paging do not select anything.
-5. Choose and test a PDF folder.
-6. Review the summary and confirm the profile.
-7. Choose whether to create the optional desktop launcher. **Not now** is a
+3. Choose and test a PDF folder.
+4. Review the summary and confirm the profile.
+5. Choose whether to create the optional desktop launcher. **Not now** is a
    complete and supported choice.
 
-The candidate corpus does not populate Review, Calendar, or Library. Selecting
-a seed paper affects ranking preferences but does not save it. A paper enters
-Library only when you explicitly save it.
+After setup, open **Interests** to optionally add seed papers, terms, and
+authors. **Refresh suggestions** builds or resumes a bounded 90-day paper
+sample using live arXiv data; each attempt is capped at five minutes. You can
+start reviewing without generating suggestions. A one-word custom term is
+saved as a keyword; a custom term of 2–12 words is saved as a phrase. Interests
+presents both together as **Terms**. Only explicit selections and nonblank
+custom entries become preferences when you choose **Update interests**;
+searching, navigating, and refreshing suggestions do not change your profile.
+
+The optional Interests sample does not populate Review, Calendar, or Library.
+Selecting a seed paper affects ranking preferences but does not save it. A
+paper enters Library only when you explicitly save it.
 
 Downloaded PDFs stay in the selected folder and are not included in portable
 backups.
@@ -257,6 +260,8 @@ category's coverage gap. Settings shows the coverage gaps and retry
 controls; unrecovered papers stay out of Review and Calendar. Coverage
 progress distinguishes checked dates with papers, confirmed empty dates,
 pending dates, retryable failures, and dates that are no longer available.
+If one category failed and another is still pending on the same date, the
+overall date counts as failed; per-category counts retain both states.
 
 Settings offers a retry for each failed category/date, so you can test one daily
 list before retrying the remaining gaps. For a plain HTTP 406, daily-list requests,
@@ -305,7 +310,7 @@ when complete.
 | `arxiv-digest init` | Start first-run setup, or open Interests after setup |
 | `arxiv-digest library` | Open the Library directly |
 | `arxiv-digest config` | Open Settings directly |
-| `arxiv-digest doctor` | Print [read-only, redacted diagnostics](docs/troubleshooting.md#run-redacted-diagnostics), including pending recovery status |
+| `arxiv-digest doctor` | Print [read-only, redacted diagnostics](docs/troubleshooting.md#run-redacted-diagnostics), without changing local state |
 | `arxiv-digest export BACKUP.zip` | Export a portable backup to a new file |
 | `arxiv-digest import BACKUP.zip` | Inspect and import a portable backup |
 | `arxiv-digest install-launcher` | Create or recreate the optional desktop launcher |
@@ -328,11 +333,11 @@ remain in the platform data directories described in
 
 When a dashboard process starts, the app checks GitHub's public releases API
 in the background within a sixty-second deadline. It may read multiple release
-list pages and release manifests to compare versions and compatibility. It
-sends no interests or library data. A compatible release offers **Update and restart** after installation eligibility
-is verified. Other releases retain an update-instructions link; an inconclusive
-check offers the public releases page so you can check manually. GitHub receives ordinary connection details and a User-Agent
-containing the installed version.
+list pages to compare versions. A newer release offers a link to its release
+notes and manual update instructions; an inconclusive check offers the public
+releases page. The app does not download or install updates. The check sends no
+interests or Library data. GitHub receives ordinary connection details and a
+User-Agent containing the installed version.
 
 The app also makes outbound HTTPS requests to arXiv services. Candidate
 building and synchronization disclose the selected arXiv categories and
@@ -356,52 +361,38 @@ from application-data generation 1 are rejected without modification; they
 are not converted or imported. Generation-2 data from 0.2.0, 0.2.1, and 0.3.0 remains
 compatible.
 
-`arxiv-digest doctor` prints read-only, redacted diagnostics. If update recovery
-is pending or blocked, it reports that status without attempting recovery,
-opening application data, or printing local paths. See
+`arxiv-digest doctor` prints read-only, redacted diagnostics without changing
+local state or making network requests. See
 [Run redacted diagnostics](docs/troubleshooting.md#run-redacted-diagnostics).
-You can share its redacted output when asking for troubleshooting help, but do not share your
-database, profile, backup, downloaded PDFs, or a dashboard URL containing a
-session token.
+You can share its redacted output when asking for troubleshooting help, but do
+not share your database, profile, backup, downloaded PDFs, or a dashboard URL
+containing a session token.
 
-## Updates and recovery
+## Updates
 
-Version 0.3.1 offers **Update and restart** to eligible 0.3.0 installations
-after its GitHub release is published. Version 0.3.0 introduced the manual
-bootstrap for one-click updates. Upgrade 0.2.0 or 0.2.1 using the
-[manual installation instructions](docs/installation.md#upgrade-within-application-data-generation-2).
-These upgrades keep application-data generation 2 and your existing profile,
-Library, review progress, and downloaded PDFs.
-
-For a compatible release, **Update and restart** downloads and verifies
-the release wheel, saves the complete installed environment and a private data
-backup, finishes background work, then reopens the dashboard. One click starts
-the whole process. Wait for the new tab before closing the old one; the new tab
-reports whether the update succeeded or the previous version was restored.
-Canceled PDF or candidate-corpus jobs require manual retry. Ordinary bounded
-synchronization resumes after safe preparation failure.
-
-Automatic updates initially support only verified macOS/Linux installations
-using pipx 1.16.7 with its `pip` backend, the retained interpreter, no suffix,
-injected packages, or system-site packages, and unchanged dependencies. Setup
-must be complete. The source must be the documented canonical tag or a previous
-verified updater installation. Other layouts and dependency-changing releases
-remain manual. See [automatic-update eligibility](docs/installation.md#automatic-updates).
-
-If no new tab appears after a few minutes, launch arXiv Digest again. If it asks
-you to fully quit or reports an unresolved recovery, follow the
-[update recovery instructions](docs/troubleshooting.md#an-update-or-restart-did-not-finish).
+Updates are installed manually. The dashboard links to new releases when they
+are available. Quit the app, export a private backup, then follow the
+[manual upgrade instructions](docs/installation.md#upgrade-within-application-data-generation-2).
+Generation-2 upgrades keep your existing profile, Library, review progress,
+and downloaded PDFs. If you use the optional desktop launcher, refresh it
+after upgrading with `arxiv-digest install-launcher`.
 
 ## Maintenance and troubleshooting
 
-To upgrade an existing version-0.2.0 or version-0.2.1 installation, first quit the app and make
+To upgrade an existing generation-2 installation, first quit the app and make
 a current private backup if its local state matters. Then follow the
 [routine generation-2 upgrade](docs/installation.md#upgrade-within-application-data-generation-2).
 The upgrade replaces the pipx-managed program without resetting the profile,
 database, or downloaded PDFs.
 
 Generation-2 backups contain interests and Library state, so keep them
-private. Export refuses to overwrite an existing file. Cache deletion is safe:
+private. Settings offers **Export backup**. To restore, select **Quit**, wait
+for the app to stop, then run `arxiv-digest import BACKUP.zip` in a terminal.
+The command validates the archive, asks for a PDF folder, and creates a
+verified recovery backup before replacing existing state. See
+[Inspect and import](docs/data-and-backup.md#inspect-and-import).
+
+Export refuses to overwrite an existing file. Cache deletion is safe:
 it does not erase the profile, synchronization checkpoints, review progress,
 or saved Library. Moving from an earlier data generation requires the documented
 **Clean reset with recovery copy**; do not import the old database, profile, or
@@ -419,7 +410,7 @@ PDF, launcher, backup, and recovery guidance.
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
-- [v0.3.1 review and Library notes](docs/releases/v0.3.1.md)
+- [v0.3.1 release notes](docs/releases/v0.3.1.md)
 - [v0.3.0 update-bootstrap notes](docs/releases/v0.3.0.md)
 - [v0.2.1 technical-beta notes](docs/releases/v0.2.1.md)
 

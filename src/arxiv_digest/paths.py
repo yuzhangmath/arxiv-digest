@@ -6,23 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from arxiv_digest.atomic import (
-    ensure_private_directory,
-    ensure_private_directory_strict,
-    ensure_private_lock_file,
-)
-from arxiv_digest.update_contract import (
-    LAUNCHER_OPERATION_LOCK_FILENAME,
-    RECOVERY_WRAPPER_FILENAME,
-    TRANSITION_LOCK_FILENAME,
-    UPDATE_DIAGNOSTIC_LOG_FILENAME,
-    UPDATE_JOURNAL_FILENAME,
-    UPDATE_JOURNAL_LOCK_FILENAME,
-    UPDATE_PLAN_FILENAME,
-    UPDATE_PROVENANCE_FILENAME,
-    UPDATE_RECOVERY_DIRNAME,
-    UPDATE_RUNTIME_DIRNAME,
-)
+from arxiv_digest.atomic import ensure_private_directory
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,16 +22,7 @@ class AppPaths:
     process_lock_path: Path
     profile_lock_path: Path
     restore_journal_path: Path
-    update_recovery_dir: Path
-    update_transition_lock_path: Path
     launcher_operation_lock_path: Path
-    update_journal_lock_path: Path
-    update_plan_path: Path
-    update_journal_path: Path
-    update_provenance_path: Path
-    update_diagnostic_log_path: Path
-    recovery_wrapper_path: Path
-    update_runtime_dir: Path
 
     def ensure(self) -> None:
         for path in (
@@ -57,23 +33,9 @@ class AppPaths:
         ):
             ensure_private_directory(path)
 
-    def ensure_update_coordination(self) -> None:
-        for path in (
-            self.data_dir,
-            self.update_recovery_dir,
-            self.update_runtime_dir,
-        ):
-            ensure_private_directory_strict(path)
-        for path in (
-            self.update_transition_lock_path,
-            self.launcher_operation_lock_path,
-            self.update_journal_lock_path,
-        ):
-            ensure_private_lock_file(path)
 
 
 def _resolved_app_paths(*, config: Path, data: Path, cache: Path) -> AppPaths:
-    recovery = data / UPDATE_RECOVERY_DIRNAME
     return AppPaths(
         config_dir=config,
         data_dir=data,
@@ -85,17 +47,9 @@ def _resolved_app_paths(*, config: Path, data: Path, cache: Path) -> AppPaths:
         process_lock_path=data / "runtime.lock",
         profile_lock_path=config / "profile.lock",
         restore_journal_path=config / "restore-journal.json",
-        update_recovery_dir=recovery,
-        update_transition_lock_path=recovery / TRANSITION_LOCK_FILENAME,
-        launcher_operation_lock_path=recovery / LAUNCHER_OPERATION_LOCK_FILENAME,
-        update_journal_lock_path=recovery / UPDATE_JOURNAL_LOCK_FILENAME,
-        update_plan_path=recovery / UPDATE_PLAN_FILENAME,
-        update_journal_path=recovery / UPDATE_JOURNAL_FILENAME,
-        update_provenance_path=recovery / UPDATE_PROVENANCE_FILENAME,
-        update_diagnostic_log_path=recovery / UPDATE_DIAGNOSTIC_LOG_FILENAME,
-        recovery_wrapper_path=recovery / RECOVERY_WRAPPER_FILENAME,
-        update_runtime_dir=recovery / UPDATE_RUNTIME_DIRNAME,
+        launcher_operation_lock_path=data / "launcher-operation.lock",
     )
+
 
 
 def resolve_paths(

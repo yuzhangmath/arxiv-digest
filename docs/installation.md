@@ -10,16 +10,18 @@ macOS or Linux.
 - [Install pipx on Linux](#install-pipx-on-linux)
 - [Install arXiv Digest](#install-arxiv-digest)
 - [Upgrade within application-data generation 2](#upgrade-within-application-data-generation-2)
-- [Automatic updates](#automatic-updates)
 - [Complete first-run setup](#complete-first-run-setup)
 - [Use the app](#use-the-app)
 - [Clean reset with recovery copy](#clean-reset-with-recovery-copy)
 - [Uninstall](#uninstall)
 - [HTTPS and maintainer SSH](#https-and-maintainer-ssh)
 
-This guide covers version 0.3.1.
-The tagged commands require a published `v0.3.1` release. Existing users
-should start with [the upgrade instructions](#upgrade-within-application-data-generation-2).
+The tagged commands in this guide install published `v0.3.1`. The setup and
+maintenance descriptions reflect the current unreleased checkout; use the
+[v0.3.1 installation guide](https://github.com/yuzhangmath/arxiv-digest/blob/v0.3.1/docs/installation.md)
+for that release's workflow. See the [Unreleased changes](../CHANGELOG.md#unreleased)
+for changes since that tag. Existing users should start with
+[the upgrade instructions](#upgrade-within-application-data-generation-2).
 
 ## Requirements
 
@@ -109,9 +111,8 @@ documents VCS URLs as supported package specifications.
 ## Upgrade within application-data generation 2
 
 Version 0.3.1 uses the same application-data generation, profile schema, and
-portable backup format as versions 0.2.0, 0.2.1, and 0.3.0. Eligible 0.3.0
-installations can use **Update and restart**; older clients require a manual
-upgrade.
+portable backup format as versions 0.2.0, 0.2.1, and 0.3.0. Follow the manual
+upgrade steps below to replace the program while keeping your saved state.
 
 Confirm that `v0.3.1` appears on the
 [releases page](https://github.com/yuzhangmath/arxiv-digest/releases) before
@@ -128,14 +129,13 @@ pipx list
 
 | Existing installation | Upgrade route |
 | --- | --- |
-| 0.3.0 with **Update and restart** in the dashboard | Follow [Automatic updates](#automatic-updates) |
-| 0.2.0, 0.2.1, or 0.3.0 requiring manual update, listed as `arxiv-digest` in `pipx list` | Follow the steps below, including installations originally made from a downloaded wheel or source folder |
-| 0.2.0, 0.2.1, or 0.3.0 installed with `pip` in a virtual environment | Follow the virtual-environment instructions below |
+| Generation-2 installation listed as `arxiv-digest` in `pipx list` | Follow the steps below, including installations originally made from a downloaded wheel or source folder |
+| Generation-2 installation with `pip` in a virtual environment | Follow the virtual-environment instructions below |
 | 0.1.x or an application reporting an incompatible data generation | Use [Clean reset with recovery copy](#clean-reset-with-recovery-copy); generation-1 data cannot be migrated or imported |
 
-If a diagnostic reports unfinished update recovery, complete the
-[recovery procedure](troubleshooting.md#an-update-or-restart-did-not-finish)
-before replacing the program. If you are unsure which copy is running, use
+If an older version has an unfinished automatic update, resolve it with that
+version before replacing the program; keep its private recovery files intact.
+If you are unsure which copy is running, use
 `command -v arxiv-digest` and compare it with `pipx list` or your virtual
 environment's executable.
 
@@ -185,8 +185,7 @@ environment's executable.
    arxiv-digest install-launcher
    ```
 
-   Then launch it once to verify it opens the updated app. This installs the
-   recovery-aware launcher used by future automatic updates. If the app reports
+   Then launch it once to verify it opens the updated app. If the app reports
    that the launcher was changed outside arXiv Digest, follow its guidance.
 
 This replaces the pipx-managed program while leaving the generation-2 profile,
@@ -212,45 +211,10 @@ that environment's `arxiv-digest` first. Then, using that same environment
 Replace `.venv` with your environment's path and run without a source-tree
 `PYTHONPATH` override. This also replaces an editable installation with the
 tagged package; keep any local source changes separately. Verify the version
-and saved state as above. Custom environments remain manual-update
-installations. Contributor setup is documented in
+and saved state as above. Contributor setup is documented in
 [CONTRIBUTING](../CONTRIBUTING.md#development-setup).
 
-## Automatic updates
 
-Version 0.3.0 introduced the manual bootstrap. The 0.3.1 release enables
-**Update and restart** from eligible 0.3.0 installations. After publication,
-quit and relaunch the app to check for the new release. This requires macOS or
-Linux, pipx exactly 1.16.7 using its `pip`
-backend, an unsuffixed per-user `arxiv-digest` environment, its original Python
-interpreter, no injected or system-site packages, and completed setup. The
-release must preserve the running Python policy, updater protocol,
-application-data generation, and normalized runtime dependencies.
-
-A documented canonical-tag installation is eligible for verification. After an
-automatic install, a protected local provenance record and its retained wheel
-establish the installed source for the next update. Arbitrary local wheels,
-editable installs, custom environments, unsupported pipx versions, and missing
-or changed provenance stay manual. A missing current wheel disables automatic
-updating without preventing an otherwise healthy application from starting.
-
-The updater downloads from the canonical GitHub release, checks the wheel
-against its manifest, snapshots the complete environment, and creates a private
-portable data backup before shutdown. Installation is offline and preserves the
-interpreter and every nonapplication distribution. Package recovery restores
-the verified snapshot; it does not reinstall an old wheel or fetch rollback
-packages. Downloaded PDFs remain in place.
-
-A managed recovery-aware desktop launcher reopens recovery before the normal
-application when needed. Updating preserves the absence of a launcher and does
-not overwrite a launcher that changed outside the application. Ordinary **Quit**
-and update restart are separate actions. While an update is finishing, wait for
-its outcome or follow explicit fully-quit guidance.
-
-The new dashboard reports the final result. If preparation safely fails, retry
-from the current dashboard; canceled PDF and corpus jobs require manual retry.
-If restart or recovery remains unresolved, follow the
-[fixed recovery command](troubleshooting.md#an-update-or-restart-did-not-finish).
 
 ## Complete first-run setup
 
@@ -261,28 +225,30 @@ arxiv-digest init
 ```
 
 The command keeps running while the local dashboard is open. Leave the
-terminal open during setup. Listing categories and building the candidate
-sample require a live connection to arXiv. Each candidate-building attempt is
-capped at five minutes; an incomplete attempt offers **Resume corpus** or
-**Restart corpus**.
+terminal open during setup. Loading the category list requires a live
+connection to arXiv. Choose categories, the start of daily-list coverage, and
+a PDF folder; test the folder, review the summary, and confirm your profile.
+Then choose whether to create the optional desktop launcher. **Not now** is
+a complete choice.
+
+The app opens Review and starts synchronization. Personalization is optional:
+open **Interests** to add seed papers, terms, or authors. **Refresh suggestions**
+builds or resumes a bounded 90-day paper sample from arXiv, with each attempt
+capped at five minutes. A one-word custom term is saved as a keyword; a custom
+term of 2–12 words is saved as a phrase. Both appear under **Terms**. Changes
+take effect only after **Update interests**. Search, navigation, and refreshing
+suggestions do not select anything or change the profile.
+
 When finished, select **Quit** and wait for the terminal prompt to return.
 Closing only the browser tab normally leaves the process running for about 3
 minutes and may take up to about 4.5 minutes when the browser cannot deliver
-its disconnect notice. The dashboard guides you through categories, initial
-history, candidate papers, optional seed papers, terms and authors, a
-picker-selected PDF folder, profile review, and the optional desktop launcher.
-The **Terms** step presents multiword **Suggested terms** and one **Custom
-term** control. A one-word custom term is saved as a keyword; a custom term of
-2–12 words is saved as a phrase. Setup and Interests present both together as
-terms while preserving that classification. Only checked suggestions and
-nonblank custom entries become preferences. Search, navigation, and paging do
-not select anything.
+its disconnect notice.
 
 The history choice controls recovered daily-list membership. Review and
 Calendar remain empty for a category/date until that daily list is recovered.
 Atom and OAI provide hidden support for metadata and version resolution but do
-not create visible review dates. The candidate corpus does not populate Review,
-Calendar, or Library, and selecting a seed does not save it. Failed recovery
+not create visible review dates. The optional Interests sample does not populate
+Review, Calendar, or Library, and selecting a seed does not save it. Failed recovery
 leaves coverage gaps; Settings shows per-category progress and retryable dates.
 Library is independent of that coverage, so removing a category does not
 remove papers you saved explicitly.
@@ -326,7 +292,7 @@ changing it. Use this exact flow when moving from the earlier generation:
 
 The private timestamped recovery location is rollback-only and is not imported
 by generation 2. Do not place the recovery copy back into the new active data
-directories and do not select an old portable backup during setup.
+directories and do not import an old portable backup.
 
 ## Uninstall
 

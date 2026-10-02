@@ -9,7 +9,7 @@ URLs as sensitive.
 - [Supported version](#supported-version)
 - [Report a vulnerability privately](#report-a-vulnerability-privately)
 - [Non-sensitive problems](#non-sensitive-problems)
-- [Update trust and recovery](#update-trust-and-recovery)
+- [Release trust](#release-trust)
 - [Scope and expectations](#scope-and-expectations)
 
 ## Supported version
@@ -35,32 +35,16 @@ synthetic values whenever possible.
 
 Ordinary bugs with no security or privacy impact may use the public issue
 tracker. Open a terminal, run `arxiv-digest doctor`, and attach only its
-redacted output. An unfinished update produces a pending or blocked recovery
-status without attempting recovery or exposing local paths. See
+redacted output. See
 [Run redacted diagnostics](docs/troubleshooting.md#run-redacted-diagnostics).
 
-## Update trust and recovery
+## Release trust
 
-Automatic updating trusts the canonical GitHub repository and its release
-assets. Release manifests bind wheel names, versions, sizes, and SHA-256
-hashes; HTTPS and repository access controls remain part of the trust boundary.
-Checksums do not establish an independent publisher signature.
-
-The updater supports a narrow verified pipx configuration and never accepts
-commands, filesystem paths, hashes, or download URLs from browser update
-requests. Private plans, provenance, journals, snapshots, backups, copied
-recovery programs, and logs are sensitive local state. Terminal receipts live
-only in the atomic journal. The coordinator, helper, installer guard, and
-quarantined child use authenticated bounded control messages and explicit lock
-ownership; a borrowed lock descriptor must close without unlocking another
-owner's reference.
-
-Useful updater reports include eligibility bypass, wheel or plan replacement,
-unsafe snapshot replay, premature launcher or lock release, state-machine
-confusion, unauthorized internal startup, data-recovery overwrite, and leaked
-private diagnostics. Use synthetic environments and stop before changing a
-real personal installation. A malformed or ambiguous recovery journal must
-refuse normal startup rather than authorize a guessed recovery.
+Install updates manually from the canonical GitHub repository. The passive
+release check only offers a link; it does not accept or execute installation
+commands. Published checksums detect changed release artifacts, but do not
+establish an independent publisher signature. HTTPS and repository access
+controls remain part of the trust boundary.
 
 ## Scope and expectations
 

@@ -13,11 +13,8 @@ import pytest
 
 from arxiv_digest.candidates import (
     CandidateCorpus,
-    CandidateCorpusBuild,
-    CandidateCorpusDiagnostics,
     CandidateDocument,
     build_suggestions,
-    candidate_corpus_hash,
     search_candidate_papers,
 )
 from arxiv_digest.desktop_launcher import (
@@ -179,28 +176,8 @@ def _complete_setup(
     draft = service.set_initial_coverage(
         draft.revision,
         coverage_start,
-        earliest_datestamp=date(2007, 1, 1),
-    )
-    corpus_hash = candidate_corpus_hash(corpus)
-    build = CandidateCorpusBuild(
-        corpus,
-        CandidateCorpusDiagnostics(
-            complete=True,
-            reduced_breadth=False,
-            setup_ready=True,
-            minimum_met=True,
-            pages_fetched=54,
-            progress=(),
-            corpus_hash=corpus_hash,
-            can_resume=False,
-        ),
-    )
-    draft = service.accept_candidate_corpus(
-        draft.revision,
-        build,
-        corpus_hash=corpus_hash,
-    )
 
+    )
     suggestions = build_suggestions(
         corpus,
         (corpus.documents[0].paper.arxiv_id,),
@@ -216,17 +193,6 @@ def _complete_setup(
 
     explicit = _fixture()["explicit_profile"]
     assert isinstance(explicit, dict)
-    draft = service.select_seed_papers(draft.revision, (corpus.documents[0],))
-    draft = service.select_terms(
-        draft.revision,
-        keywords=(str(explicit["custom_keyword"]),),
-        phrases=(recurring_phrase, str(explicit["custom_phrase"])),
-    )
-    draft = service.select_authors(
-        draft.revision,
-        (recurring_author, str(explicit["custom_author"])),
-    )
-
     folders = FolderService(platform="linux", home=root / "home")
     downloads_choice = folders.standard_choices()[0]
     destination = folders.validate(downloads_choice)
@@ -243,6 +209,21 @@ def _complete_setup(
     profile = service.complete(
         draft.revision,
         launcher_choice=launcher_choice,  # type: ignore[arg-type]
+    )
+    assert profile.seed_papers == profile.keywords == profile.phrases == profile.authors == ()
+    # Personalization is an explicit Interests publication after setup completes.
+    from dataclasses import replace
+    profile = replace(
+        profile, revision=profile.revision + 1,
+        seed_papers=(corpus.documents[0].paper.arxiv_id,),
+        keywords=(str(explicit["custom_keyword"]),),
+        phrases=(recurring_phrase, str(explicit["custom_phrase"])),
+        authors=(recurring_author, str(explicit["custom_author"])),
+    )
+    service.publish_profile(
+        profile,
+        tuple(CategoryConfig(item.category, item.set_spec, coverage_start) for item in draft.categories),
+        seed_papers=(corpus.documents[0],), expected_revision=1,
     )
     assert profile.pdf_destination == destination
     return service, repository, launcher, database_path

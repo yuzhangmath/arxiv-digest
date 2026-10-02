@@ -9,9 +9,7 @@ import stat
 import sys
 import tempfile
 import threading
-import time
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping
 from datetime import date, datetime, timedelta, timezone
 from importlib.resources import files
 from pathlib import Path
@@ -38,6 +36,7 @@ _MAX_ACTIVE_BACKGROUND_JOBS = 8
 _MAX_RETAINED_TERMINAL_JOBS = 128
 
 
+
 class Application:
     def __init__(
         self,
@@ -58,8 +57,6 @@ class Application:
         export_action: Callable[[Path], int] | None = None,
         import_action: Callable[[Path], int] | None = None,
         install_launcher_action: Callable[[], int] | None = None,
-        application_stopping: Callable[[], None] = lambda: None,
-        application_started: Callable[[], None] = lambda: None,
     ) -> None:
         self.paths = paths
         self.profile_exists = profile_exists
@@ -77,8 +74,6 @@ class Application:
         self.export_action = export_action
         self.import_action = import_action
         self.install_launcher_action = install_launcher_action
-        self.application_stopping = application_stopping
-        self.application_started = application_started
 
     def _view(self, intent: str, initialized: bool) -> str:
         if intent == "library":
@@ -114,17 +109,14 @@ class Application:
         self,
         intent: str,
         *,
-        instance_resolved: Callable[[], None] = lambda: None,
         copy_url: bool = False,
     ) -> int:
         self.paths.ensure()
         instances = self.instance_factory()
         claim = instances.acquire()
         if isinstance(claim, ExistingInstance):
-            instance_resolved()
             view = self._view(intent, self.profile_exists())
             descriptor = claim.descriptor
-            self.application_started()
             url = (
                 f"http://127.0.0.1:{descriptor.port}/"
                 f"#token={descriptor.token}&view={view}"
@@ -134,7 +126,6 @@ class Application:
         server = None
         database = None
         try:
-            instance_resolved()
             self.resolve_restore_journal()
             initialized = self.profile_exists()
             view = self._view(intent, initialized)
@@ -154,7 +145,6 @@ class Application:
                 startup_nonce=server.startup_nonce,
                 token=server.token,
             )
-            self.application_started()
             if intent == "default" and initialized:
                 self.start_sync()
             url = server.launch_url(view)
@@ -170,7 +160,6 @@ class Application:
                     close = getattr(database, "close", None)
                     if callable(close):
                         close()
-                    self.application_stopping()
                 finally:
                     instances.release()
 
@@ -228,13 +217,6 @@ _STATIC_CONTENT_TYPES = {
     ".woff2": "font/woff2",
 }
 
-_RESTORE_UPLOAD_PREFIX = ".arxiv-digest-restore-"
-_BROWSER_RESTORE_WAIT_SECONDS = 45.0
-_PENDING_RESTORE_TTL_SECONDS = 15 * 60
-_MAX_PENDING_RESTORES = 2
-_MAX_PENDING_RESTORE_BYTES = 64 * 1024 * 1024
-
-
 def _packaged_static_assets() -> dict[str, StaticAsset]:
     """Materialize the packaged tree into a fixed URL allowlist."""
 
@@ -257,6 +239,7 @@ def _packaged_static_assets() -> dict[str, StaticAsset]:
 
     visit(root)
     return assets
+
 
 
 def _category_from_set_spec(set_spec: str) -> str:
@@ -282,6 +265,7 @@ def _category_from_set_spec(set_spec: str) -> str:
     return leaf
 
 
+
 class _DefaultRuntime:
     """Lazy production service graph owned by one dashboard process."""
 
@@ -293,19 +277,13 @@ class _DefaultRuntime:
         lifecycle: LifecycleController,
         *,
         output: Callable[[str], None],
-        update_running_command: Path | None = None,
     ) -> None:
         self.paths = paths
         self.profiles = profiles
         self.maintenance = maintenance
         self.lifecycle = lifecycle
         self.output = output
-        self._update_running_command = update_running_command
-        self.update_checker = UpdateChecker(
-            detect_installation=self._detect_update_installation,
-        )
-        from arxiv_digest.update_coordinator import UpdateCoordinator
-        self.update_coordinator = UpdateCoordinator(runtime=self, paths=paths, checker=self.update_checker)
+        self.update_checker = UpdateChecker()
         self.store: Any = None
         self.setup: Any = None
         self.review: Any = None
@@ -316,39 +294,18 @@ class _DefaultRuntime:
         self.launcher: Any = None
         self._jobs: dict[str, dict[str, Any]] = {}
         self._jobs_lock = threading.RLock()
-        self._candidate_state_lock = threading.RLock()
         self._candidate_build: Any = None
-        self._candidate_job_id: str | None = None
-        self._candidate_job_revision: int | None = None
-        self._suggestions: dict[str, tuple[int, str, str, Any]] = {}
-        self._suggestion_ids: dict[tuple[int, str, str, str], str] = {}
         self._picker_choices: dict[str, Any] = {}
         self._tested_destinations: dict[str, tuple[int | None, Any]] = {}
-        self._pending_restores: dict[str, Any] = {}
-        self._pending_restores_lock = threading.RLock()
-        self._pending_restore_reservations: dict[str, int] = {}
-        self._restore_cleanup_timer: threading.Timer | None = None
-        self._restore_shutdown = False
         self._sync_cancel = threading.Event()
         self._sync_start_lock = threading.Lock()
         self._active_sync_job: str | None = None
         self._sync_follow_up_requested = False
         self._last_sync_report: Any = None
         self._last_abstract_retry: dict[str, Any] | None = None
-        self._resume_sync_after_update = False
-        self._sync_resume_after_cancel = False
         self._runtime_closed = False
         self._category_values: tuple[Any, ...] | None = None
         self._issued_category_pairs: set[tuple[str, str]] = set()
-
-    def _detect_update_installation(self, *, deadline_at: float, monotonic: Callable[[], float]):
-        from arxiv_digest.update_installation import detect_pipx_installation
-
-        return detect_pipx_installation(
-            paths=self.paths, maintenance=self.maintenance,
-            deadline_at=deadline_at, monotonic=monotonic,
-            running_command=self._update_running_command,
-        )
 
     def _launcher_manager(self) -> Any | None:
         from arxiv_digest.desktop_launcher import (
@@ -363,7 +320,7 @@ class _DefaultRuntime:
             platform=sys.platform,
             home=Path.home(),
             executable=Path(executable),
-            recovery_wrapper=self.paths.recovery_wrapper_path,
+            legacy_recovery_wrapper=self.paths.data_dir / "update-recovery/recover-arxiv-digest",
             operation_guard=lambda: launcher_operation_guard(self.paths),
         )
 
@@ -385,12 +342,9 @@ class _DefaultRuntime:
         from arxiv_digest.storage.store import Store
         from arxiv_digest.sync import SyncService
 
-        self._cleanup_orphaned_restore_uploads()
         connection = open_database(self.paths.database_path)
-        # Service objects open short-lived, maintenance-leased connections on
-        # demand. Keeping this bootstrap WAL connection for the server
-        # lifetime would leave an unleased handle to the database that browser
-        # restore replaces, so close it immediately after validation/migration.
+        # Services open short-lived connections on demand; close the bootstrap
+        # connection after validation and migration.
         connection.close()
         self.store = Store(self.paths.database_path, maintenance=self.maintenance)
         self.folder = FolderService()
@@ -437,93 +391,17 @@ class _DefaultRuntime:
         )
         return SimpleNamespace(close=self._close_runtime)
 
-    def _cleanup_orphaned_restore_uploads(self) -> None:
-        cache = self.paths.cache_dir
-        if not cache.exists():
-            return
-        for candidate in cache.iterdir():
-            if not (
-                candidate.name.startswith(_RESTORE_UPLOAD_PREFIX)
-                and candidate.suffix == ".zip"
-            ):
-                continue
-            info = candidate.lstat()
-            if not stat.S_ISREG(info.st_mode):
-                continue
-            if hasattr(os, "getuid") and info.st_uid != os.getuid():
-                continue
-            if info.st_mode & 0o077:
-                continue
-            candidate.unlink(missing_ok=True)
-
     def _close_runtime(self) -> None:
         from arxiv_digest.maintenance import MaintenanceTimeoutError
-        from arxiv_digest.update_contract import LOCK_WAIT_TIMEOUT_SECONDS
         self._runtime_closed = True
         while True:
             try:
-                self.maintenance.drain_for_shutdown(timeout=LOCK_WAIT_TIMEOUT_SECONDS)
+                self.maintenance.drain_for_shutdown(timeout=45.0)
                 break
             except MaintenanceTimeoutError:
                 # Keep ordinary ownership while a canceled worker is finishing.
                 # Each wait is finite; elapsed time cannot authorize release.
                 continue
-        with self._pending_restores_lock:
-            self._restore_shutdown = True
-            timer = self._restore_cleanup_timer
-            self._restore_cleanup_timer = None
-            pending = tuple(self._pending_restores.values())
-            self._pending_restores.clear()
-            self._pending_restore_reservations.clear()
-        if timer is not None:
-            timer.cancel()
-        for _created, inspection in pending:
-            inspection.path.unlink(missing_ok=True)
-
-    @contextmanager
-    def begin_update_quiescence(
-        self, *, timeout: float = 45.0,
-    ) -> Iterator[tuple[str, ...]]:
-        """Own the latch and outer lease until verified cleanup or shutdown.
-
-        The dedicated coordinator thread must retain this context through the
-        application's resource-close notification. No helper or installer is
-        started here, and unwinding never authorizes automatic job replay.
-        """
-        with self.maintenance.update_latch():
-            with self._jobs_lock:
-                ordinary_sync = getattr(self, "_active_sync_job", None)
-                self._resume_sync_after_update = ordinary_sync is not None and (
-                    self._jobs.get(ordinary_sync, {}).get("status") == "running"
-                )
-                self._sync_follow_up_requested = False
-                self._sync_resume_after_cancel = False
-            with self.maintenance.exclusive(cancel_active=True, timeout=timeout) as canceled:
-                with self._jobs_lock:
-                    canceled_jobs = tuple(
-                        identifier for identifier in canceled
-                        if self._jobs.get(identifier, {}).get("status") == "canceled"
-                    )
-                yield canceled_jobs
-
-    def resume_after_update_failure(self) -> None:
-        """Resume one interrupted ordinary sync after proven safe cleanup."""
-        if self.maintenance.update_active:
-            raise RuntimeError("update quiescence must be released before scheduling")
-        if self.lifecycle.is_closing or getattr(self, "_runtime_closed", False):
-            return
-        with self._jobs_lock:
-            resume = getattr(self, "_resume_sync_after_update", False)
-            self._resume_sync_after_update = False
-            active = getattr(self, "_active_sync_job", None)
-            if resume and active is not None and self._jobs.get(active, {}).get("status") == "running":
-                # A drain timeout can leave the canceled pass finishing. Keep
-                # cancellation set until that pass returns, then let the
-                # existing bounded follow-up loop run one ordinary pass.
-                self._sync_resume_after_cancel = True
-                return
-        if resume:
-            self.start_sync()
 
     def _require_open(self) -> None:
         if self.store is None:
@@ -538,11 +416,7 @@ class _DefaultRuntime:
         return True
 
     def update_status(self, payload: dict[str, Any]) -> dict[str, str]:
-        active = self.update_coordinator.status()
-        if active is not None:
-            return active
-        if not self.maintenance.update_active:
-            self.update_checker.start()
+        self.update_checker.start()
         return self.update_checker.snapshot()
 
     def _arxiv_access_error(self) -> Exception | None:
@@ -573,6 +447,12 @@ class _DefaultRuntime:
         }
 
     def status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._status_snapshot()[0]
+
+    def _status_snapshot(
+        self, *, profile: Any | None = None,
+    ) -> tuple[dict[str, Any], Any | None]:
+        """Read worker state before the shared synchronization snapshot."""
         from arxiv_digest.doctor import _redacted_sync_error_code
 
         sync_job = None
@@ -580,9 +460,30 @@ class _DefaultRuntime:
             if self._active_sync_job is not None:
                 sync_job = dict(self._jobs.get(self._active_sync_job, {}))
                 sync_job.pop("result", None)
+        offline = bool(
+            self._last_sync_report is not None
+            and self._last_sync_report.offline
+        )
+        if profile is None:
+            profile = self.profiles.load()
+        initialized = profile is not None
+        progress_snapshot = getattr(getattr(self, "sync", None), "progress", None)
+        report = (
+            progress_snapshot(self._sync_configs(profile), offline=offline)
+            if initialized and callable(progress_snapshot)
+            else None
+        )
         retry = None if sync_job is None else sync_job.get("daily_list_retry")
         if not isinstance(retry, dict):
-            retry_dates = self._retryable_sync_dates()
+            retry_dates = (
+                self._retryable_sync_dates()
+                if report is None
+                else {
+                    progress.category: progress.retryable_failed_exact_dates
+                    for progress in report.categories
+                    if progress.retryable_failed_exact_dates
+                }
+            )
             retry = {
                 "status": (
                     "running"
@@ -603,15 +504,9 @@ class _DefaultRuntime:
             }
         else:
             retry = dict(retry)
-        offline = bool(
-            self._last_sync_report is not None
-            and self._last_sync_report.offline
-        )
         metadata_sync = None
         daily_list_progress = None
-        progress_snapshot = getattr(getattr(self, "sync", None), "progress", None)
-        if self.profiles.load() is not None and callable(progress_snapshot):
-            report = progress_snapshot(self._sync_configs(), offline=offline)
+        if report is not None:
             metadata_categories = []
             daily_list_categories = []
             for category_progress in report.categories:
@@ -691,7 +586,7 @@ class _DefaultRuntime:
         return {
             "state": "ready",
             "arxiv_access": self._arxiv_access_status(),
-            "initialized": self.profiles.load() is not None,
+            "initialized": initialized,
             "sync": sync_job,
             "daily_list_retry": retry,
             "abstract_retry": (
@@ -706,7 +601,7 @@ class _DefaultRuntime:
             "metadata_sync": metadata_sync,
             "daily_list_progress": daily_list_progress,
             "offline": offline,
-        }
+        }, report
 
     def _review_date(self, payload: dict[str, Any]) -> Any:
         from arxiv_digest.web.api import ReviewPagePayload
@@ -795,18 +690,8 @@ class _DefaultRuntime:
         initial_fields: Mapping[str, Any] | None = None,
     ) -> str:
         job_id = job_id or f"{prefix}_{secrets.token_urlsafe(12)}"
-        canceled_by_update = threading.Event()
-
-        def cancel() -> None:
-            if self.maintenance.update_active and request_cancel is not None:
-                canceled_by_update.set()
-            if request_cancel is not None:
-                request_cancel()
-
-        # Registration is synchronous and atomic with the update latch. A
-        # coordinator can therefore cancel/drain a worker even in the gap
-        # before its thread starts, and rejected work never publishes a job.
-        reservation = self.maintenance.reserve_worker(job_id, cancel)
+        # Reserve before starting the thread so maintenance can cancel pending work.
+        reservation = self.maintenance.reserve_worker(job_id, request_cancel or (lambda: None))
         lifecycle_registered = False
         job = None
         try:
@@ -849,13 +734,7 @@ class _DefaultRuntime:
 
         def finish_job(*, result: Any = None, error: BaseException | None = None) -> None:
             with self._jobs_lock:
-                if canceled_by_update.is_set():
-                    self._jobs[job_id].update(
-                        status="canceled", complete=True, failed=False,
-                        error_code="canceled_for_update",
-                        message="The update stopped this job. Retry it manually if needed.",
-                    )
-                elif error is not None:
+                if error is not None:
                     code = getattr(error, "code", None)
                     self._jobs[job_id].update(
                         status="failed", complete=False, failed=True,
@@ -902,36 +781,8 @@ class _DefaultRuntime:
             result = dict(job)
         value = result.pop("result", None)
         if value is not None:
-            if hasattr(value, "diagnostics"):
-                diagnostics = value.diagnostics
-                result.update(
-                    corpus_complete=diagnostics.complete,
-                    corpus_hash=diagnostics.corpus_hash,
-                    reduced_breadth=diagnostics.reduced_breadth,
-                    setup_ready=diagnostics.setup_ready,
-                    minimum_met=diagnostics.minimum_met,
-                    pages_fetched=diagnostics.pages_fetched,
-                    can_resume=diagnostics.can_resume,
-                    progress=diagnostics.progress,
-                )
-            else:
-                result["value"] = value
+            result["value"] = value
         return result
-
-    @staticmethod
-    def _category_configs(draft: Any) -> tuple[Any, ...]:
-        from arxiv_digest.models import CategoryConfig
-
-        if draft.coverage_start is None:
-            raise ValueError("select initial coverage before building candidates")
-        return tuple(
-            CategoryConfig(
-                item.category,
-                item.set_spec,
-                draft.coverage_start,
-            )
-            for item in draft.categories
-        )
 
     def _local_candidate_documents(
         self,
@@ -962,314 +813,6 @@ class _DefaultRuntime:
                     )
                 )
         return tuple(documents)
-
-    def _start_candidate_corpus(self, payload: dict[str, Any]) -> dict[str, str]:
-        with self._candidate_state_lock:
-            draft = self.setup.load_draft()
-            if draft is None or draft.revision != payload["draft_revision"]:
-                from arxiv_digest.setup import SetupRevisionError
-
-                raise SetupRevisionError(
-                    payload["draft_revision"],
-                    None if draft is None else draft.revision,
-                )
-            configs = self._category_configs(draft)
-            cancellation = threading.Event()
-
-            def build() -> Any:
-                result = (
-                    self.candidates.retry(
-                        configs,
-                        cancelled=cancellation.is_set,
-                    )
-                    if payload["mode"] == "restart"
-                    else self.candidates.resume(
-                        configs,
-                        cancelled=cancellation.is_set,
-                    )
-                )
-                self._candidate_build = result
-                self._suggestions.clear()
-                self._suggestion_ids.clear()
-                return result
-
-            with self._jobs_lock:
-                current = (
-                    None
-                    if self._candidate_job_id is None
-                    else self._jobs.get(self._candidate_job_id)
-                )
-            if (
-                self._candidate_job_id is not None
-                and self._candidate_job_revision == draft.revision
-                and current is not None
-                and current.get("status") == "running"
-            ):
-                return {"job_id": self._candidate_job_id}
-            job_id = f"setup_{secrets.token_urlsafe(12)}"
-            self._candidate_job_id = job_id
-            self._candidate_job_revision = draft.revision
-            try:
-                self._new_job(
-                    "setup",
-                    "sync",
-                    build,
-                    job_id=job_id,
-                    request_cancel=cancellation.set,
-                )
-            except Exception:
-                if self._candidate_job_id == job_id:
-                    self._candidate_job_id = None
-                    self._candidate_job_revision = None
-                raise
-            return {"job_id": job_id}
-
-    def _accept_candidate_corpus(self, payload: dict[str, Any]) -> Any:
-        with self._candidate_state_lock:
-            draft = self.setup.load_draft()
-            if draft is None or draft.revision != payload["draft_revision"]:
-                from arxiv_digest.setup import SetupRevisionError
-
-                raise SetupRevisionError(
-                    payload["draft_revision"],
-                    None if draft is None else draft.revision,
-                )
-            with self._jobs_lock:
-                active = (
-                    None
-                    if self._candidate_job_id is None
-                    else self._jobs.get(self._candidate_job_id)
-                )
-            if (
-                self._candidate_job_revision == draft.revision
-                and active is not None
-                and active.get("status") == "running"
-            ):
-                raise ValueError("candidate corpus generation is still running")
-            build = self._candidate_build
-            if build is None or build.corpus_hash != payload["corpus_hash"]:
-                raise ValueError("candidate corpus changed; resume it again")
-            if not build.complete and build.minimum_met:
-                build = self.candidates.resume(
-                    self._category_configs(draft),
-                    accept_reduced_breadth=True,
-                )
-                if build.corpus_hash != payload["corpus_hash"]:
-                    raise ValueError("candidate corpus changed; inspect it again")
-                self._candidate_build = build
-            revised = self.setup.accept_candidate_corpus(
-                draft.revision,
-                build,
-                corpus_hash=payload["corpus_hash"],
-            )
-            return self._setup_payload(revised)
-
-    @staticmethod
-    def _suggestion_identity(kind: str, value: Any) -> str:
-        if kind == "paper":
-            return value.paper.arxiv_id
-        if kind == "author":
-            return value.name
-        return f"{value.kind}:{value.value}"
-
-    def _register_suggestion(
-        self,
-        draft: Any,
-        kind: str,
-        value: Any,
-    ) -> str:
-        if draft.corpus_hash is None:
-            raise ValueError("candidate corpus is not accepted")
-        key = (
-            draft.revision,
-            draft.corpus_hash,
-            kind,
-            self._suggestion_identity(kind, value),
-        )
-        suggestion_id = self._suggestion_ids.get(key)
-        if suggestion_id is None:
-            suggestion_id = f"suggest_{secrets.token_urlsafe(12)}"
-            self._suggestion_ids[key] = suggestion_id
-            self._suggestions[suggestion_id] = (
-                draft.revision,
-                draft.corpus_hash,
-                kind,
-                value,
-            )
-        return suggestion_id
-
-    def _resolve_suggestions(
-        self,
-        draft: Any,
-        identifiers: list[str],
-        kind: str,
-    ) -> tuple[Any, ...]:
-        values = []
-        for identifier in identifiers:
-            registered = self._suggestions.get(identifier)
-            if (
-                registered is None
-                or registered[:3]
-                != (draft.revision, draft.corpus_hash, kind)
-            ):
-                raise ValueError("suggestion is missing, stale, or from another step")
-            values.append(registered[3])
-        if len(values) != len({self._suggestion_identity(kind, value) for value in values}):
-            raise ValueError("suggestions must be unique")
-        return tuple(values)
-
-    def _candidate_suggestions(self) -> Any:
-        from arxiv_digest.candidates import build_suggestions
-
-        draft = self.setup.load_draft()
-        if draft is None:
-            raise ValueError("setup draft is unavailable")
-        build = self._accepted_candidate_build(draft)
-        if build is None:
-            raise ValueError("candidate corpus is unavailable")
-        corpus = build.corpus
-        corpus_ids = {
-            document.paper.arxiv_id for document in corpus.documents
-        }
-        return build_suggestions(
-            corpus,
-            tuple(
-                document.paper.arxiv_id
-                for document in draft.seed_papers
-                if document.paper.arxiv_id in corpus_ids
-            ),
-            (*draft.keywords, *draft.phrases),
-            draft.authors,
-        )
-
-    def _accepted_candidate_build(self, draft: Any) -> Any | None:
-        """Return only the corpus bound to the draft's persisted accepted hash."""
-
-        expected_hash = getattr(draft, "corpus_hash", None)
-        if expected_hash is None:
-            return None
-        selected = tuple(item.category for item in draft.categories)
-        current = self._candidate_build
-        if (
-            current is not None
-            and getattr(current, "corpus_hash", None) == expected_hash
-            and tuple(current.corpus.categories) == selected
-        ):
-            return current
-        corpus = self.candidates.cache.load_accepted_corpus(
-            self._category_configs(draft),
-            expected_hash=expected_hash,
-        )
-        if corpus is None:
-            return None
-        current = SimpleNamespace(corpus=corpus, corpus_hash=expected_hash)
-        self._candidate_build = current
-        self._suggestions.clear()
-        self._suggestion_ids.clear()
-        return current
-
-    @staticmethod
-    def _paper_value(document: Any) -> dict[str, Any]:
-        paper = document.paper
-        return {
-            "arxiv_id": paper.arxiv_id,
-            "title": paper.title,
-            "authors": list(paper.authors),
-            "abstract": paper.abstract,
-            "primary_category": paper.primary_category,
-            "categories": list(paper.categories),
-        }
-
-    def _candidate_papers(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from arxiv_digest.candidates import search_candidate_papers
-
-        draft = self.setup.load_draft()
-        if draft is None:
-            raise ValueError("candidate corpus is unavailable")
-        build = self._accepted_candidate_build(draft)
-        if build is None:
-            raise ValueError("candidate corpus is unavailable")
-        documents = search_candidate_papers(
-            build.corpus,
-            payload.get("q", ""),
-            offset=payload.get("offset", 0),
-            limit=30,
-        )
-        items = []
-        for document in documents:
-            suggestion_id = self._register_suggestion(
-                draft, "paper", document
-            )
-            items.append(
-                {
-                    "suggestion_id": suggestion_id,
-                    **self._paper_value(document),
-                }
-            )
-        return {
-            "items": items,
-            "offset": payload.get("offset", 0),
-            "next_offset": (
-                payload.get("offset", 0) + len(items)
-                if len(items) == 30
-                else None
-            ),
-        }
-
-    def _candidate_terms(self, payload: dict[str, Any]) -> dict[str, Any]:
-        draft = self.setup.load_draft()
-        if draft is None:
-            raise ValueError("setup draft is unavailable")
-        suggestions = self._candidate_suggestions()
-
-        def value(item: Any) -> dict[str, Any]:
-            return {
-                "suggestion_id": self._register_suggestion(draft, "term", item),
-                "value": item.value,
-                "kind": item.kind,
-                "score": item.score,
-                "reasons": list(item.reasons),
-            }
-
-        return {
-            "keywords": [
-                value(item) for item in suggestions.terms if item.kind == "keyword"
-            ],
-            "phrases": [
-                value(item) for item in suggestions.terms if item.kind == "phrase"
-            ],
-        }
-
-    def _candidate_authors(self, payload: dict[str, Any]) -> dict[str, Any]:
-        draft = self.setup.load_draft()
-        if draft is None:
-            raise ValueError("setup draft is unavailable")
-        query = payload.get("q", "").casefold()
-        items = []
-        for item in self._candidate_suggestions().authors:
-            if query and query not in item.name.casefold():
-                continue
-            items.append(
-                {
-                    "suggestion_id": self._register_suggestion(
-                        draft, "author", item
-                    ),
-                    "name": item.name,
-                    "score": item.score,
-                    "reasons": list(item.reasons),
-                }
-            )
-        return {"items": items}
-
-    def _lookup_candidate_paper(self, payload: dict[str, Any]) -> dict[str, Any]:
-        draft = self.setup.load_draft()
-        if draft is None or draft.revision != payload["draft_revision"]:
-            raise ValueError("setup draft revision changed")
-        document = self.candidates.lookup(payload["arxiv_id"])
-        return {
-            "suggestion_id": self._register_suggestion(draft, "paper", document),
-            **self._paper_value(document),
-        }
 
     def _supported_coverage_bounds(self) -> tuple[date, date]:
         from arxiv_digest.sync import (
@@ -1313,66 +856,11 @@ class _DefaultRuntime:
         coverage_min, coverage_max = self._supported_coverage_bounds()
         return SetupDraftPayload(
             draft,
-            corpus_can_resume=self._candidate_cache_can_resume(draft),
-            corpus_job=self._candidate_job_for_draft(draft),
             coverage_min=coverage_min,
             coverage_max=coverage_max,
         )
 
-    def _candidate_job_for_draft(self, draft: Any) -> dict[str, Any] | None:
-        state_lock = getattr(self, "_candidate_state_lock", None)
-        if state_lock is None:
-            return None
-        with state_lock:
-            if (
-                getattr(self, "_candidate_job_id", None) is None
-                or getattr(self, "_candidate_job_revision", None)
-                != getattr(draft, "revision", None)
-            ):
-                return None
-            job_id = self._candidate_job_id
-            try:
-                return self._job_status({"job_id": job_id})
-            except KeyError:
-                return None
-
-    def _candidate_cache_can_resume(self, draft: Any) -> bool:
-        from arxiv_digest.candidates import CandidateCacheError
-        from arxiv_digest.setup import SetupStep
-
-        if (
-            getattr(draft, "current_step", None)
-            is not SetupStep.CANDIDATE_CORPUS
-            or getattr(draft, "corpus_hash", None) is not None
-        ):
-            return False
-        candidates = getattr(self, "candidates", None)
-        if candidates is None:
-            return False
-        observed_at = candidates.clock()
-        window_end = observed_at.date()
-        window_start = window_end - timedelta(days=89)
-        for selection in draft.categories:
-            try:
-                shard = candidates.cache.load_shard(
-                    selection.category,
-                    selection.set_spec,
-                    window_start=window_start,
-                    window_end=window_end,
-                    now=observed_at,
-                )
-            except (CandidateCacheError, OSError, ValueError):
-                continue
-            if shard is not None:
-                return True
-        return False
-
     def _setup_draft_put(self, payload: dict[str, Any]) -> Any:
-        from arxiv_digest.candidates import (
-            validate_custom_author,
-            validate_custom_keyword,
-            validate_custom_phrase,
-        )
         from arxiv_digest.setup import CategorySelection
         from arxiv_digest.web.api import project_setup_draft
 
@@ -1395,82 +883,10 @@ class _DefaultRuntime:
                 ),
             )
         elif step == "coverage":
-            earliest = self._oai.identify().earliest_datestamp
             draft = self.setup.set_initial_coverage(
                 revision,
                 date.fromisoformat(payload["coverage_start"]),
-                earliest_datestamp=earliest,
                 coverage_bounds=self._supported_coverage_bounds(),
-            )
-        elif step == "seed_papers":
-            current = self.setup.load_draft()
-            if current is None or current.revision != revision:
-                raise ValueError("setup draft revision changed")
-            accepted = self._resolve_suggestions(
-                current,
-                payload["accepted_suggestion_ids"],
-                "paper",
-            )
-            custom = tuple(
-                self.candidates.lookup(arxiv_id)
-                for arxiv_id in payload["custom_arxiv_ids"]
-            )
-            draft = self.setup.select_seed_papers(
-                revision, (*accepted, *custom)
-            )
-        elif step == "terms":
-            current = self.setup.load_draft()
-            if current is None or current.revision != revision:
-                raise ValueError("setup draft revision changed")
-            keyword_values = self._resolve_suggestions(
-                current,
-                payload["accepted_keyword_suggestion_ids"],
-                "term",
-            )
-            phrase_values = self._resolve_suggestions(
-                current,
-                payload["accepted_phrase_suggestion_ids"],
-                "term",
-            )
-            if any(item.kind != "keyword" for item in keyword_values) or any(
-                item.kind != "phrase" for item in phrase_values
-            ):
-                raise ValueError("suggestion kind does not match the setup field")
-            draft = self.setup.select_terms(
-                revision,
-                keywords=(
-                    *(item.value for item in keyword_values),
-                    *(
-                        validate_custom_keyword(value)
-                        for value in payload["custom_keywords"]
-                    ),
-                ),
-                phrases=(
-                    *(item.value for item in phrase_values),
-                    *(
-                        validate_custom_phrase(value)
-                        for value in payload["custom_phrases"]
-                    ),
-                ),
-            )
-        elif step == "authors":
-            current = self.setup.load_draft()
-            if current is None or current.revision != revision:
-                raise ValueError("setup draft revision changed")
-            accepted = self._resolve_suggestions(
-                current,
-                payload["accepted_suggestion_ids"],
-                "author",
-            )
-            draft = self.setup.select_authors(
-                revision,
-                (
-                    *(item.name for item in accepted),
-                    *(
-                        validate_custom_author(value)
-                        for value in payload["custom_authors"]
-                    ),
-                ),
             )
         elif step == "pdf_destination":
             registered = self._tested_destinations.pop(
@@ -1853,10 +1269,6 @@ class _DefaultRuntime:
                         or self._arxiv_access_error() is not None
                     ):
                         return report
-                    if getattr(self, "_sync_resume_after_cancel", False):
-                        self._sync_resume_after_cancel = False
-                        self._sync_cancel.clear()
-                        self._sync_follow_up_requested = True
                     if not self._sync_follow_up_requested:
                         self._active_sync_job = None
                         return report
@@ -1984,8 +1396,6 @@ class _DefaultRuntime:
             with self.maintenance.operation():
                 build = self.candidates.resume(configs)
             self._candidate_build = build
-            self._suggestions.clear()
-            self._suggestion_ids.clear()
         result = self._profile_value(profile, self.store)
         coverage_min, coverage_max = self._supported_coverage_bounds()
         result["coverage_min"] = coverage_min.isoformat()
@@ -2003,7 +1413,7 @@ class _DefaultRuntime:
 
         from arxiv_digest.candidates import build_suggestions
 
-        corpus, corpus_hash = current
+        corpus = current
         corpus_ids = {
             document.paper.arxiv_id for document in corpus.documents
         }
@@ -2017,18 +1427,9 @@ class _DefaultRuntime:
             (*profile.keywords, *profile.phrases),
             profile.authors,
         )
-        binding = SimpleNamespace(
-            revision=profile.revision,
-            corpus_hash=corpus_hash,
-        )
-
-        def suggestion_id(kind: str, item: Any) -> str:
-            return self._register_suggestion(binding, kind, item)
-
         result["suggestions_generated_at"] = corpus.created_at.isoformat()
         result["suggestions"]["seed_papers"] = [
             {
-                "suggestion_id": suggestion_id("paper", item),
                 "arxiv_id": item.paper.arxiv_id,
                 "title": item.paper.title,
                 "authors": list(item.paper.authors),
@@ -2043,7 +1444,6 @@ class _DefaultRuntime:
         for kind in ("keyword", "phrase"):
             result["suggestions"][f"{kind}s"] = [
                 {
-                    "suggestion_id": suggestion_id("term", item),
                     "value": item.value,
                     "score": item.score,
                     "reasons": list(item.reasons),
@@ -2053,7 +1453,6 @@ class _DefaultRuntime:
             ][:30]
         result["suggestions"]["authors"] = [
             {
-                "suggestion_id": suggestion_id("author", item),
                 "name": item.name,
                 "score": item.score,
                 "reasons": list(item.reasons),
@@ -2062,13 +1461,13 @@ class _DefaultRuntime:
         ]
         return result
 
-    def _current_interest_corpus(self, profile: Any) -> tuple[Any, str] | None:
+    def _current_interest_corpus(self, profile: Any) -> Any | None:
         build = self._candidate_build
         if (
             build is not None
             and tuple(build.corpus.categories) == tuple(profile.categories)
         ):
-            return build.corpus, build.corpus_hash
+            return build.corpus
 
         shards = []
         try:
@@ -2088,9 +1487,7 @@ class _DefaultRuntime:
         except (KeyError, OSError, ValueError):
             return None
 
-        from arxiv_digest.candidates import candidate_corpus_hash
-
-        return corpus, candidate_corpus_hash(corpus)
+        return corpus
 
     def _interest_category_suggestions(self, profile: Any) -> list[dict[str, str]]:
         if self._category_values is None:
@@ -2252,108 +1649,44 @@ class _DefaultRuntime:
         profile = self.profiles.load()
         if profile is None:
             raise KeyError("active profile")
-        service_status = self.status({})
+        service_status, report = self._status_snapshot(profile=profile)
+        if report is None:
+            raise RuntimeError("synchronization services are not initialized")
         active_sync = service_status.get("sync")
         coverage_min, coverage_max = self._supported_coverage_bounds()
-        metadata_categories = []
+        metadata_categories = service_status["metadata_sync"]["categories"]
+        daily_list_progress = service_status["daily_list_progress"]
+        progress_categories = {
+            item["category"]: item for item in daily_list_progress["categories"]
+        }
+        coverage_starts = {
+            item.category: item.coverage_start for item in profile.category_coverage
+        }
         coverage_categories = []
-        category_days: dict[str, dict[date, str]] = {}
-        checkpoint_count = 0
-        for profile_category in profile.category_coverage:
-            category = profile_category.category
-            state = self.store.category_sync_state(category)
-            if state.completed_through_utc is not None:
-                checkpoint_count += 1
-            metadata_codes = []
-            if state.last_error_code is not None:
-                metadata_codes.append(
-                    _redacted_sync_error_code(state.last_error_code)
-                )
-            metadata_categories.append(
-                {
-                    "category": category,
-                    "status": state.status,
-                    "synchronized_through": (
-                        None
-                        if state.completed_through_utc is None
-                        else state.completed_through_utc.isoformat()
-                    ),
-                    "error_codes": sorted(set(metadata_codes)),
-                }
-            )
-
-            records = tuple(
-                record
-                for record in self.store.catchup_day_records(category)
-                if profile_category.coverage_start <= record.daily_list_date <= coverage_max
-            )
-            category_days[category] = {
-                record.daily_list_date: record.status.value
-                for record in records
-            }
-            category_statuses = [record.status.value for record in records]
-            category_unavailable = sum(
-                self._daily_list_is_unavailable(
-                    [record.status.value],
-                    record.daily_list_date,
-                    coverage_min,
-                )
-                for record in records
-            )
-            error_codes = sorted(
-                {
-                    _redacted_sync_error_code(record.error_code)
-                    for record in records
-                    if record.error_code is not None
-                }
-            )
+        for category_progress in report.categories:
+            category = category_progress.category
+            projected = progress_categories[category]
+            failed_dates = set(category_progress.failed_dates)
             coverage_categories.append(
                 {
                     "category": category,
-                    "coverage_start": profile_category.coverage_start.isoformat(),
-                    **self._daily_list_counts(
-                        category_statuses,
-                        unavailable=category_unavailable,
-                    ),
-                    "error_codes": error_codes,
+                    "coverage_start": coverage_starts[category].isoformat(),
+                    **self._settings_coverage_counts(projected),
+                    "error_codes": projected["error_codes"],
                     "failed_date_errors": [
                         {
-                            "date": record.daily_list_date.isoformat(),
-                            "error_code": _redacted_sync_error_code(record.error_code),
+                            "date": day.isoformat(),
+                            "error_code": _redacted_sync_error_code(error_code),
                         }
-                        for record in records
-                        if record.status.value == "failed"
-                        and record.error_code is not None
+                        for day, error_code in category_progress.daily_list_errors
+                        if day in failed_dates and error_code is not None
                     ],
                     "retryable_failed_dates": [
-                        record.daily_list_date.isoformat()
-                        for record in records
-                        if record.status.value == "failed"
-                        and coverage_min <= record.daily_list_date <= coverage_max
+                        day.isoformat()
+                        for day in category_progress.retryable_failed_exact_dates
                     ],
                 }
             )
-
-        global_dates = sorted(
-            {
-                day
-                for statuses in category_days.values()
-                for day in statuses
-            }
-        )
-        global_statuses = []
-        global_unavailable = 0
-        for day in global_dates:
-            statuses = [
-                category_days.get(item.category, {}).get(day, "pending")
-                for item in profile.category_coverage
-                if item.coverage_start <= day
-            ]
-            if statuses:
-                global_statuses.append(self._global_daily_list_status(statuses))
-                global_unavailable += self._daily_list_is_unavailable(
-                    statuses, day, coverage_min
-                )
         connection = self.store._connect()
         try:
             resolution_counts = {
@@ -2410,14 +1743,14 @@ class _DefaultRuntime:
             "coverage_min": coverage_min.isoformat(),
             "coverage_max": coverage_max.isoformat(),
             "metadata_sync": {
-                "checkpoint_count": checkpoint_count,
+                "checkpoint_count": sum(
+                    item["synchronized_through"] is not None
+                    for item in metadata_categories
+                ),
                 "categories": metadata_categories,
             },
             "daily_list_coverage": {
-                **self._daily_list_counts(
-                    global_statuses,
-                    unavailable=global_unavailable,
-                ),
+                **self._settings_coverage_counts(daily_list_progress),
                 "categories": coverage_categories,
             },
             "version_resolution": {
@@ -2444,46 +1777,19 @@ class _DefaultRuntime:
         }
 
     @staticmethod
-    def _daily_list_is_unavailable(
-        statuses: list[str],
-        day: date,
-        coverage_min: date,
-    ) -> bool:
-        return day < coverage_min and any(
-            status in {"failed", "pending"} for status in statuses
-        )
-
-    @staticmethod
-    def _global_daily_list_status(
-        statuses: list[str],
-    ) -> str:
-        if "failed" in statuses:
-            return "failed"
-        if "pending" in statuses:
-            return "pending"
-        if "complete" in statuses:
-            return "complete"
-        return "empty"
-
-    @staticmethod
-    def _daily_list_counts(
-        statuses: list[str],
-        *,
-        unavailable: int = 0,
+    def _settings_coverage_counts(
+        progress: Mapping[str, Any],
     ) -> dict[str, int]:
-        with_papers = statuses.count("complete")
-        empty = statuses.count("empty")
-        failed = statuses.count("failed")
-        pending = statuses.count("pending")
+        """Keep Settings' established field names for shared progress counts."""
         return {
-            "target": with_papers + empty + failed + pending,
-            "checked": with_papers + empty + failed,
-            "with_papers": with_papers,
-            "empty": empty,
-            "failed": failed,
-            "pending": pending,
-            "unavailable": unavailable,
-            "gaps": failed + pending,
+            "target": progress["target_dates"],
+            "checked": progress["checked_dates"],
+            "with_papers": progress["dates_with_papers"],
+            "empty": progress["empty_dates"],
+            "failed": progress["failed_dates"],
+            "pending": progress["pending_dates"],
+            "unavailable": progress["unavailable_dates"],
+            "gaps": progress["failed_dates"] + progress["pending_dates"],
         }
 
     def _settings_coverage(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2563,8 +1869,6 @@ class _DefaultRuntime:
         if root.exists():
             shutil.rmtree(root)
         self._candidate_build = None
-        self._suggestions.clear()
-        self._suggestion_ids.clear()
         return {"cleared": True}
 
     def _settings_folder(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2692,243 +1996,16 @@ class _DefaultRuntime:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _expire_pending_restores(self) -> None:
-        now = time.monotonic()
-        expired_paths: list[Path] = []
-        with self._pending_restores_lock:
-            expired = [
-                identifier
-                for identifier, (created, _) in self._pending_restores.items()
-                if now - created >= _PENDING_RESTORE_TTL_SECONDS
-            ]
-            for identifier in expired:
-                pending = self._pending_restores.pop(identifier, None)
-                if pending is not None:
-                    _, inspection = pending
-                    expired_paths.append(inspection.path)
-            self._schedule_pending_restore_expiration_locked(now=now)
-        for path in expired_paths:
-            path.unlink(missing_ok=True)
-
-    def _schedule_pending_restore_expiration_locked(
-        self, *, now: float | None = None
-    ) -> None:
-        current = self._restore_cleanup_timer
-        if current is not None:
-            current.cancel()
-        self._restore_cleanup_timer = None
-        if self._restore_shutdown or not self._pending_restores:
-            return
-        current_time = time.monotonic() if now is None else now
-        next_expiry = min(
-            created + _PENDING_RESTORE_TTL_SECONDS
-            for created, _inspection in self._pending_restores.values()
-        )
-        timer = threading.Timer(
-            max(0.01, next_expiry - current_time),
-            self._expire_pending_restores,
-        )
-        timer.daemon = True
-        self._restore_cleanup_timer = timer
-        timer.start()
-
-    def _schedule_pending_restore_expiration(self) -> None:
-        with self._pending_restores_lock:
-            self._schedule_pending_restore_expiration_locked()
-
-    def _pending_restore_usage_locked(self) -> tuple[int, int]:
-        pending_bytes = sum(
-            inspection.path.stat().st_size
-            for _created, inspection in self._pending_restores.values()
-        )
-        return (
-            len(self._pending_restores)
-            + len(self._pending_restore_reservations),
-            pending_bytes + sum(self._pending_restore_reservations.values()),
-        )
-
-    def _reserve_pending_restore_locked(
-        self, identifier: str, archive_bytes: int
-    ) -> None:
-        if self._restore_shutdown:
-            raise RuntimeError("application services are closing")
-        if (
-            identifier in self._pending_restores
-            or identifier in self._pending_restore_reservations
-        ):
-            raise RuntimeError("pending restore identifier collision")
-        count, total_bytes = self._pending_restore_usage_locked()
-        if count >= _MAX_PENDING_RESTORES:
-            raise ValueError("too many pending restore inspections")
-        if total_bytes + archive_bytes > _MAX_PENDING_RESTORE_BYTES:
-            raise ValueError("pending restore storage limit exceeded")
-        self._pending_restore_reservations[identifier] = archive_bytes
-
-    def _backup_inspect(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from arxiv_digest.backup import inspect_backup
-
-        self._expire_pending_restores()
-        identifier = f"restore_{secrets.token_urlsafe(12)}"
-        with self._pending_restores_lock:
-            self._reserve_pending_restore_locked(
-                identifier,
-                len(payload["archive"]),
-            )
-        temporary: Path | None = None
-        try:
-            temporary = self._private_temp(
-                ".zip",
-                prefix=_RESTORE_UPLOAD_PREFIX,
-            )
-            with temporary.open("wb") as handle:
-                os.fchmod(handle.fileno(), 0o600)
-                handle.write(payload["archive"])
-                handle.flush()
-                os.fsync(handle.fileno())
-            inspection = inspect_backup(temporary)
-        except Exception:
-            with self._pending_restores_lock:
-                self._pending_restore_reservations.pop(identifier, None)
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-            raise
-        try:
-            with self._pending_restores_lock:
-                reserved_bytes = self._pending_restore_reservations.pop(
-                    identifier,
-                    None,
-                )
-                if self._restore_shutdown:
-                    raise RuntimeError("application services are closing")
-                if reserved_bytes is None:
-                    raise RuntimeError("pending restore reservation was lost")
-                self._pending_restores[identifier] = (
-                    time.monotonic(),
-                    inspection,
-                )
-                self._schedule_pending_restore_expiration_locked()
-        except Exception:
-            temporary.unlink(missing_ok=True)
-            raise
-        record_counts = {
-            record_type: sum(
-                record.record_type == record_type
-                for record in inspection.records
-            )
-            for record_type in ("saved_paper", "canonical_event")
-        }
-        return {
-            "pending_restore_id": identifier,
-            "format_version": inspection.manifest.format_version,
-            "application_version": inspection.manifest.application_version,
-            "created_at": inspection.manifest.created_at.isoformat(),
-            "profile_revision": inspection.profile.revision,
-            "category_count": len(inspection.profile.categories),
-            "record_count": len(inspection.records),
-            "summary": {
-                "categories": len(inspection.profile.categories),
-                "saved_papers": record_counts["saved_paper"],
-                "review_events": record_counts["canonical_event"],
-                "profile_revision": inspection.profile.revision,
-            },
-        }
-
-    def _backup_restore(self, payload: dict[str, Any]) -> dict[str, Any]:
-        from arxiv_digest.backup import restore_backup
-        from arxiv_digest.storage.database import open_database
-
-        self._expire_pending_restores()
-        identifier = payload["pending_restore_id"]
-        with self._pending_restores_lock:
-            pending = self._pending_restores.get(identifier)
-            if pending is not None:
-                _, reserved_inspection = pending
-                reserved_bytes = reserved_inspection.path.stat().st_size
-                self._pending_restores.pop(identifier)
-                self._pending_restore_reservations[identifier] = reserved_bytes
-            self._schedule_pending_restore_expiration_locked()
-        if pending is None:
-            raise KeyError("pending restore")
-        _, inspection = pending
-        choice_identifier = payload["destination_choice"]
-        picker_choice = self._picker_choices.get(choice_identifier)
-        try:
-            destination = self.folder.validate(
-                self._resolve_folder_choice(choice_identifier)
-            )
-            # Acquire candidate ownership before making maintenance exclusive.
-            # A start that won this lock must register its cancellable worker
-            # first; a restore that won it replaces state before another start
-            # is allowed to capture a draft.
-            with self._candidate_state_lock:
-                with self.maintenance.exclusive(
-                    cancel_active=payload["cancel_active"],
-                    timeout=_BROWSER_RESTORE_WAIT_SECONDS,
-                ):
-                    result = restore_backup(
-                        self.paths,
-                        inspection,
-                        destination,
-                        maintenance=None,
-                    )
-                    # Reopen under the same exclusive lease so migrations,
-                    # integrity checks, and interrupted-run reconciliation finish
-                    # before any worker can observe the replacement database.
-                    validation = open_database(self.paths.database_path)
-                    validation.close()
-                    self._candidate_build = None
-                    self._candidate_job_id = None
-                    self._candidate_job_revision = None
-                    self._suggestions.clear()
-                    self._suggestion_ids.clear()
-                    self._last_sync_report = None
-                    self._last_abstract_retry = None
-        except Exception:
-            retain_pending = False
-            with self._pending_restores_lock:
-                self._pending_restore_reservations.pop(identifier, None)
-                if not self._restore_shutdown:
-                    self._pending_restores[identifier] = pending
-                    self._schedule_pending_restore_expiration_locked()
-                    retain_pending = True
-            if not retain_pending:
-                inspection.path.unlink(missing_ok=True)
-            if picker_choice is not None:
-                self._picker_choices.setdefault(choice_identifier, picker_choice)
-            raise
-        else:
-            with self._pending_restores_lock:
-                self._pending_restore_reservations.pop(identifier, None)
-                self._schedule_pending_restore_expiration_locked()
-            inspection.path.unlink(missing_ok=True)
-            return {
-                "profile_revision": result.profile_revision,
-                "pre_restore_backup_created": result.pre_restore_path is not None,
-            }
-
     def handlers(self) -> Mapping[str, Callable]:
         self._require_open()
         return {
             "status": self.status,
             "update": self.update_status,
-            "update_start": lambda payload: self._update_response(202, self.update_coordinator.start(payload["target_version"])),
-            "update_job": lambda payload: self.update_coordinator.job(payload["job_id"]),
-            "update_commit": lambda payload: self._update_response(202, self.update_coordinator.commit(payload["job_id"])),
-            "update_handoff_ack": lambda payload: self.update_coordinator.handoff_ack(payload["job_id"]),
-            "update_receipt": lambda payload: self.update_coordinator.receipt(),
-            "update_receipt_ack": lambda payload: self.update_coordinator.acknowledge_receipt(payload["receipt_id"]),
             "categories": self._categories,
             "setup_draft_get": lambda payload: self._setup_payload(
                 self.setup.start()
             ),
             "setup_draft_put": self._setup_draft_put,
-            "setup_corpus": self._start_candidate_corpus,
-            "setup_corpus_accept": self._accept_candidate_corpus,
-            "setup_job": self._job_status,
-            "setup_candidate_papers": self._candidate_papers,
-            "setup_candidate_terms": self._candidate_terms,
-            "setup_candidate_authors": self._candidate_authors,
-            "setup_paper_lookup": self._lookup_candidate_paper,
             "setup_folder_pick": self._folder_pick,
             "setup_folder_test": lambda payload: self._folder_test(
                 payload, revision_field="draft_revision"
@@ -2973,15 +2050,8 @@ class _DefaultRuntime:
             "settings_launcher_not_now": self._launcher_not_now,
             "settings_launcher_remove": self._launcher_remove,
             "backup_export": self._backup_export,
-            "backup_inspect": self._backup_inspect,
-            "backup_restore": self._backup_restore,
             "application_quit": self._application_quit,
         }
-
-    @staticmethod
-    def _update_response(status, data):
-        from arxiv_digest.web.api import JsonPayload
-        return JsonPayload(status, data)
 
     def _application_quit(self, payload: dict[str, Any]) -> dict[str, bool]:
         self.lifecycle.request_quit()
@@ -2993,13 +2063,13 @@ class _DefaultRuntime:
             known_paper=self.known_paper,
             static_assets=_packaged_static_assets(),
             lifecycle=self.lifecycle,
-            maintenance=self.maintenance,
         )
 
-    def _sync_configs(self) -> tuple[Any, ...]:
+    def _sync_configs(self, profile: Any | None = None) -> tuple[Any, ...]:
         from arxiv_digest.models import CategoryConfig
 
-        profile = self.profiles.load()
+        if profile is None:
+            profile = self.profiles.load()
         if profile is None:
             return ()
         values = []
@@ -3020,6 +2090,7 @@ class _DefaultRuntime:
         if self._arxiv_access_error() is not None:
             return
         self._start_sync_job({})
+
 
 
 def _standalone_import(
@@ -3065,14 +2136,13 @@ def _standalone_import(
     return 0
 
 
+
 def create_application(
     *,
     paths: AppPaths | None = None,
     browser_open: Callable[[str], bool] = open_browser,
     input_text: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
-    application_started: Callable[[], None] = lambda: None,
-    update_running_command: Path | None = None,
 ) -> Application:
     """Compose the installed application without creating persistent state."""
 
@@ -3093,7 +2163,6 @@ def create_application(
         maintenance,
         lifecycle,
         output=output,
-        update_running_command=update_running_command,
     )
 
     def doctor_action() -> int:
@@ -3138,6 +2207,4 @@ def create_application(
             output=output,
         ),
         install_launcher_action=launcher_action,
-        application_stopping=runtime.update_coordinator.application_stopping,
-        application_started=application_started,
     )

@@ -2,10 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  BACKUP_UPLOAD_LIMIT,
   SettingsController,
-  renderRestoreError,
-  renderRestoreInspection,
   renderSettingsView,
 } from "../../src/arxiv_digest/web/static/settings_view.mjs";
 import {
@@ -211,83 +208,6 @@ test("backup export authentication rejection clears the local session", async ()
   assert.equal(authenticationRejections, 1);
 });
 
-test("restore is inspect-first, size-bounded, and reconfirms destination and pre-restore backup", async () => {
-  const calls = [];
-  let failRestore = true;
-  const api = {
-    origin: "http://127.0.0.1:8123",
-    token: "secret-token",
-    async json(key, path, options) {
-      calls.push({ key, path, options });
-      if (path.endsWith("/inspect")) {
-        return {
-          pending_restore_id: "pending_restore_123",
-          summary: { saved_papers: 7 },
-        };
-      }
-      if (path.endsWith("/restore") && failRestore) {
-        failRestore = false;
-        throw new Error("restore fixture failed");
-      }
-      return { restored: true, pre_restore_backup_created: true };
-    },
-  };
-  const controller = new SettingsController(api);
-  await assert.rejects(
-    () => controller.inspectBackup({ size: BACKUP_UPLOAD_LIMIT + 1 }),
-    /size/i,
-  );
-  assert.equal(calls.length, 0);
-
-  const archive = new Blob(["fixture zip"], { type: "application/zip" });
-  const inspection = await controller.inspectBackup(archive);
-  assert.equal(calls[0].path, "/api/v1/backup/inspect");
-  assert.equal(calls[0].options.body, archive);
-  assert.equal(calls[0].options.headers["Content-Type"], "application/zip");
-  assert.equal(calls.some((call) => call.path.endsWith("/restore")), false);
-
-  assert.throws(
-    () => controller.restoreBackup(inspection.pending_restore_id, { cancelActive: false, confirmedPreRestoreBackup: true }),
-    /destination/i,
-  );
-  controller.reconfirmRestoreDestination(
-    inspection.pending_restore_id,
-    "documents",
-  );
-  assert.throws(
-    () => controller.restoreBackup(inspection.pending_restore_id, { cancelActive: false, confirmedPreRestoreBackup: false }),
-    /pre-restore backup/i,
-  );
-
-  await assert.rejects(
-    () => controller.restoreBackup(inspection.pending_restore_id, { cancelActive: true, confirmedPreRestoreBackup: true }),
-    /fixture failed/,
-  );
-  const restored = await controller.restoreBackup(inspection.pending_restore_id, {
-    cancelActive: true,
-    confirmedPreRestoreBackup: true,
-  });
-  assert.deepEqual(restored, {
-    restored: true,
-    pre_restore_backup_created: true,
-  });
-  const restoreBodies = calls
-    .filter((call) => call.path.endsWith("/restore"))
-    .map((call) => JSON.parse(call.options.body));
-  assert.deepEqual(restoreBodies, [
-    {
-      pending_restore_id: "pending_restore_123",
-      destination_choice: "documents",
-      cancel_active: true,
-    },
-    {
-      pending_restore_id: "pending_restore_123",
-      destination_choice: "documents",
-      cancel_active: true,
-    },
-  ]);
-});
-
 test("settings actions use the exact scoped API routes and require destructive confirmation", async () => {
   const calls = [];
   const api = {
@@ -425,7 +345,6 @@ test("settings keeps canonical version-resolution accounting internal", () => {
     {
       openFolder: () => calls.push("open-folder"),
       exportBackup: () => calls.push("export"),
-      inspectBackup: () => calls.push("inspect"),
       clearCache: () => calls.push("clear-cache"),
       retryLauncher: () => calls.push("retry-launcher"),
       notNowLauncher: () => calls.push("not-now"),
@@ -468,14 +387,13 @@ test("settings keeps canonical version-resolution accounting internal", () => {
     root.textContent,
     /does not include downloaded PDFs, suggestion cache data, or your machine-specific PDF folder/i,
   );
-  assert.match(root.textContent, /Restore replaces your current local data with the backup/i);
-  assert.match(root.textContent, /creates a recovery backup of your current data/i);
+  assert.match(root.textContent, /creates a recovery backup before replacing existing data/i);
   assert.doesNotMatch(root.textContent, /Destination kind/);
   assert.match(root.textContent, /Candidate cache/);
   assert.doesNotMatch(root.textContent, /Disposable cache/);
   assert.match(
     root.textContent,
-    /temporary recent-paper sample used to build setup and Interests suggestions/i,
+    /temporary recent-paper sample used to build Interests suggestions/i,
   );
   assert.match(root.textContent, /download and rebuild it when you refresh suggestions/i);
   assert.match(
@@ -485,10 +403,12 @@ test("settings keeps canonical version-resolution accounting internal", () => {
   assert.match(root.textContent, /This does not start arXiv Digest in the background/i);
   assert.match(root.textContent, /reopened with the arxiv-digest command or desktop launcher/i);
   findButton(root, "Choose PDF folder");
+  assert.match(root.textContent, /choose Quit, wait for the app to stop/i);
+  assert.match(root.textContent, /arxiv-digest import BACKUP.zip/);
+  assert.equal(descendants(root, "input").some(node => node.getAttribute("type") === "file"), false);
 
   findButton(root, "Open folder").click();
   findButton(root, "Export backup").click();
-  findButton(root, "Inspect backup").click();
   findButton(root, "Delete suggestion cache").click();
   assert.equal(calls.includes("clear-cache"), false);
   findButton(root, "Confirm delete suggestion cache").click();
@@ -498,7 +418,6 @@ test("settings keeps canonical version-resolution accounting internal", () => {
   assert.deepEqual(calls, [
     "open-folder",
     "export",
-    "inspect",
     "clear-cache",
     "retry-launcher",
     "not-now",
@@ -537,6 +456,9 @@ test("settings shows and tests only the server-issued picker choice", () => {
   assert.match(root.textContent, /Current PDF folder: ~\/Documents\/Research PDFs/);
   assert.match(root.textContent, /Selected folder: Research PDFs/);
   findButton(root, "Choose PDF folder");
+  assert.match(root.textContent, /choose Quit, wait for the app to stop/i);
+  assert.match(root.textContent, /arxiv-digest import BACKUP.zip/);
+  assert.equal(descendants(root, "input").some(node => node.getAttribute("type") === "file"), false);
   findButton(root, "Test and use folder").click();
   assert.deepEqual(tested, ["picker_12345678"]);
 });
@@ -837,93 +759,4 @@ test("settings reports completed failed-date retries while syncing", () => {
   assert.ok(progress);
   assert.equal(progress.getAttribute("value"), "20");
   assert.equal(progress.getAttribute("max"), "32");
-});
-
-test("restore inspection requires a freshly picked destination and pre-backup confirmation", () => {
-  const document = new FakeDocument();
-  const root = new FakeNode("section");
-  const calls = [];
-  renderRestoreInspection(
-    document,
-    root,
-    {
-      pending_restore_id: "pending_restore_123",
-      summary: {
-        categories: 2,
-        saved_papers: 9,
-        hidden_path: ["", "Users", "private", "archive.zip"].join("/"),
-      },
-    },
-    {
-      confirmDestination: (...args) => calls.push(["destination", ...args]),
-      restore: (...args) => calls.push(["restore", ...args]),
-    },
-  );
-  assert.match(root.textContent, /Inspection made no changes/i);
-  assert.match(root.textContent, /pre-restore backup/i);
-  assert.doesNotMatch(root.textContent, /\/Users\/private/);
-  assert.doesNotMatch(root.textContent, /Downloads \/ Arxiv Digest|Documents \/ Arxiv Digest/);
-  findButton(root, "Choose PDF folder");
-  const restore = findButton(root, "Restore backup");
-  assert.equal(restore.disabled, true);
-
-  renderRestoreInspection(
-    document,
-    root,
-    {
-      pending_restore_id: "pending_restore_123",
-      picker_choice: "picker_12345678",
-      picker_display_name: "Restored PDFs",
-      summary: { categories: 2, saved_papers: 9 },
-    },
-    {
-      confirmDestination: (...args) => calls.push(["destination", ...args]),
-      restore: (...args) => calls.push(["restore", ...args]),
-    },
-  );
-  assert.match(root.textContent, /Selected folder: Restored PDFs/);
-  assert.doesNotMatch(root.textContent, /Downloads \/ Arxiv Digest|Documents \/ Arxiv Digest/);
-  findButton(root, "Use this folder").click();
-  const preBackup = descendants(root, "input").find(
-    (node) => node.getAttribute("name") === "confirm-pre-restore-backup",
-  );
-  preBackup.checked = true;
-  preBackup.dispatchEvent({ type: "change" });
-  const confirmedRestore = findButton(root, "Restore backup");
-  assert.equal(confirmedRestore.disabled, false);
-  confirmedRestore.click();
-  assert.deepEqual(calls, [
-    ["destination", "pending_restore_123", "picker_12345678"],
-    [
-      "restore",
-      "pending_restore_123",
-      { cancelActive: false, confirmedPreRestoreBackup: true },
-    ],
-  ]);
-
-  renderRestoreError(document, root, "Restore failed safely.", () => calls.push("retry"));
-  assert.match(root.textContent, /Inspection made no changes/i);
-  findButton(root, "Retry restore").click();
-  assert.equal(calls.at(-1), "retry");
-});
-
-test("restore offers standard fallbacks only when the native picker is unavailable", () => {
-  const root = new FakeNode("section");
-  const calls = [];
-  renderRestoreInspection(
-    new FakeDocument(),
-    root,
-    {
-      pending_restore_id: "pending_restore_123",
-      picker_unavailable: true,
-      summary: { categories: 1 },
-    },
-    {
-      confirmDestination: (...args) => calls.push(args),
-    },
-  );
-
-  assert.match(root.textContent, /native folder picker is unavailable/i);
-  findButton(root, "Use Downloads fallback").click();
-  assert.deepEqual(calls, [["pending_restore_123", "downloads"]]);
 });

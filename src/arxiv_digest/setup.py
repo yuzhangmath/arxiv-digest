@@ -14,11 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import ContextManager, Literal
 
-from arxiv_digest.candidates import (
-    CandidateCorpusBuild,
-    CandidateDocument,
-    candidate_corpus_hash,
-)
+from arxiv_digest.candidates import CandidateDocument
 from arxiv_digest.atomic import atomic_write, exclusive_flock
 from arxiv_digest.desktop_launcher import LauncherCollisionError
 from arxiv_digest.maintenance import MaintenanceBarrier
@@ -51,10 +47,6 @@ NOT_NOW_LABEL = "Not now"
 class SetupStep(StrEnum):
     CATEGORIES = "categories"
     INITIAL_COVERAGE = "initial_coverage"
-    CANDIDATE_CORPUS = "candidate_corpus"
-    SEED_PAPERS = "seed_papers"
-    KEYWORDS_AND_PHRASES = "keywords_and_phrases"
-    AUTHORS = "authors"
     PDF_DESTINATION = "pdf_destination"
     REVIEW = "review"
     DESKTOP_LAUNCHER = "desktop_launcher"
@@ -90,6 +82,7 @@ class SetupDraft:
     categories: tuple[CategorySelection, ...]
     coverage_start: date | None
     coverage_warning: str | None
+    # Retain the schema-1 draft payload so unfinished older setups still decode.
     corpus_hash: str | None
     corpus_categories: tuple[str, ...]
     corpus_complete: bool
@@ -299,7 +292,15 @@ def _decode_row(row: sqlite3.Row) -> SetupDraft:
     return SetupDraft(
         schema_version=row["schema_version"],
         revision=row["revision"],
-        current_step=SetupStep(row["current_step"]),
+        # Older drafts may be waiting at optional personalization steps. Their
+        # explicit selections remain in the payload and in the review summary.
+        current_step=(
+            SetupStep.PDF_DESTINATION
+            if row["current_step"] in {
+                "candidate_corpus", "seed_papers", "keywords_and_phrases", "authors"
+            }
+            else SetupStep(row["current_step"])
+        ),
         categories=categories,
         coverage_start=None if coverage is None else date.fromisoformat(coverage),
         coverage_warning=payload["coverage_warning"],
@@ -455,14 +456,10 @@ class SetupService:
         expected_revision: int,
         coverage_start: date,
         *,
-        earliest_datestamp: date,
         coverage_bounds: tuple[date, date] | None = None,
     ) -> SetupDraft:
-        if (
-            type(coverage_start) is not date
-            or type(earliest_datestamp) is not date
-        ):
-            raise TypeError("coverage values must be calendar dates")
+        if type(coverage_start) is not date:
+            raise TypeError("coverage start must be a calendar date")
         current = self._require_revision(expected_revision)
         self._require_step(current, SetupStep.INITIAL_COVERAGE)
         if coverage_bounds is None:
@@ -487,124 +484,13 @@ class SetupService:
         revised = replace(
             current,
             revision=current.revision + 1,
-            current_step=SetupStep.CANDIDATE_CORPUS,
+            current_step=SetupStep.PDF_DESTINATION,
             coverage_start=coverage_start,
             coverage_warning=None,
             updated_at=self.clock(),
         )
         self._save_draft(revised, expected_revision=expected_revision)
         return revised
-
-    def accept_candidate_corpus(
-        self,
-        expected_revision: int,
-        build: CandidateCorpusBuild,
-        *,
-        corpus_hash: str,
-    ) -> SetupDraft:
-        if not isinstance(build, CandidateCorpusBuild):
-            raise TypeError("build must be a CandidateCorpusBuild")
-        current = self._require_revision(expected_revision)
-        self._require_step(current, SetupStep.CANDIDATE_CORPUS)
-        selected = {value.category.casefold() for value in current.categories}
-        provided = {value.casefold() for value in build.corpus.categories}
-        if selected != provided or len(build.corpus.categories) != len(selected):
-            raise SetupStateError(
-                "corpus_category_mismatch",
-                "candidate corpus belongs to different selected categories",
-            )
-        actual_hash = candidate_corpus_hash(build.corpus)
-        if build.corpus_hash != actual_hash or corpus_hash != actual_hash:
-            raise SetupStateError(
-                "stale_corpus", "candidate corpus changed; regenerate or retry"
-            )
-        reduced_ready = (
-            build.reduced_breadth and build.minimum_met and not build.complete
-        )
-        if not build.setup_ready or not (build.complete or reduced_ready):
-            raise SetupStateError(
-                "corpus_not_ready",
-                "candidate corpus is incomplete; resume or retry generation",
-            )
-        revised = replace(
-            current,
-            revision=current.revision + 1,
-            current_step=SetupStep.SEED_PAPERS,
-            corpus_hash=actual_hash,
-            corpus_categories=tuple(build.corpus.categories),
-            corpus_complete=build.complete,
-            corpus_reduced_breadth=reduced_ready,
-            updated_at=self.clock(),
-        )
-        self._save_draft(revised, expected_revision=expected_revision)
-        return revised
-
-    # The short alias is convenient for application adapters while retaining
-    # the more explicit public name used by the setup domain.
-    accept_corpus = accept_candidate_corpus
-
-    def select_seed_papers(
-        self,
-        expected_revision: int,
-        papers: Iterable[CandidateDocument],
-    ) -> SetupDraft:
-        selected = tuple(papers)
-        if any(not isinstance(value, CandidateDocument) for value in selected):
-            raise TypeError("seed papers must contain CandidateDocument values")
-        ids = tuple(value.paper.arxiv_id for value in selected)
-        if len(ids) != len(set(ids)):
-            raise ValueError("seed papers must have unique arXiv IDs")
-        current = self._require_revision(expected_revision)
-        self._require_step(current, SetupStep.SEED_PAPERS)
-        categories = {value.category for value in current.categories}
-        if any(
-            not categories.intersection(document.eligible_categories)
-            for document in selected
-        ):
-            raise SetupStateError(
-                "seed_category_mismatch",
-                "seed paper is not eligible for a selected category",
-            )
-        return self._advance(
-            current,
-            expected_revision,
-            SetupStep.KEYWORDS_AND_PHRASES,
-            seed_papers=selected,
-        )
-
-    def select_terms(
-        self,
-        expected_revision: int,
-        *,
-        keywords: Iterable[str],
-        phrases: Iterable[str],
-    ) -> SetupDraft:
-        normalized_keywords = _normalize_text_values(keywords, "keywords")
-        normalized_phrases = _normalize_text_values(phrases, "phrases")
-        current = self._require_revision(expected_revision)
-        self._require_step(current, SetupStep.KEYWORDS_AND_PHRASES)
-        return self._advance(
-            current,
-            expected_revision,
-            SetupStep.AUTHORS,
-            keywords=normalized_keywords,
-            phrases=normalized_phrases,
-        )
-
-    def select_authors(
-        self,
-        expected_revision: int,
-        authors: Iterable[str],
-    ) -> SetupDraft:
-        normalized = _normalize_text_values(authors, "authors")
-        current = self._require_revision(expected_revision)
-        self._require_step(current, SetupStep.AUTHORS)
-        return self._advance(
-            current,
-            expected_revision,
-            SetupStep.PDF_DESTINATION,
-            authors=normalized,
-        )
 
     def set_pdf_destination(
         self,
@@ -816,21 +702,6 @@ class SetupService:
             raise SetupStateError("categories_required", "select at least one category")
         if draft.coverage_start is None:
             raise SetupStateError("coverage_required", "select initial coverage")
-        selected = {value.category.casefold() for value in draft.categories}
-        corpus = {value.casefold() for value in draft.corpus_categories}
-        if (
-            draft.corpus_hash is None
-            or selected != corpus
-            or not (draft.corpus_complete or draft.corpus_reduced_breadth)
-        ):
-            raise SetupStateError(
-                "corpus_not_ready", "accept the current candidate corpus"
-            )
-        # Empty tuples are valid explicit choices. Reaching this step proves
-        # each paper/term/author stage was visited in order.
-        _normalize_text_values(draft.keywords, "keywords")
-        _normalize_text_values(draft.phrases, "phrases")
-        _normalize_text_values(draft.authors, "authors")
         if draft.pdf_destination is None or not draft.destination_tested:
             raise SetupStateError(
                 "destination_not_tested", "test the PDF destination"
@@ -1151,20 +1022,6 @@ def _normalize_categories(
     if len(folded) != len(set(folded)):
         raise ValueError("selected categories must be unique")
     return tuple(result)
-
-
-def _normalize_text_values(values: Iterable[str], field: str) -> tuple[str, ...]:
-    if isinstance(values, str):
-        raise TypeError(f"{field} must be an iterable of strings")
-    original = tuple(values)
-    if any(not isinstance(value, str) for value in original):
-        raise TypeError(f"{field} must contain strings")
-    result = tuple(" ".join(value.split()) for value in original)
-    if any(not value for value in result):
-        raise ValueError(f"{field} must not contain blank values")
-    if len({value.casefold() for value in result}) != len(result):
-        raise ValueError(f"{field} must not contain duplicates")
-    return result
 
 
 def _fsync_directory(path: Path) -> None:

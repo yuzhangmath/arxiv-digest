@@ -1,3 +1,5 @@
+const BACKUP_DOWNLOAD_LIMIT = 64 * 1024 * 1024;
+
 export class SettingsController {
   constructor(api, dependencies = {}) {
     if (!api || typeof api.json !== "function") {
@@ -5,7 +7,6 @@ export class SettingsController {
     }
     this.api = api;
     this.dependencies = dependencies;
-    this.pendingRestores = new Map();
     this.testedDestinationToken = null;
   }
 
@@ -185,7 +186,7 @@ export class SettingsController {
       throw new TypeError("Backup export returned an invalid content type");
     }
     const blob = await response.blob();
-    if (!(blob instanceof Blob) || blob.size > BACKUP_UPLOAD_LIMIT) {
+    if (!(blob instanceof Blob) || blob.size > BACKUP_DOWNLOAD_LIMIT) {
       throw new TypeError("Backup export exceeded the allowed size");
     }
     const objectUrl = urlApi.createObjectURL(blob);
@@ -199,81 +200,9 @@ export class SettingsController {
     }
   }
 
-  async inspectBackup(archive) {
-    if (
-      !archive ||
-      !Number.isSafeInteger(archive.size) ||
-      archive.size < 1 ||
-      archive.size > BACKUP_UPLOAD_LIMIT
-    ) {
-      throw new TypeError("Backup upload size is outside the route limit");
-    }
-    if (!(archive instanceof Blob)) throw new TypeError("Backup must be a ZIP Blob");
-    const result = await this.api.json(
-      "backup-inspect",
-      "/api/v1/backup/inspect",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/zip" },
-        body: archive,
-      },
-    );
-    assertPendingRestoreId(result?.pending_restore_id);
-    this.pendingRestores.clear();
-    this.pendingRestores.set(result.pending_restore_id, {
-      inspection: result,
-      destinationChoice: null,
-    });
-    return result;
-  }
-
-  reconfirmRestoreDestination(pendingRestoreId, destinationChoice) {
-    assertPendingRestoreId(pendingRestoreId);
-    assertDestinationChoice(destinationChoice);
-    const pending = this.pendingRestores.get(pendingRestoreId);
-    if (!pending) throw new TypeError("Restore inspection is missing or expired");
-    pending.destinationChoice = destinationChoice;
-  }
-
-  restoreBackup(pendingRestoreId, options = {}) {
-    assertPendingRestoreId(pendingRestoreId);
-    const pending = this.pendingRestores.get(pendingRestoreId);
-    if (!pending) throw new TypeError("Restore inspection is missing or expired");
-    if (!pending.destinationChoice) {
-      throw new TypeError("PDF destination must be reconfirmed after inspection");
-    }
-    if (options.confirmedPreRestoreBackup !== true) {
-      throw new TypeError("Confirm that a pre-restore backup will be created");
-    }
-    if (typeof options.cancelActive !== "boolean") {
-      throw new TypeError("Choose whether active work may be cancelled");
-    }
-    const request = this.api.json(
-      "backup-restore",
-      "/api/v1/backup/restore",
-      jsonPost({
-        pending_restore_id: pendingRestoreId,
-        destination_choice: pending.destinationChoice,
-        cancel_active: options.cancelActive,
-      }),
-    );
-    return Promise.resolve(request).then((result) => {
-      this.pendingRestores.delete(pendingRestoreId);
-      return result;
-    });
-  }
 }
 
-export const BACKUP_UPLOAD_LIMIT = 64 * 1024 * 1024;
-
-const SERVER_ID = /^[A-Za-z0-9_-]{8,128}$/;
 const PICKER_ID = /^picker_[A-Za-z0-9_-]{8,120}$/;
-
-function assertPendingRestoreId(value) {
-  if (typeof value !== "string" || !SERVER_ID.test(value)) {
-    throw new TypeError("Invalid pending restore ID");
-  }
-}
 
 function assertDestinationChoice(value) {
   if (value !== "downloads" && value !== "documents" && !PICKER_ID.test(value)) {
@@ -697,19 +626,12 @@ export function renderSettingsView(document, container, model = {}, actions = {}
     element(
       document,
       "p",
-      "Inspect validates and previews a backup without changing anything. Restore replaces " +
-        "your current local data with the backup after you choose a PDF folder. Before " +
-        "replacing anything, arXiv Digest creates a recovery backup of your current data.",
+      "To restore a backup, choose Quit, wait for the app to stop, then run this command " +
+        "in a terminal. The command validates the backup, asks for a PDF folder, and " +
+        "creates a recovery backup before replacing existing data.",
     ),
+    element(document, "code", "arxiv-digest import BACKUP.zip"),
     actionButton(document, "Export backup", () => actions.exportBackup?.()),
-  );
-  const importInput = element(document, "input");
-  importInput.setAttribute("type", "file");
-  importInput.setAttribute("accept", "application/zip,.zip");
-  importInput.setAttribute("aria-label", "Portable backup ZIP");
-  backup.append(
-    importInput,
-    actionButton(document, "Inspect backup", () => actions.inspectBackup?.(importInput.files?.[0])),
   );
   container.append(backup, renderDoctor(document, model.doctor));
 
@@ -727,7 +649,7 @@ export function renderSettingsView(document, container, model = {}, actions = {}
     element(
       document,
       "p",
-      "Stores a temporary recent-paper sample used to build setup and Interests suggestions. " +
+      "Stores a temporary recent-paper sample used to build Interests suggestions. " +
         "Delete it to free space or clear a stale sample; arXiv Digest will download and " +
         "rebuild it when you refresh suggestions. Interests, synchronization checkpoints, " +
         "review progress, Library papers, and downloaded PDFs are not removed.",
@@ -761,127 +683,4 @@ export function renderSettingsView(document, container, model = {}, actions = {}
   );
   container.append(quit);
   return container;
-}
-
-export function renderRestoreInspection(document, container, inspection, actions = {}) {
-  assertPendingRestoreId(inspection?.pending_restore_id);
-  container.replaceChildren();
-  container.append(
-    element(document, "h2", "Restore inspection"),
-    element(
-      document,
-      "p",
-      "Inspection made no changes. Reconfirm a PDF destination before restoring.",
-    ),
-  );
-  const summary = element(document, "dl");
-  const summaryFields = [
-    ["Categories", inspection.summary?.categories],
-    ["Saved papers", inspection.summary?.saved_papers],
-    ["Review events", inspection.summary?.review_events],
-    ["Profile revision", inspection.summary?.profile_revision],
-  ];
-  for (const [label, value] of summaryFields) {
-    if (!Number.isSafeInteger(value) || value < 0) continue;
-    summary.append(element(document, "dt", label), element(document, "dd", String(value)));
-  }
-  container.append(summary);
-
-  const destination = element(document, "fieldset");
-  destination.append(element(document, "legend", "Reconfirm PDF destination"));
-  let destinationChoice = null;
-  const pendingId = inspection.pending_restore_id;
-  let restoreButton;
-  let preBackup;
-  const refresh = () => {
-    if (restoreButton) restoreButton.disabled = !destinationChoice || !preBackup.checked;
-  };
-  if (
-    typeof inspection.picker_choice === "string" &&
-    PICKER_ID.test(inspection.picker_choice)
-  ) {
-    const value = inspection.picker_choice;
-    const displayName =
-      typeof inspection.picker_display_name === "string" &&
-      inspection.picker_display_name.trim()
-        ? inspection.picker_display_name.trim()
-        : "Chosen folder";
-    destination.append(
-      element(document, "p", `Selected folder: ${displayName}`, "selected-destination"),
-      actionButton(document, "Use this folder", () => {
-        destinationChoice = value;
-        actions.confirmDestination?.(pendingId, value);
-        refresh();
-      }),
-      actionButton(document, "Choose another folder", () => actions.pickFolder?.(pendingId)),
-    );
-  } else if (inspection.picker_unavailable === true) {
-    destination.append(
-      element(
-        document,
-        "p",
-        "The native folder picker is unavailable. Choose an app-managed fallback folder for restored PDFs.",
-        "picker-status",
-      ),
-      actionButton(document, "Use Downloads fallback", () => {
-        destinationChoice = "downloads";
-        actions.confirmDestination?.(pendingId, destinationChoice);
-        refresh();
-      }),
-      actionButton(document, "Use Documents fallback", () => {
-        destinationChoice = "documents";
-        actions.confirmDestination?.(pendingId, destinationChoice);
-        refresh();
-      }),
-      actionButton(document, "Try folder picker again", () => actions.pickFolder?.(pendingId)),
-    );
-  } else {
-    destination.append(
-      actionButton(document, "Choose PDF folder", () => actions.pickFolder?.(pendingId)),
-    );
-  }
-  container.append(destination);
-
-  const preBackupLabel = element(document, "label");
-  preBackup = element(document, "input");
-  preBackup.setAttribute("type", "checkbox");
-  preBackup.setAttribute("name", "confirm-pre-restore-backup");
-  preBackup.addEventListener("change", refresh);
-  preBackupLabel.append(
-    preBackup,
-    document.createTextNode(" I understand a pre-restore backup will be created before local state changes."),
-  );
-  const cancelLabel = element(document, "label");
-  const cancelActive = element(document, "input");
-  cancelActive.setAttribute("type", "checkbox");
-  cancelActive.setAttribute("name", "cancel-active-work");
-  cancelLabel.append(
-    cancelActive,
-    document.createTextNode(" Cancel active synchronization or downloads if needed."),
-  );
-  container.append(preBackupLabel, cancelLabel);
-  restoreButton = actionButton(document, "Restore backup", () => {
-    actions.restore?.(pendingId, {
-      cancelActive: cancelActive.checked,
-      confirmedPreRestoreBackup: preBackup.checked,
-    });
-  });
-  restoreButton.disabled = true;
-  container.append(restoreButton);
-  return container;
-}
-
-export function renderRestoreError(document, container, message, retry) {
-  const banner = element(document, "section", undefined, "error-banner");
-  banner.setAttribute("role", "alert");
-  banner.append(
-    element(
-      document,
-      "p",
-      typeof message === "string" ? message : "Restore did not complete. Local data remains usable.",
-    ),
-    actionButton(document, "Retry restore", () => retry?.()),
-  );
-  container.append(banner);
-  return banner;
 }

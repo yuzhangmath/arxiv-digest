@@ -1,264 +1,212 @@
 from __future__ import annotations
 
 import ast
-import copy
+import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
 import textwrap
-import types
-from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 
-from scripts import publish_verifier, release_bundle
-from tests.unit.test_release_bundle import COMMIT, VERSION, _github_release_payload, valid_bundle
+from scripts import publish_verifier as verifier
 
 
 ROOT = Path(__file__).resolve().parents[2]
+VERSION = "0.3.1"
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+NOTES = b"# Synthetic release notes\n"
 
 
-def embedded_verifier():
+@pytest.fixture
+def bundle_path(tmp_path: Path) -> Path:
+    root = tmp_path / "bundle"
+    root.mkdir()
+    names = (f"arxiv_digest-{VERSION}-py3-none-any.whl", f"arxiv_digest-{VERSION}.tar.gz")
+    checksums = []
+    for name in names:
+        payload = f"synthetic {name}\n".encode()
+        (root / name).write_bytes(payload)
+        checksums.append(f"{hashlib.sha256(payload).hexdigest()}  {name}\n")
+    (root / "SHA256SUMS").write_text("".join(checksums), encoding="ascii")
+    (root / "RELEASE_NOTES.md").write_bytes(NOTES)
+    (root / "COMMIT_SHA").write_text(COMMIT + "\n", encoding="ascii")
+    return root
+
+
+def verified_bundle(root: Path):
+    return verifier.verify_downloaded_bundle(root, version=VERSION, commit=COMMIT)
+
+
+def release_record(bundle) -> dict:
+    return {
+        "tag_name": f"v{bundle.version}",
+        "draft": False,
+        "prerelease": True,
+        "body": NOTES.decode(),
+        "assets": [
+            {
+                "name": asset.name,
+                "state": "uploaded",
+                "size": asset.size,
+                "digest": f"sha256:{asset.sha256}",
+                "browser_download_url": f"{verifier.REPOSITORY}/releases/download/v{bundle.version}/{asset.name}",
+            }
+            for asset in bundle.assets
+        ],
+    }
+
+
+def test_bundle_and_published_release_match_exact_artifacts(bundle_path):
+    bundle = verified_bundle(bundle_path)
+    assert bundle.version == VERSION
+    assert bundle.commit == COMMIT
+    assert bundle.channel == "prerelease"
+    assert bundle.release_notes_sha256 == hashlib.sha256(NOTES).hexdigest()
+    assert [asset.name for asset in bundle.assets] == [
+        f"arxiv_digest-{VERSION}-py3-none-any.whl",
+        f"arxiv_digest-{VERSION}.tar.gz",
+        "SHA256SUMS",
+    ]
+    for asset in bundle.assets:
+        payload = (bundle_path / asset.name).read_bytes()
+        assert (asset.size, asset.sha256) == (len(payload), hashlib.sha256(payload).hexdigest())
+    verifier.verify_github_release(
+        json.dumps(release_record(bundle)).encode(),
+        bundle=bundle, tag=f"v{VERSION}", remote_tag_commit=COMMIT,
+    )
+
+
+@pytest.mark.parametrize("mutation", [
+    "extra", "missing", "symlink", "directory", "hardlink", "empty", "checksum", "commit", "notes",
+])
+def test_bundle_rejects_unsafe_or_changed_artifacts(bundle_path, mutation):
+    notes = bundle_path / "RELEASE_NOTES.md"
+    if mutation == "extra":
+        (bundle_path / "extra.py").write_text("raise AssertionError()")
+    elif mutation == "missing":
+        notes.unlink()
+    elif mutation in {"symlink", "directory", "hardlink"}:
+        notes.unlink()
+        if mutation == "symlink":
+            notes.symlink_to(bundle_path / "COMMIT_SHA")
+        elif mutation == "hardlink":
+            os.link(bundle_path / "COMMIT_SHA", notes)
+        else:
+            notes.mkdir()
+    elif mutation == "empty":
+        (bundle_path / f"arxiv_digest-{VERSION}.tar.gz").write_bytes(b"")
+    elif mutation == "checksum":
+        (bundle_path / "SHA256SUMS").write_text("0" * 64)
+    elif mutation == "commit":
+        (bundle_path / "COMMIT_SHA").write_text("0" * 40 + "\n")
+    else:
+        notes.write_bytes(b"\xff")
+    with pytest.raises(ValueError):
+        verified_bundle(bundle_path)
+
+
+@pytest.mark.parametrize("version,commit", [("03.1.0", COMMIT), (VERSION, COMMIT.upper()), (VERSION, "short")])
+def test_bundle_rejects_invalid_release_identity(bundle_path, version, commit):
+    with pytest.raises(ValueError):
+        verifier.verify_downloaded_bundle(bundle_path, version=version, commit=commit)
+
+
+def test_bundle_detects_file_substitution_during_verification(bundle_path, monkeypatch):
+    read = verifier._read_regular_bytes
+
+    def replace_after_read(path, *, byte_limit):
+        payload = read(path, byte_limit=byte_limit)
+        if path.name == "SHA256SUMS":
+            path.write_bytes(b"changed\n")
+        return payload
+
+    monkeypatch.setattr(verifier, "_read_regular_bytes", replace_after_read)
+    with pytest.raises(verifier.BundleError):
+        verified_bundle(bundle_path)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("tag_name", "v0.0.0"), ("draft", True), ("prerelease", False), ("body", "changed"),
+    ("name", "renamed.whl"), ("state", "new"), ("size", True),
+    ("digest", "sha256:" + "0" * 64), ("browser_download_url", "https://example.invalid/asset"),
+    ("assets", []),
+])
+def test_published_release_rejects_mismatched_identity_or_assets(bundle_path, field, value):
+    bundle = verified_bundle(bundle_path)
+    record = release_record(bundle)
+    target = record if field in record else record["assets"][0]
+    target[field] = value
+    with pytest.raises(verifier.BundleError):
+        verifier.verify_github_release(
+            json.dumps(record).encode(), bundle=bundle,
+            tag=f"v{VERSION}", remote_tag_commit=COMMIT,
+        )
+
+
+@pytest.mark.parametrize("payload", [b'{"draft":false,"draft":false}', b"NaN", b"{", b"[]", b"\xff"])
+def test_published_release_rejects_invalid_json(bundle_path, payload):
+    with pytest.raises(verifier.BundleError):
+        verifier.verify_github_release(
+            payload, bundle=verified_bundle(bundle_path), tag=f"v{VERSION}", remote_tag_commit=COMMIT,
+        )
+
+
+def test_published_release_rejects_changed_tag_commit_and_oversized_response(bundle_path):
+    bundle = verified_bundle(bundle_path)
+    payload = json.dumps(release_record(bundle)).encode()
+    for content, commit in ((payload, "0" * 40), (b" " * (verifier.RELEASE_PAGE_BYTE_LIMIT + 1), COMMIT)):
+        with pytest.raises(verifier.BundleError):
+            verifier.verify_github_release(content, bundle=bundle, tag=f"v{VERSION}", remote_tag_commit=commit)
+
+
+def test_cli_reports_invalid_bundle_without_local_paths(bundle_path, capsys):
+    (bundle_path / "COMMIT_SHA").unlink()
+    assert verifier.main(["--bundle", str(bundle_path), "--version", VERSION, "--commit", COMMIT]) == 1
+    assert capsys.readouterr().err == "release verification failed\n"
+
+
+def test_workflow_embeds_the_same_stdlib_verifier_and_runs_it_in_isolation(bundle_path, tmp_path):
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
     match = re.search(r"<<'PY_VERIFIER'\n(.*?)^          PY_VERIFIER$", workflow, re.MULTILINE | re.DOTALL)
     assert match is not None
     source = textwrap.dedent(match.group(1))
     assert source == (ROOT / "scripts/publish_verifier.py").read_text()
-    module = types.ModuleType("synthetic_inline_publish_verifier")
-    sys.modules[module.__name__] = module
-    try:
-        exec(compile(source, "trusted-workflow-inline", "exec"), module.__dict__)
-    finally:
-        del sys.modules[module.__name__]
-    return module
+    for node in ast.walk(ast.parse(source)):
+        names = [item.name for item in node.names] if isinstance(node, ast.Import) else [node.module] if isinstance(node, ast.ImportFrom) else []
+        assert all(name.split(".")[0] in sys.stdlib_module_names for name in names)
+    script = tmp_path / "trusted-verifier.py"
+    script.write_text(source)
+    result = subprocess.run(
+        [sys.executable, "-I", str(script)], capture_output=True, text=True,
+        env={**os.environ, "BUNDLE": str(bundle_path), "VERSION": VERSION, "EXPECTED_COMMIT": COMMIT},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "prerelease\n"
 
 
-def test_embedded_verifier_is_literal_stdlib_source_and_matches_remote_contract():
-    embedded_verifier()
-    source = (ROOT / "scripts/publish_verifier.py").read_text()
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            assert all(item.name.split(".")[0] in sys.stdlib_module_names for item in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            assert node.module.split(".")[0] in sys.stdlib_module_names
-    original = ast.parse((ROOT / "scripts/release_bundle.py").read_text())
-    extract = lambda body: next(node for node in body if isinstance(node, ast.FunctionDef) and node.name == "verify_github_release")
-    assert ast.dump(extract(tree.body)) == ast.dump(extract(original.body))
-
-
-@pytest.mark.parametrize("mutation", [
-    "valid", "tag", "draft", "channel", "body", "missing", "extra", "duplicate", "renamed",
-    "state", "size", "bool-size", "digest", "url", "duplicate-json-key", "nonfinite", "truncated", "array", "oversized", "tag-commit",
-])
-def test_actual_embedded_verifier_and_source_share_the_hostile_github_matrix(valid_bundle, mutation):
-    inline = embedded_verifier()
-    source_bundle = release_bundle.verify_local_bundle(valid_bundle, version=VERSION, commit=COMMIT)
-    inline_bundle = inline.verify_downloaded_bundle(valid_bundle, version=VERSION, commit=COMMIT)
-    assert asdict(source_bundle) == asdict(inline_bundle)
-    record = json.loads(_github_release_payload(source_bundle))
-    if mutation == "tag": record["tag_name"] = "v0.3.2"
-    elif mutation == "draft": record["draft"] = True
-    elif mutation == "channel": record["prerelease"] = False
-    elif mutation == "body": record["body"] += "changed"
-    elif mutation == "missing": record["assets"].pop()
-    elif mutation == "extra": record["assets"].append({"name": "extra"})
-    elif mutation == "duplicate": record["assets"][1] = copy.deepcopy(record["assets"][0])
-    elif mutation == "renamed": record["assets"][0]["name"] = "other.whl"
-    elif mutation == "state": record["assets"][0]["state"] = "new"
-    elif mutation == "size": record["assets"][0]["size"] += 1
-    elif mutation == "bool-size": record["assets"][0]["size"] = True
-    elif mutation == "digest": record["assets"][0]["digest"] = "sha256:" + "0" * 64
-    elif mutation == "url": record["assets"][0]["browser_download_url"] = "https://example.invalid/asset"
-    payload = json.dumps(record).encode()
-    if mutation == "duplicate-json-key": payload = b'{"draft":false,"draft":false}'
-    elif mutation == "nonfinite": payload = b'NaN'
-    elif mutation == "truncated": payload = b'{'
-    elif mutation == "array": payload = b'[]'
-    elif mutation == "oversized": payload = b" " * (inline.RELEASE_PAGE_BYTE_LIMIT + 1)
-    for module, bundle in ((release_bundle, source_bundle), (inline, inline_bundle)):
-        kwargs = {"bundle": bundle, "tag": f"v{VERSION}", "remote_tag_commit": "0" * 40 if mutation == "tag-commit" else COMMIT}
-        if mutation == "valid":
-            assert module.verify_github_release(payload, **kwargs) is None
-        else:
-            with pytest.raises(module.BundleError):
-                module.verify_github_release(payload, **kwargs)
-
-
-@pytest.mark.parametrize("mutation", ["extra", "symlink", "checksum-crlf", "commit-newline", "manifest-bool", "unsafe-wheel"])
-def test_embedded_verifier_checks_downloaded_bundle_before_remote_operation(valid_bundle, mutation):
-    inline = embedded_verifier()
-    if mutation == "extra": (valid_bundle / "downloaded-code.py").write_text("raise Exception()")
-    elif mutation == "symlink":
-        (valid_bundle / "COMMIT_SHA").unlink()
-        (valid_bundle / "COMMIT_SHA").symlink_to(valid_bundle / "RELEASE_NOTES.md")
-    elif mutation == "checksum-crlf":
-        path = valid_bundle / "SHA256SUMS"
-        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
-    elif mutation == "commit-newline": (valid_bundle / "COMMIT_SHA").write_text(COMMIT)
-    elif mutation == "manifest-bool":
-        path = valid_bundle / "UPDATE_MANIFEST.json"
-        record = json.loads(path.read_bytes())
-        record["schema_version"] = True
-        path.write_text(json.dumps(record))
-    elif mutation == "unsafe-wheel":
-        path = valid_bundle / f"arxiv_digest-{VERSION}-py3-none-any.whl"
-        path.unlink()
-        path.mkdir()
-    with pytest.raises((inline.BundleError, OSError)):
-        inline.verify_downloaded_bundle(valid_bundle, version=VERSION, commit=COMMIT)
-
-
-@pytest.mark.parametrize("implementation", ["source", "embedded"])
-def test_asset_hashing_stops_when_a_file_keeps_growing(tmp_path, monkeypatch, implementation):
-    module = release_bundle if implementation == "source" else embedded_verifier()
-    path = tmp_path / "growing.whl"
-    path.write_bytes(b"small")
-    fdopen = module.os.fdopen
-
-    class GrowingReader:
-        def __init__(self, descriptor):
-            self.source = fdopen(descriptor, "rb")
-            self.reads = 0
-
-        def __enter__(self): return self
-        def __exit__(self, *args): self.source.close()
-        def fileno(self): return self.source.fileno()
-
-        def read(self, amount):
-            self.reads += 1
-            assert self.reads == 1, "asset hashing exceeded the original size bound"
-            return b"x" * amount
-
-    monkeypatch.setattr(module.os, "fdopen", lambda descriptor, mode: GrowingReader(descriptor))
-    with pytest.raises(module.BundleError, match="changed during verification"):
-        module._asset(path)
-
-
-def test_workflows_build_once_verify_manifest_and_preserve_permission_boundary():
-    for name in ("tests.yml", "release.yml"):
-        workflow = (ROOT / ".github/workflows" / name).read_text()
-        assert workflow.count("python -m build") == 1
-        assert "scripts/update_manifest.py" in workflow
-        assert "scripts/release_bundle.py local" in workflow
-        assert "ARXIV_DIGEST_RELEASE_ARTIFACT_DIR" in workflow
-        assert "SOURCE_DATE_EPOCH" in workflow
-        assert "git diff --exit-code" in workflow and "git diff --cached --exit-code" in workflow
-        assert workflow.count("python scripts/ci_python.py") == 1
-        assert "umask 022\n          python -m pytest tests/unit tests/integration -q" in workflow
-        assert "umask 022\n          python -m pytest tests/browser -q" in workflow
+def test_release_keeps_single_build_native_coverage_and_publish_permission_boundary():
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
-    build, publish = workflow.split("  publish:\n", 1)
-    assert "contents: write" not in build
+    build, native, publish = re.split(r"^  (?:native_validation|publish):\n", workflow, flags=re.MULTILINE)
+    assert workflow.count("python -m build") == 1
+    assert "contents: write" not in build + native
     assert "contents: write" in publish
     assert "actions/checkout@" not in publish
-    assert '"$BUNDLE/UPDATE_MANIFEST.json"' in publish
+    assert "needs: [build, native_validation]" in publish
     assert 'python3 -I "$RUNNER_TEMP/trusted-publish-verifier.py"' in publish
-    assert '"refs/tags/${RELEASE_TAG}^{}"' in build
-
-
-def test_publication_requires_native_matrix_for_the_exact_build_candidate():
-    workflow = (ROOT / ".github/workflows/release.yml").read_text()
-    jobs = dict(re.findall(
-        r"^  ([a-z_]+):\n(.*?)(?=^  [a-z_]+:\n|\Z)",
-        workflow.split("jobs:\n", 1)[1],
-        re.MULTILINE | re.DOTALL,
-    ))
-    validation = jobs["native_validation"]
-    publish = jobs["publish"]
-    assert "    needs: build\n" in validation
-    assert "        os: [ubuntu-24.04, macos-latest]\n" in validation
-    assert '        python: ["3.11", "3.x"]\n' in validation
-    assert '        suite: [python, browser]\n' in validation
-    assert "      fail-fast: false\n" in validation
-    assert "    runs-on: ${{ matrix.os }}\n" in validation
-    assert "          python-version: ${{ matrix.python }}\n" in validation
-    assert "          ref: ${{ needs.build.outputs.commit_sha }}\n" in validation
-    assert "          fetch-depth: 0\n" in validation
-    assert "          fetch-tags: true\n" in validation
-    assert validation.index("python scripts/ci_python.py") < validation.index(
-        "      - name: Install the candidate wheel and development dependencies\n"
-    )
-    for job in (validation, publish):
-        assert "          artifact-ids: ${{ needs.build.outputs.artifact_id }}\n" in job
-        assert "          digest-mismatch: error\n" in job
-        assert "continue-on-error:" not in job
-    assert "    needs: [build, native_validation]\n" in publish
-    assert (
-        "    if: ${{ needs.build.result == 'success' && "
-        "needs.native_validation.result == 'success' }}\n"
-    ) in publish
-    assert "exclude:" not in validation and "include:" not in validation
-    assert "python -m build" not in validation
-    assert "scripts/release_bundle.py local" in validation
-    assert "runner." not in validation.split("    steps:\n", 1)[0]
-    artifact_environment = (
-        "printf 'ARXIV_DIGEST_RELEASE_ARTIFACT_DIR=%s/release-bundle\\n' "
-        '\"$RUNNER_TEMP\" >> \"$GITHUB_ENV\"'
-    )
-    assert artifact_environment in validation
-    assert validation.index(artifact_environment) < validation.index(
-        "      - name: Install the candidate wheel and development dependencies\n"
-    )
-    assert '"$head_commit" == "$EXPECTED_COMMIT"' in validation
-    assert 'git rev-parse --verify "refs/tags/v0.2.1^{commit}"' in validation
-    assert 'python -m pip install --disable-pip-version-check "$wheel[dev]"' in validation
-    assert "python -m pytest tests/unit tests/integration -q" in validation
-    assert "node --test tests/js/*.test.mjs" in validation
-    assert "python -m playwright install --with-deps chromium webkit" in validation
-    assert "python -m playwright install chromium webkit" in validation
-    assert "python -m pytest tests/browser -q" in validation
-    assert 'python -m pipx install "$wheel"' in validation
-    assert "git diff --exit-code" in validation
-    assert "git diff --cached --exit-code" in validation
-
-
-@pytest.mark.parametrize("name,job_name", [("tests.yml", "test"), ("release.yml", "native_validation")])
-def test_native_validation_runs_both_suites_independently_without_reducing_coverage(name, job_name):
-    workflow = (ROOT / ".github/workflows" / name).read_text()
-    jobs = dict(re.findall(
-        r"^  ([a-z_]+):\n(.*?)(?=^  [a-z_]+:\n|\Z)",
-        workflow.split("jobs:\n", 1)[1], re.MULTILINE | re.DOTALL,
-    ))
-    job = jobs[job_name]
-    assert "        os: [ubuntu-24.04, macos-latest]\n" in job
-    assert '        python: ["3.11", "3.x"]\n' in job
-    assert "        suite: [python, browser]\n" in job
-    assert "exclude:" not in job and "include:" not in job
-    assert "continue-on-error:" not in job
-    assert "      fail-fast: false\n" in job
-    assert "${{ matrix.suite }}" in job.split("    steps:\n", 1)[0]
-    steps = dict(re.findall(r"^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", job, re.MULTILINE | re.DOTALL))
-    for step in ("Set up Node.js", "Run update-chain tests for early native feedback",
-                 "Run Python tests including native installation and recovery", "Run JavaScript tests"):
-        assert "        if: matrix.suite == 'python'\n" in steps[step]
-    assert "        if: matrix.suite == 'browser'\n" in steps["Run browser tests"]
-    for platform in ("Linux", "macOS"):
-        step = "Install Playwright browsers and Linux dependencies" if platform == "Linux" else "Install Playwright browsers on macOS"
-        assert f"        if: matrix.suite == 'browser' && runner.os == '{platform}'\n" in steps[step]
-    for suite, label in (("python", "update-chain"), ("python", "Python"), ("browser", "browser")):
-        assert f"        if: failure() && matrix.suite == '{suite}'\n" in steps[f"Summarize {label} test failures"]
-    for step in ("Run update-chain tests for early native feedback",
-                 "Run Python tests including native installation and recovery", "Run browser tests"):
-        assert "--durations=10" in steps[step]
-    first = steps["Run update-chain tests for early native feedback"]
-    remaining = steps["Run Python tests including native installation and recovery"]
-    assert 'python -m pytest tests/integration/test_update_chain.py -q --junitxml="$RUNNER_TEMP/update-chain-tests.xml"' in first
-    assert "--ignore=tests/integration/test_update_chain.py" in remaining
-    assert job.count("--ignore=") == 1
-    assert job.index("      - name: Run update-chain tests for early native feedback\n") < job.index(
-        "      - name: Summarize update-chain test failures\n"
-    ) < job.index("      - name: Run Python tests including native installation and recovery\n")
-    smoke = "Smoke-test the wheel through pipx" if name == "tests.yml" else "Smoke-test the candidate wheel through pipx"
-    assert "        if: matrix.suite == 'python'\n" in steps[smoke]
-    if name == "tests.yml":
-        assert "        if: matrix.suite == 'python'\n" in steps["Run privacy gates"]
-        common = ("Resolve canonical application version", "Verify the local release bundle",
-                  "Confirm verification did not alter tracked source")
-    else:
-        common = ("Check out the built commit and historical upgrade tags", "Download the single build candidate",
-                  "Verify candidate source and historical upgrade identity", "Install the candidate wheel and development dependencies",
-                  "Verify downloaded candidate bytes and source resources", "Confirm validation preserved candidate bytes and tracked source")
-    for step in common:
-        assert "        if:" not in steps[step]
+    assert "ref: ${{ needs.build.outputs.commit_sha }}" in native
+    for job in (native, publish):
+        assert "artifact-ids: ${{ needs.build.outputs.artifact_id }}" in job
+        assert "digest-mismatch: error" in job
+    for job in (native, (ROOT / ".github/workflows/tests.yml").read_text()):
+        assert "os: [ubuntu-24.04, macos-latest]" in job
+        assert 'python: ["3.11", "3.x"]' in job
+        assert "python -m pytest tests/unit tests/integration" in job
+        assert "python -m pytest tests/browser" in job
+        assert "chromium webkit" in job
+        assert "python -m pipx install" in job
+        assert "--ignore=" not in job
+    assert "UPDATE_MANIFEST" not in workflow

@@ -6,17 +6,17 @@ import runpy
 import pytest
 
 
+
 class FakeApplication:
     def __init__(self) -> None:
         self.calls = []
 
     def open_dashboard(
-        self, intent: str, *, instance_resolved=lambda: None, copy_url=False
+        self, intent: str, *, copy_url=False
     ) -> int:
         self.calls.append(
             ("dashboard", intent, "copy") if copy_url else ("dashboard", intent)
         )
-        instance_resolved()
         return 0
 
     def doctor(self) -> int:
@@ -34,6 +34,7 @@ class FakeApplication:
     def install_launcher(self) -> int:
         self.calls.append(("install-launcher",))
         return 0
+
 
 
 def test_cli_exposes_only_the_exact_supported_command_surface(tmp_path) -> None:
@@ -57,6 +58,7 @@ def test_cli_exposes_only_the_exact_supported_command_surface(tmp_path) -> None:
         assert application.calls == [expected]
 
 
+
 def test_malformed_and_email_commands_fail_before_application_creation() -> None:
     from arxiv_digest.cli import main
 
@@ -67,6 +69,7 @@ def test_malformed_and_email_commands_fail_before_application_creation() -> None
         assert raised.value.code != 0
 
     assert created == []
+
 
 
 @pytest.mark.parametrize(
@@ -87,6 +90,7 @@ def test_cli_can_copy_each_dashboard_url(arguments, intent) -> None:
     assert application.calls == [("dashboard", intent, "copy")]
 
 
+
 def test_copy_url_rejects_non_dashboard_commands_before_application_creation() -> None:
     from arxiv_digest.cli import main
 
@@ -100,6 +104,7 @@ def test_copy_url_rejects_non_dashboard_commands_before_application_creation() -
                 application_factory=lambda: pytest.fail("created application"),
             )
         assert raised.value.code == 2
+
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -180,49 +185,6 @@ def test_dashboard_url_fallback_preserves_session_and_server_lifetime(
     ])
 
 
-def test_cli_preflight_wraps_the_complete_non_dashboard_operation() -> None:
-    from arxiv_digest.cli import PreflightDisposition, main
-
-    events: list[str] = []
-
-    class Paths:
-        update_transition_lock_path = Path("/fixed/update-transition.lock")
-        update_journal_path = Path("/fixed/update-journal.json")
-        recovery_wrapper_path = Path("/fixed/recover-arxiv-digest")
-
-        def ensure_update_coordination(self) -> None:
-            events.append("ensure-coordination")
-
-    class Transition:
-        def release(self) -> None:
-            events.append("release-transition")
-
-    class Application(FakeApplication):
-        def doctor(self) -> int:
-            events.append("action")
-            return 0
-
-    assert main(
-        ["doctor"],
-        application_factory=lambda: events.append("application") or Application(),
-        paths_factory=lambda: events.append("paths") or Paths(),
-        journal_classifier=lambda path: events.append(f"classify:{path}")
-        or PreflightDisposition.ALLOW,
-        transition_acquire=lambda path: events.append(f"acquire:{path}")
-        or Transition(),
-        internal_dispatch=lambda argv: events.append("internal-recognizer"),
-    ) == 0
-    assert events == [
-        "internal-recognizer",
-        "paths",
-        "ensure-coordination",
-        "acquire:/fixed/update-transition.lock",
-        "classify:/fixed/update-journal.json",
-        "application",
-        "action",
-        "release-transition",
-    ]
-
 
 def test_python_module_entrypoint_delegates_to_cli(monkeypatch) -> None:
     import arxiv_digest.cli
@@ -239,6 +201,7 @@ def test_python_module_entrypoint_delegates_to_cli(monkeypatch) -> None:
 
     assert raised.value.code == 7
     assert called == [True]
+
 
 
 def test_plain_launch_without_profile_opens_setup_without_sync() -> None:
@@ -301,6 +264,7 @@ def test_plain_launch_without_profile_opens_setup_without_sync() -> None:
     )
 
 
+
 def test_second_invocation_opens_verified_instance_without_server_or_mutation() -> None:
     from arxiv_digest.application import Application
     from arxiv_digest.web.lifecycle import ExistingInstance, RuntimeDescriptor
@@ -358,7 +322,8 @@ def test_second_invocation_opens_verified_instance_without_server_or_mutation() 
         )
 
 
-def test_dashboard_reports_instance_resolution_before_browser_or_data_access() -> None:
+
+def test_dashboard_resolves_existing_instance_before_browser_or_data_access() -> None:
     from arxiv_digest.application import Application
     from arxiv_digest.web.lifecycle import ExistingInstance, RuntimeDescriptor
 
@@ -395,15 +360,14 @@ def test_dashboard_reports_instance_resolution_before_browser_or_data_access() -
 
     assert application.open_dashboard(
         "default",
-        instance_resolved=lambda: events.append("transition-released"),
     ) == 0
     assert events == [
         "ensure-data",
         "instance-resolved",
-        "transition-released",
         "profile",
         "browser",
     ]
+
 
 
 def test_standalone_export_refuses_a_running_dashboard_before_snapshot(tmp_path) -> None:
@@ -448,37 +412,6 @@ def test_standalone_export_refuses_a_running_dashboard_before_snapshot(tmp_path)
         application.export_backup(tmp_path / "backup.zip")
     assert exported == []
 
-
-def test_dashboard_releases_new_instance_when_transition_callback_fails() -> None:
-    from types import SimpleNamespace
-
-    from arxiv_digest.application import Application
-
-    events: list[str] = []
-
-    def callback() -> None:
-        events.append("callback")
-        raise OSError("transition release failed")
-
-    application = Application(
-        paths=SimpleNamespace(ensure=lambda: None),
-        profile_exists=lambda: events.append("profile") or False,
-        instance_factory=lambda: SimpleNamespace(
-            acquire=lambda: object(),
-            release=lambda: events.append("release-instance"),
-        ),
-        server_factory=lambda handlers: events.append("server"),
-        handlers_factory=lambda: {},
-        resolve_restore_journal=lambda: events.append("restore"),
-        open_database=lambda: events.append("database"),
-        start_sync=lambda: None,
-        browser_open=lambda url: True,
-        wait_for_server=lambda server: None,
-    )
-
-    with pytest.raises(OSError, match="transition release failed"):
-        application.open_dashboard("default", instance_resolved=callback)
-    assert events == ["callback", "release-instance"]
 
 
 def test_standalone_import_holds_ownership_across_recovery_and_restore(tmp_path) -> None:
@@ -532,6 +465,7 @@ def test_standalone_import_holds_ownership_across_recovery_and_restore(tmp_path)
     assert calls == ["ensure", "acquire", "recover", ("restore", source), "release"]
 
 
+
 def test_corrupt_database_is_preserved_and_reported_without_server_start(tmp_path) -> None:
     from arxiv_digest.application import Application
     from arxiv_digest.storage.database import CorruptDatabaseError
@@ -578,6 +512,7 @@ def test_corrupt_database_is_preserved_and_reported_without_server_start(tmp_pat
     assert len(output) == 1
     assert "backup" in output[0].casefold()
     assert "sensitive" not in output[0]
+
 
 
 def test_dashboard_closes_open_database_after_server_stops() -> None:
@@ -635,6 +570,7 @@ def test_dashboard_closes_open_database_after_server_stops() -> None:
 
     assert application.open_dashboard("default") == 0
     assert calls == ["server-stop", "database-close", "release"]
+
 
 
 def test_default_composition_doctor_is_read_only_on_a_fresh_root(tmp_path) -> None:

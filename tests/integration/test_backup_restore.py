@@ -38,6 +38,65 @@ def empty_paths(tmp_path: Path):
     )
 
 
+def test_cli_import_restores_saved_state_and_creates_a_recovery_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arxiv_digest.application import create_application
+    from arxiv_digest.backup import export_backup, inspect_backup
+    from arxiv_digest.cli import main
+    from arxiv_digest.folders import FolderService
+
+    paths = initialized_paths(tmp_path / "profile")
+    archive = tmp_path / "portable.zip"
+    export_backup(paths, archive, clock=lambda: NOW)
+    Store(paths.database_path).remove_saved_paper("2608.41001")
+    folders = FolderService(home=tmp_path / "restored-home")
+    monkeypatch.setattr("arxiv_digest.folders.FolderService", lambda: folders)
+    output = []
+    application = create_application(paths=paths, input_text=lambda prompt: "1", output=output.append)
+
+    assert main(["import", str(archive)], application_factory=lambda: application) == 0
+
+    saved = Store(paths.database_path).search_library("", limit=20, offset=0)
+    assert [entry.metadata.arxiv_id for entry in saved] == ["2608.41001"]
+    profile = ProfileRepository(paths.profile_path, paths.profile_lock_path).load()
+    assert profile.pdf_destination.path == tmp_path / "restored-home/Downloads/Arxiv Digest"
+    recovery = tuple(paths.backup_dir.glob("*.zip"))
+    assert len(recovery) == 1
+    assert not any(record.record_type == "saved_paper" for record in inspect_backup(recovery[0]).records)
+    assert output[-1] == "Backup restored successfully."
+
+
+def test_cli_import_requires_the_running_dashboard_to_quit(tmp_path: Path) -> None:
+    from arxiv_digest.application import create_application
+    from arxiv_digest.backup import export_backup
+    from arxiv_digest.web.lifecycle import SingleInstance
+    from arxiv_digest.web.server import LoopbackServer
+
+    paths = initialized_paths(tmp_path)
+    archive = tmp_path / "portable.zip"
+    export_backup(paths, archive, clock=lambda: NOW)
+    original_profile = paths.profile_path.read_bytes()
+    original_database = paths.database_path.read_bytes()
+    owner = SingleInstance(paths.process_lock_path, paths.runtime_descriptor_path)
+    claim = owner.acquire()
+    server = LoopbackServer(handlers={})
+    try:
+        server.start()
+        claim.publish(port=server.port, startup_nonce=server.startup_nonce, token=server.token)
+        application = create_application(
+            paths=paths, input_text=lambda prompt: pytest.fail("running app must block import before prompting"),
+        )
+        with pytest.raises(RuntimeError, match="Quit it before importing"):
+            application.import_backup(archive)
+        assert paths.profile_path.read_bytes() == original_profile
+        assert paths.database_path.read_bytes() == original_database
+        assert tuple(paths.backup_dir.glob("*.zip")) == ()
+    finally:
+        server.stop()
+        owner.release()
+
+
 def test_portable_profile_library_and_local_presence_round_trip(
     tmp_path: Path,
 ) -> None:

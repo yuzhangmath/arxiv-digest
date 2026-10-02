@@ -4,9 +4,42 @@ This file records notable user-visible changes to arXiv Digest.
 
 ## Contents
 
+- [Unreleased](#unreleased)
 - [0.3.1](#031---2026-09-15)
 - [0.3.0](#030---2026-09-08)
 - [0.2.1](#021---2026-08-25)
+
+## Unreleased
+
+### Changed
+
+- **Retry missing abstracts** now runs on a confirmed Review date, including
+  previously reviewed papers. Each recovered abstract is saved immediately,
+  and reading, saving, and finishing the date remain available during retries.
+- Updates are now manual. The dashboard retains a passive new-release notice
+  and a link to update instructions.
+- Removed automatic installation, environment snapshots, updater recovery,
+  browser restart handoffs, and updater-specific release manifests and tests.
+- Simplified startup, shutdown, backup integration, and release verification
+  while preserving the daily review, Library, PDF, and portable backup workflows.
+- First-run setup now asks for categories, coverage, a tested PDF folder,
+  profile confirmation, and an optional launcher. Seed papers, terms, authors,
+  and the optional recent-paper sample are available in Interests after setup.
+- **Refresh suggestions** in Interests builds or resumes the bounded 90-day
+  sample. Explicit selections still take effect only after **Update interests**.
+- Settings retains browser backup export and gives terminal restore instructions:
+  quit the app, wait for it to stop, then run `arxiv-digest import BACKUP.zip`.
+  Archive validation, PDF destination selection, and verified pre-restore
+  recovery backups remain in place.
+- Status and Settings share their coverage calculation. A date with a failed
+  category and a pending category counts as failed in both, while category
+  details retain the pending work.
+
+### Fixed
+
+- Navigating between dashboard views prevents late responses and scheduled
+  refreshes from replacing the newly opened view. PDF completion updates remain
+  attached to the view that started them.
 
 ## [0.3.1] - 2026-09-15
 

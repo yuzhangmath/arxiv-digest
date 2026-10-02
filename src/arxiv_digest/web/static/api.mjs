@@ -56,13 +56,11 @@ export function validateEnvelope(payload) {
 }
 
 export class ApiClient {
-  constructor(origin, token, fetchImpl = fetch, onAuthenticationRejected = () => {}, onRequestError = () => {}) {
+  constructor(origin, token, fetchImpl = fetch, onAuthenticationRejected = () => {}) {
     this.origin = new URL(origin).origin;
     this.token = token;
     this.fetchImpl = fetchImpl;
     this.onAuthenticationRejected = onAuthenticationRejected;
-    this.onRequestError = onRequestError;
-    this.requestAllowed = () => true;
     this.controllers = new Map();
   }
 
@@ -82,9 +80,6 @@ export class ApiClient {
     const url = new URL(path, this.origin);
     if (url.origin !== this.origin || !url.pathname.startsWith("/api/v1/")) {
       throw new TypeError("API path escaped the local origin");
-    }
-    if (!this.requestAllowed(url.pathname)) {
-      return Promise.reject(new ApiError(409, "update_in_progress", "An application update is in progress."));
     }
     this.controllers.get(key)?.abort();
     const controller = new AbortController();
@@ -112,7 +107,6 @@ export class ApiClient {
             throw new StaleResponseError();
           }
           if (response.status === 401) this.onAuthenticationRejected();
-          this.onRequestError(error);
           throw error;
         }
         const payload = await response.json();

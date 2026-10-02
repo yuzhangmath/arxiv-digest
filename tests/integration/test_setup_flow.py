@@ -6,14 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from arxiv_digest.candidates import (
-    CandidateCorpus,
-    CandidateCorpusBuild,
-    CandidateCorpusDiagnostics,
-    CandidateDocument,
-    candidate_corpus_hash,
-)
-from arxiv_digest.models import CategoryConfig, PaperMetadata, PaperVersion
+from arxiv_digest.models import CategoryConfig
 from arxiv_digest.maintenance import MaintenanceBarrier
 from arxiv_digest.profile import (
     PdfDestination,
@@ -55,22 +48,6 @@ class FlakyLauncher(RecordingLauncher):
             raise RuntimeError("SECRET filesystem detail must not be persisted")
 
 
-def _seed() -> CandidateDocument:
-    return CandidateDocument(
-        paper=PaperMetadata(
-            arxiv_id="2608.01234",
-            title="Selected geometry",
-            authors=("Ada Example",),
-            abstract="Derived geometry.",
-            primary_category="math.AG",
-            categories=("math.AG",),
-        ),
-        versions=(PaperVersion(1, datetime(2026, 8, 1, tzinfo=timezone.utc)),),
-        eligible_categories=("math.AG",),
-        evidence_dates=(date(2026, 8, 1),),
-    )
-
-
 def _ready_draft(service: SetupService, destination: Path):
     draft = service.start()
     draft = service.select_categories(
@@ -80,41 +57,8 @@ def _ready_draft(service: SetupService, destination: Path):
     draft = service.set_initial_coverage(
         draft.revision,
         date(2026, 7, 23),
-        earliest_datestamp=date(2007, 1, 1),
+
     )
-    corpus = CandidateCorpus(
-        schema_version=1,
-        categories=("math.AG",),
-        window_start=date(2026, 5, 25),
-        window_end=date(2026, 8, 22),
-        created_at=NOW,
-        source_hashes=("a" * 64,),
-        documents=(_seed(),),
-    )
-    digest = candidate_corpus_hash(corpus)
-    build = CandidateCorpusBuild(
-        corpus,
-        CandidateCorpusDiagnostics(
-            complete=True,
-            reduced_breadth=False,
-            setup_ready=True,
-            minimum_met=False,
-            pages_fetched=18,
-            progress=(),
-            corpus_hash=digest,
-            can_resume=False,
-        ),
-    )
-    draft = service.accept_candidate_corpus(
-        draft.revision, build, corpus_hash=digest
-    )
-    draft = service.select_seed_papers(draft.revision, (_seed(),))
-    draft = service.select_terms(
-        draft.revision,
-        keywords=("derived geometry",),
-        phrases=("mirror symmetry",),
-    )
-    draft = service.select_authors(draft.revision, ("Ada Example",))
     draft = service.set_pdf_destination(
         draft.revision,
         PdfDestination("custom", destination.resolve()),
@@ -123,7 +67,7 @@ def _ready_draft(service: SetupService, destination: Path):
     return service.confirm_review(draft.revision)
 
 
-def test_not_now_publishes_exact_profile_category_and_seed_metadata(
+def test_not_now_publishes_categories_without_personalization_or_seed_metadata(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "state.sqlite3"
@@ -151,8 +95,8 @@ def test_not_now_publishes_exact_profile_category_and_seed_metadata(
     assert profile.category_coverage == (
         ProfileCategory("math.AG", date(2026, 7, 23)),
     )
-    assert profile.seed_papers == ("2608.01234",)
-    assert profile.keywords == ("derived geometry",)
+    assert profile.seed_papers == ()
+    assert profile.keywords == ()
     assert launcher.install_calls == 0
     assert service.load_draft() is None
     assert service.route() is SetupRoute.INTERESTS
@@ -173,7 +117,7 @@ def test_not_now_publishes_exact_profile_category_and_seed_metadata(
     finally:
         connection.close()
     assert category == ("arXiv:math.AG", "2026-07-23")
-    assert article == ("Selected geometry",)
+    assert article is None
     assert settings == ("none", None)
 
 
@@ -275,7 +219,7 @@ def test_each_publication_phase_recovers_an_exact_old_or_new_revision(
     assert active is not None
     assert active.revision == expected_revision
     assert active.keywords == (
-        ("new preference",) if expected_revision == 2 else ("derived geometry",)
+        ("new preference",) if expected_revision == 2 else ()
     )
     connection = sqlite3.connect(database_path)
     try:

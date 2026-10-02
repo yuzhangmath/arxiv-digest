@@ -3,17 +3,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from arxiv_digest.candidates import (
-    CandidateCorpus,
-    CandidateCorpusBuild,
-    CandidateCorpusDiagnostics,
     CandidateDocument,
-    candidate_corpus_hash,
 )
 from arxiv_digest.models import CategoryConfig, PaperMetadata, PaperVersion
 from arxiv_digest.profile import (
@@ -33,6 +30,71 @@ from arxiv_digest.setup import (
     SetupStep,
 )
 from arxiv_digest.storage.database import open_database
+
+
+def test_initial_setup_goes_directly_from_coverage_to_pdf_destination(tmp_path: Path) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    repository = ProfileRepository(tmp_path / "profile.json", tmp_path / "profile.lock")
+    service = SetupService(
+        database_path, repository,
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
+    )
+    draft = service.select_categories(
+        service.start().revision, (CategorySelection("math.AG", "math.AG"),),
+    )
+    draft = service.set_initial_coverage(
+        draft.revision, date(2026, 8, 1),
+    )
+    assert draft.current_step is SetupStep.PDF_DESTINATION
+    draft = service.set_pdf_destination(
+        draft.revision, PdfDestination("custom", tmp_path / "pdfs"), tested=True,
+    )
+    draft = service.confirm_review(draft.revision)
+    profile = service.complete(draft.revision, launcher_choice="not_now")
+    assert (profile.seed_papers, profile.keywords, profile.phrases, profile.authors) == ((), (), (), ())
+    assert repository.load() == profile
+
+
+@pytest.mark.parametrize("legacy_step", ["candidate_corpus", "seed_papers", "keywords_and_phrases", "authors"])
+def test_legacy_personalization_draft_resumes_at_destination_without_losing_choices(
+    tmp_path: Path, legacy_step: str,
+) -> None:
+    database_path = tmp_path / "state.sqlite3"
+    open_database(database_path).close()
+    repository = ProfileRepository(tmp_path / "profile.json", tmp_path / "profile.lock")
+    service = SetupService(
+        database_path, repository,
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
+    )
+    draft = service.select_categories(
+        service.start().revision, (CategorySelection("math.AG", "math.AG"),),
+    )
+    draft = service.set_initial_coverage(
+        draft.revision, date(2026, 8, 1),
+    )
+    # Represent a draft written by the previous wizard, including explicitly selected interests.
+    from arxiv_digest.setup import _encode_payload
+    selected = replace(draft, seed_papers=(_seed(),), keywords=("geometry",),
+                       phrases=("derived category",), authors=("Ada Example",))
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE setup_draft SET current_step = ?, payload_json = ? WHERE singleton = 1",
+            (legacy_step, _encode_payload(selected)),
+        )
+    resumed = SetupService(database_path, repository, clock=service.clock).start()
+    assert resumed.current_step is SetupStep.PDF_DESTINATION
+    assert resumed.revision == selected.revision
+    assert resumed.seed_papers == selected.seed_papers
+    draft = service.set_pdf_destination(
+        resumed.revision, PdfDestination("custom", tmp_path / "pdfs"), tested=True,
+    )
+    draft = service.confirm_review(draft.revision)
+    profile = service.complete(draft.revision, launcher_choice="not_now")
+    assert profile.seed_papers == ("2608.01234",)
+    assert profile.keywords == ("geometry",)
+    assert profile.phrases == ("derived category",)
+    assert profile.authors == ("Ada Example",)
 
 
 def test_setup_connections_hold_maintenance_lease_until_close(
@@ -106,7 +168,7 @@ def test_desktop_launcher_prompt_and_actions_are_exact_and_unselected() -> None:
     assert NOT_NOW_LABEL == "Not now"
 
 
-def test_pending_setup_launcher_obeys_the_same_transition_guard_and_can_retry(
+def test_pending_setup_launcher_obeys_the_same_launcher_guard_and_can_retry(
     tmp_path: Path,
 ) -> None:
     from arxiv_digest.desktop_launcher import (
@@ -115,7 +177,7 @@ def test_pending_setup_launcher_obeys_the_same_transition_guard_and_can_retry(
         launcher_operation_guard,
     )
     from arxiv_digest.paths import resolve_paths
-    from arxiv_digest.update_locks import acquire_exclusive
+    from arxiv_digest.atomic import acquire_exclusive
 
     paths = resolve_paths(
         platform="linux",
@@ -126,7 +188,6 @@ def test_pending_setup_launcher_obeys_the_same_transition_guard_and_can_retry(
         },
     )
     paths.ensure()
-    paths.ensure_update_coordination()
     connection = open_database(paths.database_path)
     connection.execute(
         "UPDATE application_settings SET launcher_operation = 'create_failed', "
@@ -147,7 +208,7 @@ def test_pending_setup_launcher_obeys_the_same_transition_guard_and_can_retry(
         ProfileRepository(paths.profile_path, paths.profile_lock_path),
         launcher_manager=manager,
     )
-    owner = acquire_exclusive(paths.update_transition_lock_path, timeout=0)
+    owner = acquire_exclusive(paths.launcher_operation_lock_path, timeout=0)
     try:
         blocked = service.retry_launcher()
         assert blocked.operation == "create_failed"
@@ -243,7 +304,7 @@ def test_initial_coverage_rejects_dates_outside_supported_catchup_window(
         service.set_initial_coverage(
             draft.revision,
             date(2026, 5, 24),
-            earliest_datestamp=date(2007, 1, 1),
+
         )
     assert error.value.code == "coverage_outside_recovery_window"
     assert service.load_draft() == draft
@@ -251,9 +312,9 @@ def test_initial_coverage_rejects_dates_outside_supported_catchup_window(
     revised = service.set_initial_coverage(
         draft.revision,
         date(2026, 5, 25),
-        earliest_datestamp=date(2007, 1, 1),
+
     )
-    assert revised.current_step is SetupStep.CANDIDATE_CORPUS
+    assert revised.current_step is SetupStep.PDF_DESTINATION
     assert revised.coverage_start == date(2026, 5, 25)
     assert revised.coverage_warning is None
 
@@ -283,7 +344,7 @@ def test_initial_coverage_rejects_current_eastern_date_until_finalization(
         service.set_initial_coverage(
             draft.revision,
             date(2026, 8, 22),
-            earliest_datestamp=date(2007, 1, 1),
+
         )
     assert error.value.code == "coverage_outside_recovery_window"
 
@@ -293,7 +354,7 @@ def test_initial_coverage_rejects_current_eastern_date_until_finalization(
     revised = service.set_initial_coverage(
         draft.revision,
         date(2026, 8, 22),
-        earliest_datestamp=date(2007, 1, 1),
+
     )
     assert revised.coverage_start == date(2026, 8, 22)
 
@@ -319,89 +380,11 @@ def test_initial_coverage_validation_uses_server_issued_bounds(
         service.set_initial_coverage(
             draft.revision,
             date(2026, 8, 22),
-            earliest_datestamp=date(2007, 1, 1),
+
             coverage_bounds=(date(2026, 5, 24), date(2026, 8, 21)),
         )
 
     assert error.value.code == "coverage_outside_recovery_window"
-
-
-def _corpus_build(
-    category: str,
-    *,
-    complete: bool = False,
-    reduced: bool = True,
-    minimum: bool = True,
-) -> CandidateCorpusBuild:
-    corpus = CandidateCorpus(
-        schema_version=1,
-        categories=(category,),
-        window_start=date(2026, 5, 25),
-        window_end=date(2026, 8, 22),
-        created_at=datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
-        source_hashes=("1" * 64,),
-        documents=(),
-    )
-    digest = candidate_corpus_hash(corpus)
-    return CandidateCorpusBuild(
-        corpus=corpus,
-        diagnostics=CandidateCorpusDiagnostics(
-            complete=complete,
-            reduced_breadth=reduced,
-            setup_ready=complete or (reduced and minimum),
-            minimum_met=minimum,
-            pages_fetched=1,
-            progress=(),
-            corpus_hash=digest,
-            can_resume=not complete,
-        ),
-    )
-
-
-def test_corpus_acceptance_is_hash_and_category_bound_and_resumable(
-    tmp_path: Path,
-) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    repository = ProfileRepository(
-        tmp_path / "profile.json", tmp_path / "profile.lock"
-    )
-    service = SetupService(
-        database_path,
-        repository,
-        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
-    )
-    draft = service.start()
-    draft = service.select_categories(
-        draft.revision, (CategorySelection("math.AG", "math.AG"),)
-    )
-    draft = service.set_initial_coverage(
-        draft.revision,
-        date(2026, 8, 1),
-        earliest_datestamp=date(2007, 1, 1),
-    )
-
-    with pytest.raises(SetupStateError) as stale:
-        service.accept_candidate_corpus(
-            draft.revision, _corpus_build("math.AG"), corpus_hash="0" * 64
-        )
-    assert stale.value.code == "stale_corpus"
-    with pytest.raises(SetupStateError) as mismatch:
-        service.accept_candidate_corpus(
-            draft.revision,
-            _corpus_build("math.NT"),
-            corpus_hash=_corpus_build("math.NT").corpus_hash,
-        )
-    assert mismatch.value.code == "corpus_category_mismatch"
-
-    visible = _corpus_build("math.AG")
-    accepted = service.accept_candidate_corpus(
-        draft.revision, visible, corpus_hash=visible.corpus_hash
-    )
-    assert accepted.current_step is SetupStep.SEED_PAPERS
-    assert accepted.corpus_reduced_breadth is True
-    assert accepted.corpus_hash == visible.corpus_hash
-    assert SetupService(database_path, repository).load_draft() == accepted
 
 
 def _seed(arxiv_id: str = "2608.01234") -> CandidateDocument:
@@ -424,7 +407,7 @@ def _seed(arxiv_id: str = "2608.01234") -> CandidateDocument:
     )
 
 
-def _draft_through_corpus(service: SetupService):
+def _draft_through_coverage(service: SetupService):
     draft = service.start()
     draft = service.select_categories(
         draft.revision, (CategorySelection("math.AG", "math.AG"),)
@@ -432,50 +415,9 @@ def _draft_through_corpus(service: SetupService):
     draft = service.set_initial_coverage(
         draft.revision,
         date(2026, 8, 1),
-        earliest_datestamp=date(2007, 1, 1),
-    )
-    visible = _corpus_build("math.AG")
-    return service.accept_candidate_corpus(
-        draft.revision, visible, corpus_hash=visible.corpus_hash
-    )
 
-
-def test_explicit_custom_selections_survive_through_review(tmp_path: Path) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    open_database(database_path).close()
-    repository = ProfileRepository(
-        tmp_path / "profile.json", tmp_path / "profile.lock"
     )
-    service = SetupService(
-        database_path,
-        repository,
-        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
-    )
-    draft = _draft_through_corpus(service)
-    custom_paper = _seed()
-    draft = service.select_seed_papers(draft.revision, (custom_paper,))
-    draft = service.select_terms(
-        draft.revision,
-        keywords=(" derived category ",),
-        phrases=("homological mirror symmetry",),
-    )
-    draft = service.select_authors(draft.revision, ("Ada Example",))
-    destination = PdfDestination("custom", (tmp_path / "pdfs").resolve())
-    draft = service.set_pdf_destination(
-        draft.revision, destination, tested=True
-    )
-
-    summary = service.review_summary(draft)
-    assert summary.seed_papers == ("2608.01234",)
-    assert summary.keywords == ("derived category",)
-    assert summary.phrases == ("homological mirror symmetry",)
-    assert summary.authors == ("Ada Example",)
-    assert summary.categories == ("math.AG",)
-    assert repository.load() is None
-
-    reviewed = service.confirm_review(draft.revision)
-    assert reviewed.current_step is SetupStep.DESKTOP_LAUNCHER
-    assert reviewed.review_confirmed is True
+    return draft
 
 
 def test_empty_optional_interests_advance_and_publish(tmp_path: Path) -> None:
@@ -489,11 +431,8 @@ def test_empty_optional_interests_advance_and_publish(tmp_path: Path) -> None:
         repository,
         clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
     )
-    draft = _draft_through_corpus(service)
+    draft = _draft_through_coverage(service)
 
-    draft = service.select_seed_papers(draft.revision, ())
-    draft = service.select_terms(draft.revision, keywords=(), phrases=())
-    draft = service.select_authors(draft.revision, ())
     destination = PdfDestination("custom", (tmp_path / "pdfs").resolve())
     draft = service.set_pdf_destination(
         draft.revision, destination, tested=True
@@ -533,10 +472,7 @@ def test_profile_publication_requires_exact_category_coverage_pairs(
         repository,
         clock=lambda: datetime(2026, 8, 22, 12, tzinfo=timezone.utc),
     )
-    draft = _draft_through_corpus(service)
-    draft = service.select_seed_papers(draft.revision, ())
-    draft = service.select_terms(draft.revision, keywords=(), phrases=())
-    draft = service.select_authors(draft.revision, ())
+    draft = _draft_through_coverage(service)
     draft = service.set_pdf_destination(
         draft.revision,
         PdfDestination("custom", (tmp_path / "pdfs").resolve()),

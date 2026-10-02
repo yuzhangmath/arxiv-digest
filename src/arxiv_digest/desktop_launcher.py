@@ -5,28 +5,25 @@ from __future__ import annotations
 import hashlib
 import importlib.resources
 import json
-import math
 import os
 import shutil
 import shlex
 import tempfile
-import time
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from arxiv_digest.atomic import atomic_write
+from arxiv_digest.atomic import acquire_exclusive, atomic_write
 from arxiv_digest.paths import AppPaths
-from arxiv_digest.update_contract import LOCK_WAIT_TIMEOUT_SECONDS
-from arxiv_digest.update_locks import acquire_exclusive, acquire_shared
 
 
 _MAC_SCHEMA_VERSION = 3
 _LINUX_SCHEMA_VERSION = 2
 _BUNDLE_ID = "org.arxiv.digest"
 _MAC_ICON_FILENAME = "arxiv-digest.icns"
+
 
 
 class LauncherState(StrEnum):
@@ -36,40 +33,32 @@ class LauncherState(StrEnum):
     COLLISION = "collision"
 
 
+
 @dataclass(frozen=True, slots=True)
 class LauncherStatus:
     state: LauncherState
     path: Path
 
 
+
 class LauncherCollisionError(RuntimeError):
     pass
+
 
 
 @contextmanager
 def launcher_operation_guard(
     paths: AppPaths,
     *,
-    timeout: float = LOCK_WAIT_TIMEOUT_SECONDS,
+    timeout: float = 45.0,
 ) -> Iterator[None]:
-    """Serialize launcher changes while excluding an update transition."""
-
-    if not math.isfinite(timeout) or timeout < 0:
-        raise ValueError("launcher lock timeout must be finite and nonnegative")
-    paths.ensure_update_coordination()
-    deadline = time.monotonic() + timeout
-    transition = acquire_shared(paths.update_transition_lock_path, timeout=timeout)
+    """Serialize launcher installation and removal."""
+    lock = acquire_exclusive(paths.launcher_operation_lock_path, timeout=timeout)
     try:
-        launcher = acquire_exclusive(
-            paths.launcher_operation_lock_path,
-            timeout=max(0.0, deadline - time.monotonic()),
-        )
-        try:
-            yield
-        finally:
-            launcher.release()
+        yield
     finally:
-        transition.release()
+        lock.release()
+
 
 
 def _fsync_directory(path: Path) -> None:
@@ -80,6 +69,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+
 class DesktopLauncherManager:
     def __init__(
         self,
@@ -88,7 +78,7 @@ class DesktopLauncherManager:
         home: Path,
         executable: Path,
         operation_guard: Callable[[], AbstractContextManager[None]],
-        recovery_wrapper: Path | None = None,
+        legacy_recovery_wrapper: Path | None = None,
     ) -> None:
         if platform != "darwin" and not platform.startswith("linux"):
             raise RuntimeError("desktop launchers support macOS and Linux")
@@ -98,9 +88,7 @@ class DesktopLauncherManager:
         self.home = Path(home)
         self.executable = executable.resolve()
         self._operation_guard = operation_guard
-        self.recovery_wrapper = recovery_wrapper
-        if recovery_wrapper is not None and (not recovery_wrapper.is_absolute() or "\n" in str(recovery_wrapper) or "\r" in str(recovery_wrapper)):
-            raise ValueError("recovery wrapper must be an absolute fixed path")
+        self._legacy_recovery_wrapper = legacy_recovery_wrapper
         if not self.executable.is_file():
             raise ValueError("launcher executable must be an installed file")
 
@@ -110,13 +98,9 @@ class DesktopLauncherManager:
             return self.home / "Applications/arXiv Digest.app"
         return self.home / ".local/share/applications/arxiv-digest.desktop"
 
-    def _mac_launcher(self, *, legacy: bool = False) -> bytes:
+    def _mac_launcher(self) -> bytes:
         quoted = str(self.executable).replace("'", "'\"'\"'")
-        recovery = ""
-        if self.recovery_wrapper is not None and not legacy:
-            wrapper = shlex.quote(str(self.recovery_wrapper))
-            recovery = f"if [ -e {wrapper} ] || [ -L {wrapper} ]; then\n  {wrapper} || exit $?\nfi\n"
-        return f"#!/bin/sh\n{recovery}exec '{quoted}'\n".encode("utf-8")
+        return f"#!/bin/sh\nexec '{quoted}'\n".encode("utf-8")
 
     @staticmethod
     def _mac_plist(*, schema: int = _MAC_SCHEMA_VERSION) -> bytes:
@@ -219,11 +203,6 @@ class DesktopLauncherManager:
             .replace("$", "\\$")
         )
         command = f'"{escaped}"'
-        if self.recovery_wrapper is not None and not legacy:
-            wrapper = shlex.quote(str(self.recovery_wrapper))
-            script = f"if [ -e {wrapper} ] || [ -L {wrapper} ]; then {wrapper} || exit $?; fi; exec {shlex.quote(str(self.executable))}"
-            escaped_script = script.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%")
-            command = f'/bin/sh -c "{escaped_script}"'
         return (
             "[Desktop Entry]\n"
             "Type=Application\n"
@@ -233,6 +212,19 @@ class DesktopLauncherManager:
             "X-arXiv-Digest-Managed=true\n"
             f"X-arXiv-Digest-Launcher-Schema={1 if legacy else _LINUX_SCHEMA_VERSION}\n"
         ).encode("utf-8")
+
+    def _legacy_recovery_payload(self) -> bytes | None:
+        """Recognize old managed launchers so an explicit repair can replace them."""
+        if self._legacy_recovery_wrapper is None:
+            return None
+        wrapper = shlex.quote(str(self._legacy_recovery_wrapper))
+        if self.platform == "darwin":
+            recovery = f"if [ -e {wrapper} ] || [ -L {wrapper} ]; then\n  {wrapper} || exit $?\nfi\n"
+            return self._mac_launcher().replace(b"#!/bin/sh\n", f"#!/bin/sh\n{recovery}".encode(), 1)
+        script = f"if [ -e {wrapper} ] || [ -L {wrapper} ]; then {wrapper} || exit $?; fi; exec {shlex.quote(str(self.executable))}"
+        escaped = script.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%")
+        lines = self._linux_payload().decode().splitlines(keepends=True)
+        return "".join(f'Exec=/bin/sh -c "{escaped}"\n' if line.startswith("Exec=") else line for line in lines).encode()
 
     def status(self) -> LauncherStatus:
         target = self.target
@@ -246,6 +238,10 @@ class DesktopLauncherManager:
             try:
                 launcher_bytes = self._mac_launcher()
                 icon_bytes = self._mac_icon()
+                previous_launchers = [(launcher_bytes, 2)]
+                recovery_payload = self._legacy_recovery_payload()
+                if recovery_payload is not None:
+                    previous_launchers.append((recovery_payload, 3))
                 current = (
                     target.is_dir()
                     and not target.is_symlink()
@@ -265,10 +261,13 @@ class DesktopLauncherManager:
                     and target.is_dir()
                     and not target.is_symlink()
                     and self._mac_inventory_matches(target, includes_icon=True)
-                    and launcher.read_bytes() == self._mac_launcher(legacy=True)
-                    and plist.read_bytes() == self._mac_plist(schema=2)
                     and icon.read_bytes() == icon_bytes
-                    and manifest.read_bytes() == self._mac_manifest(self._mac_launcher(legacy=True), icon_bytes, schema=2)
+                    and any(
+                        launcher.read_bytes() == payload
+                        and plist.read_bytes() == self._mac_plist(schema=schema)
+                        and manifest.read_bytes() == self._mac_manifest(payload, icon_bytes, schema=schema)
+                        for payload, schema in previous_launchers
+                    )
                 )
                 legacy = (
                     not current
@@ -278,9 +277,9 @@ class DesktopLauncherManager:
                     and launcher.is_file()
                     and not launcher.is_symlink()
                     and plist.read_bytes() == self._legacy_mac_plist()
-                    and launcher.read_bytes() == self._mac_launcher(legacy=True)
+                    and launcher.read_bytes() == self._mac_launcher()
                     and manifest.read_bytes()
-                    == self._legacy_mac_manifest(self._mac_launcher(legacy=True))
+                    == self._legacy_mac_manifest(self._mac_launcher())
                 )
             except OSError:
                 current = False
@@ -299,7 +298,7 @@ class DesktopLauncherManager:
                     and target.read_bytes() == self._linux_payload()
                 )
                 outdated = (not valid and target.is_file() and not target.is_symlink()
-                            and target.read_bytes() == self._linux_payload(legacy=True))
+                            and target.read_bytes() in (self._linux_payload(legacy=True), self._legacy_recovery_payload()))
             except OSError:
                 valid = False
                 outdated = False
@@ -311,43 +310,6 @@ class DesktopLauncherManager:
     def install(self) -> LauncherStatus:
         with self._operation_guard():
             return self._install()
-
-    def update_states(self) -> dict:
-        """Describe an owned launcher's exact refresh without mutating it.
-
-        The coordinator captures this under launcher ownership, then repeats
-        the prior-state comparison under both exclusive update locks.
-        """
-        from arxiv_digest.update_runtime.recovery import capture_launcher_state
-
-        status = self.status()
-        if status.state is LauncherState.COLLISION:
-            raise LauncherCollisionError("launcher ownership cannot be proven")
-        prior = capture_launcher_state(self.target)
-        if status.state is LauncherState.ABSENT:
-            return {"prior": prior, "intended": prior}
-        if self.platform != "darwin":
-            payload = self._linux_payload()
-            intended = {"kind": "file", "path": str(self.target), "mode": 0o700,
-                        "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
-                        "content_hex": payload.hex()}
-        else:
-            launcher, icon = self._mac_launcher(), self._mac_icon()
-            files = {
-                "Contents/Info.plist": (self._mac_plist(), 0o600),
-                "Contents/MacOS/arxiv-digest": (launcher, 0o700),
-                f"Contents/Resources/{_MAC_ICON_FILENAME}": (icon, 0o600),
-                "Contents/Resources/ownership.json": (self._mac_manifest(launcher, icon), 0o600),
-            }
-            entries = [{"kind": "directory", "path": path, "mode": 0o700}
-                       for path in ("Contents", "Contents/MacOS", "Contents/Resources")]
-            entries.extend({"kind": "file", "path": path, "mode": mode, "size": len(payload),
-                            "sha256": hashlib.sha256(payload).hexdigest()}
-                           for path, (payload, mode) in files.items())
-            intended = {"kind": "directory", "path": str(self.target),
-                        "inventory": {"root_mode": 0o700, "entries": sorted(entries, key=lambda item: item["path"])},
-                        "files": [{"path": path, "bytes_hex": payload.hex()} for path, (payload, _) in sorted(files.items())]}
-        return {"prior": prior, "intended": intended}
 
     def _install(self) -> LauncherStatus:
         current = self.status()

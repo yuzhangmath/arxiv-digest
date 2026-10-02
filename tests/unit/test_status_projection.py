@@ -55,7 +55,7 @@ def test_status_keeps_metadata_and_category_daily_list_progress_distinct_and_red
         load=lambda: SimpleNamespace(categories=("cs.SE", "math.LO"))
     )
     configs = (SimpleNamespace(category="cs.SE"), SimpleNamespace(category="math.LO"))
-    runtime._sync_configs = lambda: configs
+    runtime._sync_configs = lambda _profile=None: configs
     categories = (
         _category(
             "cs.SE",

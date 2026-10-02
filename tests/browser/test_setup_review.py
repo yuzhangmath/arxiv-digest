@@ -46,12 +46,6 @@ class FixtureApplication:
         self.launcher_calls = 0
         self.saved_anchor: int | None = None
         self.dashboard_calls: list[tuple[str, dict[str, object]]] = []
-        self.corpus_start_gate: threading.Event | None = None
-        self.corpus_start_entered = threading.Event()
-        self.corpus_start_requests = 0
-        self.corpus_status_requests = 0
-        self.corpus_status_gate: threading.Event | None = None
-        self.corpus_status_entered = threading.Event()
         self.draft_requests = 0
         self.category_failures = 0
         self.setup_already_complete = False
@@ -60,8 +54,6 @@ class FixtureApplication:
         self.draft_gate_entered = threading.Event()
         self.quit_gate: threading.Event | None = None
         self.quit_entered = threading.Event()
-        self.expose_corpus_job = False
-        self.corpus_can_resume = False
         self.folder_pick_result: dict[str, object] = {
             "destination_choice": "picker_abcd1234",
             "display_name": "Research PDFs",
@@ -79,6 +71,10 @@ class FixtureApplication:
         }
         self.settings_folder_save_failures = 0
         self.library_empty = False
+        self.interest_values = {
+            "keywords": ["derived geometry"], "phrases": ["mirror symmetry"],
+            "authors": ["Ada Example"], "seed_papers": ["2608.01234"],
+        }
         self.sync_starts_running = False
         self.sync_start_gate: threading.Event | None = None
         self.sync_start_entered = threading.Event()
@@ -91,7 +87,6 @@ class FixtureApplication:
         self.sync_status_entered = threading.Event()
         self.update_status: dict[str, object] = {
             "status": "current",
-            "automatic_update": False,
             "installed_version": "0.2.1",
         }
         self.update_status_sequence: list[dict[str, object]] = []
@@ -160,37 +155,6 @@ class FixtureApplication:
         self.library_save_requests = 0
         self.library_save_gate: threading.Event | None = None
         self.library_save_entered = threading.Event()
-        self.candidate_job: dict[str, object] = {
-            "status": "completed",
-            "complete": True,
-            "failed": False,
-            "corpus_complete": True,
-            "minimum_met": True,
-            "setup_ready": True,
-            "can_resume": False,
-            "corpus_hash": "a" * 64,
-            "reduced_breadth": False,
-            "message": "Corpus ready",
-        }
-
-    def start_corpus(self, _payload: dict[str, object]) -> dict[str, str]:
-        with self.lock:
-            self.corpus_start_requests += 1
-            self.expose_corpus_job = True
-        self.corpus_start_entered.set()
-        if self.corpus_start_gate is not None:
-            assert self.corpus_start_gate.wait(timeout=5)
-        return {"job_id": "corpus_job_1234"}
-
-    def corpus_job(self, _payload: dict[str, object]) -> dict[str, object]:
-        with self.lock:
-            self.corpus_status_requests += 1
-            request_number = self.corpus_status_requests
-            result = dict(self.candidate_job)
-        if request_number == 1 and self.corpus_status_gate is not None:
-            self.corpus_status_entered.set()
-            assert self.corpus_status_gate.wait(timeout=5)
-        return result
 
     def record_dashboard(
         self, operation: str, payload: dict[str, object], result: object
@@ -229,10 +193,6 @@ class FixtureApplication:
             "categories": [],
             "coverage_start": None,
             "coverage_warning": None,
-            "corpus_complete": False,
-            "corpus_hash": None,
-            "corpus_reduced_breadth": False,
-            "corpus_can_resume": self.corpus_can_resume,
             "recommended_coverage_start": "2026-07-23",
         }
         if self.step == "review":
@@ -240,20 +200,8 @@ class FixtureApplication:
                 {
                     "profile_summary": {
                         "categories": ["math.AG"],
-                        "seed_papers": ["2608.01234", "2608.09999"],
-                        "seed_paper_details": [
-                            {
-                                "arxiv_id": "2608.01234",
-                                "title": "Selected geometry",
-                            },
-                            {
-                                "arxiv_id": "2608.09999",
-                                "title": "Custom seed paper",
-                            },
-                        ],
-                        "keywords": ["derived geometry", "custom keyword"],
-                        "phrases": ["mirror symmetry", "custom phrase"],
-                        "authors": ["Ada Example", "Custom Author"],
+                        "seed_papers": [], "seed_paper_details": [],
+                        "keywords": [], "phrases": [], "authors": [],
                         "pdf_destination_kind": "custom",
                         "pdf_destination_display_path": (
                             "~/Documents/Research PDFs"
@@ -262,17 +210,12 @@ class FixtureApplication:
                     "profile_summary_sha256": "b" * 64,
                 }
             )
-        if self.step == "candidate_corpus" and self.expose_corpus_job:
-            value["corpus_job"] = dict(self.candidate_job)
         return value
 
     def update_draft(self, payload: dict[str, object]) -> dict[str, object]:
         transitions = {
             "categories": "initial_coverage",
-            "coverage": "candidate_corpus",
-            "seed_papers": "keywords_and_phrases",
-            "terms": "authors",
-            "authors": "pdf_destination",
+            "coverage": "pdf_destination",
             "pdf_destination": "review",
             "review": "desktop_launcher",
         }
@@ -282,12 +225,6 @@ class FixtureApplication:
             self.step = transitions[str(payload["step"])]
         return self.draft({})
 
-    def accept_corpus(self, payload: dict[str, object]) -> dict[str, object]:
-        with self.lock:
-            self.submissions.append(dict(payload))
-            self.revision += 1
-            self.step = "seed_papers"
-        return self.draft({})
 
     def complete(self, payload: dict[str, object]) -> dict[str, object]:
         with self.lock:
@@ -808,10 +745,7 @@ class FixtureApplication:
             ],
             "coverage_min": "2026-07-01",
             "coverage_max": "2026-08-24",
-            "keywords": ["derived geometry"],
-            "phrases": ["mirror symmetry"],
-            "authors": ["Ada Example"],
-            "seed_papers": ["2608.01234"],
+            **{field: list(values) for field, values in self.interest_values.items()},
             "seed_paper_details": [
                 {
                     "arxiv_id": "2608.01234",
@@ -831,8 +765,8 @@ class FixtureApplication:
                 ],
                 "keywords": [{"value": "spectral sequence"}],
                 "phrases": [],
-                "authors": [],
-                "seed_papers": [],
+                "authors": [{"name": "Custom Author"}],
+                "seed_papers": [{"arxiv_id": "2608.09999", "title": "Suggested seed"}],
             },
         }
 
@@ -861,6 +795,9 @@ class FixtureApplication:
                 if category not in configured_starts:
                     raise ValueError("new categories require coverage")
                 self.category_coverage_starts[category] = configured_starts[category]
+            for field in self.interest_values:
+                if field in payload:
+                    self.interest_values[field] = list(payload[field])
             self.active_categories = selected
             self.review_profile_revision += 1
             self.review_projection_revision += 1
@@ -883,84 +820,6 @@ class FixtureApplication:
             "categories": self.categories,
             "setup_draft_get": self.draft,
             "setup_draft_put": self.update_draft,
-            "setup_corpus": self.start_corpus,
-            "setup_job": self.corpus_job,
-            "setup_corpus_accept": self.accept_corpus,
-            "setup_candidate_papers": lambda _payload: {
-                "items": [
-                    {
-                        "suggestion_id": "paper_suggestion_1",
-                        "title": "Selected geometry",
-                    }
-                ]
-            },
-            "setup_candidate_terms": lambda _payload: {
-                "keywords": [
-                    {
-                        "suggestion_id": "keyword_suggestion_1",
-                        "label": "derived geometry",
-                    }
-                ],
-                "phrases": [
-                    {
-                        "suggestion_id": "phrase_suggestion_1",
-                        "label": "mirror symmetry",
-                    },
-                    *(
-                        {
-                            "suggestion_id": f"phrase_suggestion_{index}",
-                            "label": label,
-                        }
-                        for index, label in enumerate(
-                            (
-                                "k theory",
-                                "homotopy theory",
-                                "persistent homology",
-                                "homotopy type",
-                                "homotopy groups",
-                                "homotopy equivalent",
-                                "data analysis",
-                                "vector bundles",
-                                "spectral sequence",
-                                "topological data",
-                                "simplicial complexes",
-                                "topological data analysis",
-                                "characteristicallylongtoken extraordinarilylongtoken topology",
-                            ),
-                            start=2,
-                        )
-                    ),
-                ],
-            },
-            "setup_candidate_authors": lambda _payload: {
-                "items": [
-                    {
-                        "suggestion_id": "author_suggestion_1",
-                        "label": "Ada Example",
-                    },
-                    *(
-                        {
-                            "suggestion_id": f"author_suggestion_{index}",
-                            "label": label,
-                        }
-                        for index, label in enumerate(
-                            (
-                                "Nova Recurring",
-                                "Casey Crosscategory",
-                                "Morgan Manual",
-                                "Taylor Spectral",
-                                "Jordan Homotopy",
-                                "Avery Topological",
-                                "Riley Simplicial",
-                                "Cameron Persistent",
-                                "Quinn Mathematical",
-                                "Characteristicallylonggivenname Extraordinarilylongfamilyname",
-                            ),
-                            start=2,
-                        )
-                    ),
-                ]
-            },
             "setup_folder_test": lambda _payload: dict(self.folder_test_result),
             "setup_folder_pick": lambda _payload: dict(self.folder_pick_result),
             "setup_complete": self.complete,
@@ -1114,7 +973,6 @@ def test_startup_shows_a_link_when_a_new_release_is_available(engine: str) -> No
     ):
         available = {
             "status": "available_manual",
-            "automatic_update": False,
             "installed_version": "0.2.1",
             "available_version": "0.3.0",
             "release_notes_url": (
@@ -1124,7 +982,7 @@ def test_startup_shows_a_link_when_a_new_release_is_available(engine: str) -> No
         }
         application.update_status = available
         application.update_status_sequence = [
-            {"status": "checking", "automatic_update": False},
+            {"status": "checking"},
             available,
         ]
 
@@ -1133,6 +991,7 @@ def test_startup_shows_a_link_when_a_new_release_is_available(engine: str) -> No
         link = page.get_by_role("link", name="View update instructions")
         link.wait_for()
         assert application.update_requests >= 2
+        assert page.locator("#update-notice button").count() == 0
         assert link.get_attribute("href") == (
             "https://github.com/yuzhangmath/arxiv-digest/releases/tag/v0.3.0"
         )
@@ -1244,182 +1103,6 @@ def test_category_choices_are_spaced_responsive_cards(
         else:
             assert abs(first["y"] - second["y"]) < 1
             assert second["x"] >= first["x"] + first["width"] + 6
-        assert page.evaluate(
-            "document.documentElement.scrollWidth <= "
-            "document.documentElement.clientWidth"
-        )
-
-
-@pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_terms_guidance_uses_available_width_responsively(engine: str) -> None:
-    with running_fixture() as (server, application), browser_page(engine) as page:
-        application.revision = 4
-        application.step = "keywords_and_phrases"
-        page.set_viewport_size({"width": 1161, "height": 900})
-        page.goto(server.launch_url("setup"))
-
-        guidance = page.get_by_text(
-            "Optional. Choose or add terms that describe work you want to prioritize. "
-            "You can change them later in Interests.",
-            exact=True,
-        )
-        guidance.wait_for()
-        line_count = guidance.evaluate(
-            """
-            element => {
-              const range = document.createRange();
-              range.selectNodeContents(element);
-              return new Set(
-                [...range.getClientRects()].map((rect) => Math.round(rect.top)),
-              ).size;
-            }
-            """
-        )
-
-        assert line_count == 1
-        page.set_viewport_size({"width": 360, "height": 900})
-        mobile_line_count = guidance.evaluate(
-            """
-            element => {
-              const range = document.createRange();
-              range.selectNodeContents(element);
-              return new Set(
-                [...range.getClientRects()].map((rect) => Math.round(rect.top)),
-              ).size;
-            }
-            """
-        )
-        assert mobile_line_count > 1
-        assert page.evaluate(
-            "document.documentElement.scrollWidth <= "
-            "document.documentElement.clientWidth"
-        )
-
-
-@pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_term_suggestions_wrap_only_between_complete_options(engine: str) -> None:
-    with running_fixture() as (server, application), browser_page(engine) as page:
-        application.revision = 4
-        application.step = "keywords_and_phrases"
-        page.set_viewport_size({"width": 720, "height": 900})
-        page.goto(server.launch_url("setup"))
-
-        short_phrase = page.get_by_text("spectral sequence", exact=True)
-        long_phrase = page.get_by_text(
-            "characteristicallylongtoken extraordinarilylongtoken topology",
-            exact=True,
-        )
-        short_phrase.wait_for()
-
-        def text_line_count(label: Locator) -> int:
-            return label.evaluate(
-                """
-                element => {
-                  const range = document.createRange();
-                  range.selectNodeContents(element);
-                  return new Set(
-                    [...range.getClientRects()].map((rect) => Math.round(rect.top)),
-                  ).size;
-                }
-                """
-            )
-
-        assert text_line_count(short_phrase) == 1
-        page.set_viewport_size({"width": 360, "height": 900})
-        assert text_line_count(short_phrase) == 1
-        assert text_line_count(long_phrase) > 1
-        assert page.locator(
-            '.setup-view[data-step="terms"] .suggestion'
-        ).evaluate_all(
-            """
-            options => options.every((option) => {
-              const checkbox = option.querySelector('input').getBoundingClientRect();
-              const label = option.querySelector('span').getBoundingClientRect();
-              return Math.min(checkbox.bottom, label.bottom) >
-                Math.max(checkbox.top, label.top);
-            })
-            """
-        )
-        assert page.evaluate(
-            "document.documentElement.scrollWidth <= "
-            "document.documentElement.clientWidth"
-        )
-
-
-@pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_custom_terms_have_contextual_names_and_preserve_focus(engine: str) -> None:
-    with running_fixture() as (server, application), browser_page(engine) as page:
-        application.revision = 4
-        application.step = "keywords_and_phrases"
-        page.goto(server.launch_url("setup"))
-
-        add = page.get_by_role("button", name="Add custom term", exact=True)
-        add.click()
-        first = page.get_by_role("textbox", name="Custom term 1", exact=True)
-        assert first.count() == 1
-        assert first.evaluate("input => document.activeElement === input")
-        page.get_by_role(
-            "button", name="Remove custom term 1", exact=True
-        ).wait_for()
-
-        add.click()
-        second = page.get_by_role("textbox", name="Custom term 2", exact=True)
-        assert second.evaluate("input => document.activeElement === input")
-        page.get_by_role(
-            "button", name="Remove custom term 2", exact=True
-        ).click()
-        assert first.evaluate("input => document.activeElement === input")
-
-        page.get_by_role(
-            "button", name="Remove custom term 1", exact=True
-        ).click()
-        assert add.evaluate("button => document.activeElement === button")
-
-
-@pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_author_suggestions_wrap_only_between_complete_options(engine: str) -> None:
-    with running_fixture() as (server, application), browser_page(engine) as page:
-        application.revision = 5
-        application.step = "authors"
-        page.set_viewport_size({"width": 720, "height": 900})
-        page.goto(server.launch_url("setup"))
-
-        short_name = page.get_by_text("Taylor Spectral", exact=True)
-        long_name = page.get_by_text(
-            "Characteristicallylonggivenname Extraordinarilylongfamilyname",
-            exact=True,
-        )
-        short_name.wait_for()
-
-        def text_line_count(label: Locator) -> int:
-            return label.evaluate(
-                """
-                element => {
-                  const range = document.createRange();
-                  range.selectNodeContents(element);
-                  return new Set(
-                    [...range.getClientRects()].map((rect) => Math.round(rect.top)),
-                  ).size;
-                }
-                """
-            )
-
-        assert text_line_count(short_name) == 1
-        page.set_viewport_size({"width": 360, "height": 900})
-        assert text_line_count(short_name) == 1
-        assert text_line_count(long_name) > 1
-        assert page.locator(
-            '.setup-view[data-step="authors"] .suggestion'
-        ).evaluate_all(
-            """
-            options => options.every((option) => {
-              const checkbox = option.querySelector('input').getBoundingClientRect();
-              const label = option.querySelector('span').getBoundingClientRect();
-              return Math.min(checkbox.bottom, label.bottom) >
-                Math.max(checkbox.top, label.top);
-            })
-            """
-        )
         assert page.evaluate(
             "document.documentElement.scrollWidth <= "
             "document.documentElement.clientWidth"
@@ -1549,7 +1232,7 @@ def test_setup_retry_redirects_if_setup_completed_after_the_failure() -> None:
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_complete_setup_records_only_explicit_selections_and_not_now(
+def test_complete_setup_skips_personalization_and_preserves_explicit_not_now(
     engine: str,
 ) -> None:
     with running_fixture() as (server, application), browser_page(engine) as page:
@@ -1567,53 +1250,7 @@ def test_complete_setup_records_only_explicit_selections_and_not_now(
         ).click()
         page.get_by_role("button", name="Use recommended 30 days").click()
         page.get_by_role("button", name="Continue").click()
-        page.get_by_role("button", name="Generate corpus").click()
-        page.get_by_text("Corpus ready").wait_for()
-        page.get_by_role(
-            "button", name="Use this corpus and continue", exact=True
-        ).click()
-
-        page.get_by_role(
-            "button", name="Continue without seed papers", exact=True
-        ).wait_for()
-        page.get_by_text("Selected geometry").click()
-        page.get_by_role(
-            "button", name="Continue with selected seed papers", exact=True
-        ).wait_for()
-        page.get_by_role("button", name="Add custom paper id").click()
-        page.locator(".custom-entries input").fill("2608.09999")
-        page.get_by_role(
-            "button", name="Continue with selected seed papers", exact=True
-        ).click()
-
-        page.get_by_role(
-            "button", name="Continue without terms", exact=True
-        ).wait_for()
-        page.get_by_text("derived geometry", exact=True).click()
-        page.get_by_text("mirror symmetry").click()
-        page.get_by_role(
-            "button", name="Continue with selected terms", exact=True
-        ).wait_for()
-        page.get_by_role("button", name="Add custom term").click()
-        page.locator(".custom-entries input").nth(0).fill("topology")
-        page.get_by_role("button", name="Add custom term").click()
-        page.locator(".custom-entries input").nth(1).fill("custom phrase")
-        page.get_by_role(
-            "button", name="Continue with selected terms", exact=True
-        ).click()
-
-        page.get_by_role(
-            "button", name="Continue without author preferences", exact=True
-        ).wait_for()
-        page.get_by_text("Ada Example").click()
-        page.get_by_role(
-            "button", name="Continue with selected authors", exact=True
-        ).wait_for()
-        page.get_by_role("button", name="Add custom author").click()
-        page.locator(".custom-entries input").fill("Custom Author")
-        page.get_by_role(
-            "button", name="Continue with selected authors", exact=True
-        ).click()
+        assert page.get_by_role("button", name="Generate corpus").count() == 0
 
         page.get_by_text(
             "Choose the folder where arXiv Digest will place paper PDFs",
@@ -1632,17 +1269,7 @@ def test_complete_setup_records_only_explicit_selections_and_not_now(
         page.get_by_role("button", name="Continue").click()
 
         page.get_by_text("Categories", exact=True).wait_for()
-        seed_rows = page.locator(".setup-summary-seed-paper")
-        assert seed_rows.count() == 2
-        assert "2608.01234" in seed_rows.nth(0).inner_text()
-        assert "Selected geometry" in seed_rows.nth(0).inner_text()
-        assert "2608.09999" in seed_rows.nth(1).inner_text()
-        assert "Custom seed paper" in seed_rows.nth(1).inner_text()
-        first_seed_box = seed_rows.nth(0).bounding_box()
-        second_seed_box = seed_rows.nth(1).bounding_box()
-        assert first_seed_box is not None
-        assert second_seed_box is not None
-        assert second_seed_box["y"] >= first_seed_box["y"] + first_seed_box["height"]
+        assert page.locator(".setup-summary-seed-paper").count() == 0
         page.get_by_text("PDF download folder", exact=True).wait_for()
         destination_path = page.locator(".setup-summary-destination-path")
         assert destination_path.inner_text() == "~/Documents/Research PDFs"
@@ -1685,58 +1312,9 @@ def test_complete_setup_records_only_explicit_selections_and_not_now(
         assert category["selections"] == [
             {"category": "math.AG", "set_spec": "arXiv:math.AG"}
         ]
-        seeds = next(item for item in application.submissions if item.get("step") == "seed_papers")
-        assert seeds["accepted_suggestion_ids"] == ["paper_suggestion_1"]
-        assert seeds["custom_arxiv_ids"] == ["2608.09999"]
-        terms = next(item for item in application.submissions if item.get("step") == "terms")
-        assert terms["accepted_keyword_suggestion_ids"] == [
-            "keyword_suggestion_1"
+        assert [item.get("step") for item in application.submissions] == [
+            "categories", "coverage", "pdf_destination", "review",
         ]
-        assert terms["accepted_phrase_suggestion_ids"] == ["phrase_suggestion_1"]
-        assert terms["custom_keywords"] == ["topology"]
-        assert terms["custom_phrases"] == ["custom phrase"]
-
-
-@pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_optional_interest_steps_can_continue_with_no_selections(
-    engine: str,
-) -> None:
-    with running_fixture() as (server, application), browser_page(engine) as page:
-        application.revision = 3
-        application.step = "seed_papers"
-        page.goto(server.launch_url("setup"))
-
-        page.get_by_role("button", name="Add custom paper id").click()
-        page.locator(".custom-entries input").fill("   ")
-        page.get_by_role(
-            "button", name="Continue without seed papers", exact=True
-        ).click()
-        page.get_by_role("button", name="Add custom term").click()
-        page.locator(".custom-entries input").fill("   ")
-        page.get_by_role(
-            "button", name="Continue without terms", exact=True
-        ).click()
-        page.get_by_role("button", name="Add custom author").click()
-        page.locator(".custom-entries input").fill("   ")
-        page.get_by_role(
-            "button", name="Continue without author preferences", exact=True
-        ).click()
-        page.get_by_role("button", name="Choose PDF folder").wait_for()
-        assert page.get_by_role("button", name="Test selected destination").count() == 0
-
-        optional = {
-            str(item["step"]): item
-            for item in application.submissions
-            if item.get("step") in {"seed_papers", "terms", "authors"}
-        }
-        assert optional["seed_papers"]["accepted_suggestion_ids"] == []
-        assert optional["seed_papers"]["custom_arxiv_ids"] == []
-        assert optional["terms"]["accepted_keyword_suggestion_ids"] == []
-        assert optional["terms"]["accepted_phrase_suggestion_ids"] == []
-        assert optional["terms"]["custom_keywords"] == []
-        assert optional["terms"]["custom_phrases"] == []
-        assert optional["authors"]["accepted_suggestion_ids"] == []
-        assert optional["authors"]["custom_authors"] == []
 
 
 def test_review_reports_initial_sync_and_refreshes_when_papers_arrive() -> None:
@@ -3470,295 +3048,6 @@ def test_failed_folder_test_requires_a_new_picker_choice() -> None:
         assert page.get_by_role("button", name="Continue").is_disabled()
 
 
-def test_capped_candidate_job_requires_resume_or_restart_before_continuing() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.candidate_job = {
-            "status": "completed",
-            "complete": True,
-            "failed": False,
-            "corpus_complete": False,
-            "minimum_met": False,
-            "setup_ready": False,
-            "can_resume": True,
-            "corpus_hash": "a" * 64,
-            "message": "Invocation budget reached",
-        }
-
-        page.goto(server.launch_url("setup"))
-        page.get_by_role("button", name="Generate corpus").click()
-        page.get_by_role("button", name="Resume corpus", exact=True).wait_for()
-
-        assert page.get_by_role(
-            "button", name="Restart corpus", exact=True
-        ).is_visible()
-        assert page.get_by_role("button", name="Continue", exact=True).is_disabled()
-        page.get_by_text("below the required minimum", exact=False).wait_for()
-
-        application.candidate_job.update(
-            minimum_met=True,
-            corpus_hash="b" * 64,
-            message="Minimum candidate breadth reached",
-        )
-        page.get_by_role("button", name="Resume corpus", exact=True).click()
-        accept = page.get_by_role(
-            "button", name="Accept reduced breadth and continue", exact=True
-        )
-        accept.wait_for()
-        assert accept.is_enabled()
-        page.get_by_text("explicitly accept this reduced breadth", exact=False).wait_for()
-
-
-@pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_corpus_generation_is_busy_before_start_returns_and_through_polling(
-    engine: str,
-) -> None:
-    with running_fixture() as (server, application), browser_page(engine) as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.corpus_start_gate = threading.Event()
-        application.candidate_job = {
-            "job_id": "corpus_job_1234",
-            "status": "running",
-            "complete": False,
-            "failed": False,
-        }
-
-        try:
-            page.goto(server.launch_url("setup"))
-            page.get_by_role("button", name="Generate corpus").click()
-            assert application.corpus_start_entered.wait(timeout=2)
-
-            starting = page.get_by_text(
-                "Starting corpus generation… This can take up to five minutes.",
-                exact=True,
-            )
-            starting.wait_for(timeout=2_000)
-            assert page.locator(
-                'progress[aria-label="Corpus generation in progress"]'
-            ).is_visible()
-            assert page.locator('.setup-view[aria-busy="true"]').is_visible()
-            assert page.get_by_role("button", name="Generate corpus").count() == 0
-            navigation = page.locator(".primary-navigation")
-            assert navigation.is_hidden()
-            assert page.get_by_role(
-                "button", name="Settings", exact=True
-            ).count() == 0
-            assert page.get_by_role("button", name="Quit", exact=True).is_visible()
-
-            application.corpus_start_gate.set()
-            working = page.get_by_text(
-                "Generating corpus… This can take up to five minutes.",
-                exact=True,
-            )
-            working.wait_for(timeout=2_000)
-            deadline = time.monotonic() + 3
-            while application.corpus_status_requests < 2 and time.monotonic() < deadline:
-                page.wait_for_timeout(50)
-            assert application.corpus_status_requests >= 2
-            assert working.is_visible()
-            assert page.get_by_role("button", name="Generate corpus").count() == 0
-            assert navigation.is_hidden()
-            assert page.get_by_role(
-                "button", name="Settings", exact=True
-            ).count() == 0
-            assert page.get_by_role("button", name="Quit", exact=True).is_visible()
-
-            application.expose_corpus_job = True
-            page.reload()
-            working.wait_for(timeout=2_000)
-            assert page.locator('.setup-view[aria-busy="true"]').is_visible()
-            assert page.get_by_role("button", name="Generate corpus").count() == 0
-
-            application.candidate_job = {
-                "job_id": "corpus_job_1234",
-                "status": "completed",
-                "complete": True,
-                "failed": False,
-                "corpus_complete": True,
-                "minimum_met": True,
-                "setup_ready": True,
-                "can_resume": False,
-                "corpus_hash": "a" * 64,
-                "reduced_breadth": False,
-                "message": "Corpus ready",
-            }
-            page.get_by_text("Corpus ready", exact=True).wait_for(timeout=3_000)
-            assert application.corpus_start_requests == 1
-        finally:
-            application.corpus_start_gate.set()
-
-
-def test_corpus_polling_never_replaces_a_view_opened_during_generation() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.candidate_job = {
-            "job_id": "corpus_job_1234",
-            "status": "running",
-            "complete": False,
-            "failed": False,
-        }
-
-        page.goto(server.launch_url("setup"))
-        page.get_by_role("button", name="Generate corpus").click()
-        page.get_by_text(
-            "Generating corpus… This can take up to five minutes.", exact=True
-        ).wait_for()
-        navigate_with_history(page, "settings")
-        page.get_by_role("heading", name="Settings", exact=True).wait_for()
-
-        page.wait_for_timeout(750)
-        assert page.get_by_role("heading", name="Settings", exact=True).is_visible()
-        assert page.get_by_role(
-            "heading", name="Set up your arXiv digest", exact=True
-        ).count() == 0
-
-
-def test_steady_corpus_polling_does_not_repeat_live_region_announcements() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.candidate_job = {
-            "job_id": "corpus_job_1234",
-            "status": "running",
-            "complete": False,
-            "failed": False,
-        }
-
-        page.goto(server.launch_url("setup"))
-        page.get_by_role("button", name="Generate corpus").click()
-        page.get_by_text(
-            "Generating corpus… This can take up to five minutes.", exact=True
-        ).wait_for()
-        starting_requests = application.corpus_status_requests
-        page.evaluate(
-            """
-            () => {
-              window.__corpusMutationCounts = { status: 0, content: 0 };
-              const statusObserver = new MutationObserver((records) => {
-                window.__corpusMutationCounts.status += records.length;
-              });
-              statusObserver.observe(document.querySelector("#status"), {
-                childList: true,
-                characterData: true,
-                subtree: true,
-              });
-              const contentObserver = new MutationObserver((records) => {
-                window.__corpusMutationCounts.content += records.filter(
-                  (record) => record.target === document.querySelector("#content"),
-                ).length;
-              });
-              contentObserver.observe(document.querySelector("#content"), {
-                childList: true,
-              });
-              window.__corpusObservers = [statusObserver, contentObserver];
-            }
-            """
-        )
-
-        deadline = time.monotonic() + 2
-        while (
-            application.corpus_status_requests < starting_requests + 3
-            and time.monotonic() < deadline
-        ):
-            page.wait_for_timeout(50)
-        assert application.corpus_status_requests >= starting_requests + 3
-        assert page.evaluate("window.__corpusMutationCounts") == {
-            "status": 0,
-            "content": 0,
-        }
-
-
-def test_corpus_start_response_does_not_replace_a_view_opened_while_starting() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.corpus_start_gate = threading.Event()
-        application.candidate_job = {
-            "job_id": "corpus_job_1234",
-            "status": "running",
-            "complete": False,
-            "failed": False,
-        }
-
-        try:
-            page.goto(server.launch_url("setup"))
-            page.get_by_role("button", name="Generate corpus").click()
-            assert application.corpus_start_entered.wait(timeout=2)
-            navigate_with_history(page, "settings")
-            page.get_by_role("heading", name="Settings", exact=True).wait_for()
-
-            application.corpus_start_gate.set()
-            page.wait_for_timeout(500)
-            assert page.get_by_role(
-                "heading", name="Settings", exact=True
-            ).is_visible()
-            assert page.get_by_role(
-                "heading", name="Set up your arXiv digest", exact=True
-            ).count() == 0
-            assert application.corpus_status_requests == 0
-        finally:
-            application.corpus_start_gate.set()
-
-
-def test_corpus_start_response_does_not_replace_the_closed_screen() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.corpus_start_gate = threading.Event()
-
-        try:
-            page.goto(server.launch_url("setup"))
-            page.get_by_role("button", name="Generate corpus").click()
-            assert application.corpus_start_entered.wait(timeout=2)
-            page.get_by_role("button", name="Quit", exact=True).click()
-            page.get_by_role(
-                "heading", name="arXiv Digest is closed", exact=True
-            ).wait_for()
-
-            application.corpus_start_gate.set()
-            page.wait_for_timeout(500)
-            assert page.get_by_role(
-                "heading", name="arXiv Digest is closed", exact=True
-            ).is_visible()
-            assert page.get_by_role(
-                "heading", name="Set up your arXiv digest", exact=True
-            ).count() == 0
-            assert application.corpus_status_requests == 0
-        finally:
-            application.corpus_start_gate.set()
-
-
-def test_quit_immediately_prevents_a_new_corpus_start() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.quit_gate = threading.Event()
-        application.corpus_start_gate = threading.Event()
-
-        try:
-            page.goto(server.launch_url("setup"))
-            generate = page.get_by_role("button", name="Generate corpus", exact=True)
-            page.get_by_role("button", name="Quit", exact=True).click()
-            assert application.quit_entered.wait(timeout=2)
-
-            generate.evaluate("control => control.click()")
-            page.wait_for_timeout(200)
-            assert not application.corpus_start_entered.is_set()
-
-            application.quit_gate.set()
-            page.get_by_role(
-                "heading", name="arXiv Digest is closed", exact=True
-            ).wait_for()
-            assert application.corpus_start_requests == 0
-            assert application.corpus_status_requests == 0
-        finally:
-            application.quit_gate.set()
-            application.corpus_start_gate.set()
-
-
 def test_pagehide_does_not_cancel_an_explicit_quit_request() -> None:
     with running_fixture() as (server, application), browser_page("chromium") as page:
         page.add_init_script(
@@ -3848,206 +3137,6 @@ def test_webkit_back_forward_cache_restore_reactivates_the_page() -> None:
 
         navigate_with_history(page, "settings")
         page.get_by_role("heading", name="Settings", exact=True).wait_for()
-
-
-def test_failed_corpus_refresh_does_not_replace_a_newly_opened_view() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.candidate_job = {
-            "job_id": "corpus_job_1234",
-            "status": "running",
-            "complete": False,
-            "failed": False,
-        }
-
-        try:
-            page.goto(server.launch_url("setup"))
-            page.get_by_role("button", name="Generate corpus").click()
-            page.get_by_text(
-                "Generating corpus… This can take up to five minutes.",
-                exact=True,
-            ).wait_for()
-
-            application.draft_gate_request = application.draft_requests + 1
-            application.draft_gate = threading.Event()
-            application.expose_corpus_job = True
-            application.candidate_job = {
-                "job_id": "corpus_job_1234",
-                "status": "failed",
-                "complete": False,
-                "failed": True,
-                "error_code": "job_failed",
-                "message": "The background operation did not complete.",
-            }
-            assert application.draft_gate_entered.wait(timeout=3)
-            assert page.locator("#status").inner_text() == "Checking corpus status…"
-
-            navigate_with_history(page, "settings")
-            page.get_by_role("heading", name="Settings", exact=True).wait_for()
-            application.draft_gate.set()
-            page.wait_for_timeout(500)
-            assert page.get_by_role(
-                "heading", name="Settings", exact=True
-            ).is_visible()
-            assert page.get_by_role(
-                "heading", name="Set up your arXiv digest", exact=True
-            ).count() == 0
-        finally:
-            if application.draft_gate is not None:
-                application.draft_gate.set()
-
-
-def test_corpus_polling_restarts_after_returning_during_an_inflight_poll() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.expose_corpus_job = True
-        application.corpus_status_gate = threading.Event()
-        application.candidate_job = {
-            "job_id": "corpus_job_1234",
-            "status": "running",
-            "complete": False,
-            "failed": False,
-        }
-
-        try:
-            page.goto(server.launch_url("setup"))
-            assert application.corpus_status_entered.wait(timeout=2)
-
-            navigate_with_history(page, "settings")
-            page.get_by_role("heading", name="Settings", exact=True).wait_for()
-            page.go_back()
-            page.get_by_text(
-                "Generating corpus… This can take up to five minutes.",
-                exact=True,
-            ).wait_for()
-
-            deadline = time.monotonic() + 2
-            while (
-                application.corpus_status_requests < 3
-                and time.monotonic() < deadline
-            ):
-                page.wait_for_timeout(50)
-            assert application.corpus_status_requests >= 3
-
-            application.candidate_job = {
-                "job_id": "corpus_job_1234",
-                "status": "completed",
-                "complete": True,
-                "failed": False,
-                "corpus_complete": True,
-                "minimum_met": True,
-                "setup_ready": True,
-                "can_resume": False,
-                "corpus_hash": "a" * 64,
-                "reduced_breadth": False,
-                "message": "Corpus ready",
-            }
-            page.get_by_text("Corpus ready", exact=True).wait_for(timeout=3_000)
-        finally:
-            application.corpus_status_gate.set()
-
-
-def test_terminal_poll_reconciles_the_current_candidate_job_before_actions() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.corpus_status_gate = threading.Event()
-        application.candidate_job = {
-            "job_id": "corpus_job_1234",
-            "status": "completed",
-            "complete": True,
-            "failed": False,
-            "corpus_complete": True,
-            "minimum_met": True,
-            "setup_ready": True,
-            "can_resume": False,
-            "corpus_hash": "a" * 64,
-            "reduced_breadth": False,
-            "message": "Old corpus ready",
-        }
-
-        try:
-            page.goto(server.launch_url("setup"))
-            page.get_by_role("button", name="Generate corpus").click()
-            assert application.corpus_status_entered.wait(timeout=2)
-
-            application.candidate_job = {
-                "job_id": "corpus_job_5678",
-                "status": "running",
-                "complete": False,
-                "failed": False,
-            }
-            application.corpus_status_gate.set()
-            deadline = time.monotonic() + 3
-            while application.corpus_status_requests < 2 and time.monotonic() < deadline:
-                page.wait_for_timeout(50)
-            assert application.corpus_status_requests >= 2
-            assert page.locator('.setup-view[aria-busy="true"]').is_visible()
-            assert page.get_by_text("Old corpus ready", exact=True).count() == 0
-            assert page.get_by_role(
-                "button", name="Use this corpus and continue", exact=True
-            ).count() == 0
-
-            application.candidate_job = {
-                "job_id": "corpus_job_5678",
-                "status": "completed",
-                "complete": True,
-                "failed": False,
-                "corpus_complete": True,
-                "minimum_met": True,
-                "setup_ready": True,
-                "can_resume": False,
-                "corpus_hash": "b" * 64,
-                "reduced_breadth": False,
-                "message": "Current corpus ready",
-            }
-            page.get_by_text("Current corpus ready", exact=True).wait_for(
-                timeout=3_000
-            )
-        finally:
-            application.corpus_status_gate.set()
-
-
-@pytest.mark.parametrize("engine", ["chromium", "webkit"])
-def test_failed_corpus_generation_preserves_resumable_cached_work(
-    engine: str,
-) -> None:
-    with running_fixture() as (server, application), browser_page(engine) as page:
-        application.revision = 2
-        application.step = "candidate_corpus"
-        application.candidate_job = {
-            "job_id": "corpus_job_1234",
-            "status": "running",
-            "complete": False,
-            "failed": False,
-        }
-
-        page.goto(server.launch_url("setup"))
-        page.get_by_role("button", name="Generate corpus").click()
-        page.get_by_text(
-            "Generating corpus… This can take up to five minutes.", exact=True
-        ).wait_for()
-
-        application.corpus_can_resume = True
-        application.expose_corpus_job = True
-        application.candidate_job = {
-            "job_id": "corpus_job_1234",
-            "status": "failed",
-            "complete": False,
-            "failed": True,
-            "error_code": "job_failed",
-            "message": "The background operation did not complete.",
-        }
-
-        page.get_by_role("button", name="Resume corpus", exact=True).wait_for(
-            timeout=3_000
-        )
-        assert page.get_by_role(
-            "button", name="Restart corpus", exact=True
-        ).is_visible()
-        assert page.get_by_role("button", name="Retry corpus", exact=True).count() == 0
 
 
 def test_create_launcher_is_explicit_and_dispatched_once() -> None:
@@ -4433,3 +3522,36 @@ def test_settings_refreshes_after_a_stale_folder_save_and_requires_a_new_pick() 
         operations = [operation for operation, _ in application.dashboard_calls]
         assert operations.count("settings_get") >= 3
         assert operations.count("settings_folder") == 2
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_fresh_interests_are_optional_and_only_explicit_choices_are_saved(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
+        application.interest_values = {field: [] for field in application.interest_values}
+        page.goto(server.launch_url("interests"))
+        page.get_by_role("heading", name="Interests", exact=True).wait_for()
+        save = page.get_by_role("button", name="Update interests", exact=True)
+        assert save.is_disabled()
+        page.get_by_role("button", name="Refresh suggestions", exact=True).click()
+        page.get_by_text("Suggestions refreshed").wait_for()
+        assert save.is_disabled()
+        assert not any(operation == "interests_put" for operation, _ in application.dashboard_calls)
+        page.get_by_role("button", name="Add seed paper", exact=True).click()
+        page.get_by_text("Suggested seed (2608.09999)", exact=False).click()
+        page.get_by_role("button", name="Add terms", exact=True).click()
+        page.get_by_label("Add custom term", exact=True).fill("topology")
+        page.get_by_role("button", name="Add custom term", exact=True).click()
+        page.get_by_label("Add custom term", exact=True).fill("spectral flow")
+        page.get_by_role("button", name="Add custom term", exact=True).click()
+        page.get_by_role("button", name="Add author", exact=True).click()
+        page.get_by_text("Custom Author", exact=True).click()
+        assert not any(operation == "interests_put" for operation, _ in application.dashboard_calls)
+        save.click()
+        page.get_by_text("Interests updated").wait_for()
+        submitted = [payload for operation, payload in application.dashboard_calls if operation == "interests_put"]
+        assert len(submitted) == 1
+        assert submitted[0]["seed_papers"] == ["2608.09999"]
+        assert submitted[0]["keywords"] == ["topology"]
+        assert submitted[0]["phrases"] == ["spectral flow"]
+        assert submitted[0]["authors"] == ["Custom Author"]
+        assert not any(operation == "library_save" for operation, _ in application.dashboard_calls)

@@ -447,14 +447,14 @@ def test_page_budget_persists_exact_tokens_accepts_visible_reduced_breadth_and_r
     assert len(source.next_calls) == 54
 
 
-def test_setup_restart_resumes_exact_shards_and_rehydrates_before_acceptance(
+def test_interests_refresh_resumes_exact_shards_and_rehydrates_after_restart(
     tmp_path,
 ) -> None:
     from arxiv_digest.application import _DefaultRuntime
     from arxiv_digest.candidates import CandidateCache, CandidateCorpusBuilder
     from arxiv_digest.maintenance import MaintenanceBarrier
     from arxiv_digest.paths import resolve_paths
-    from arxiv_digest.profile import ProfileRepository
+    from arxiv_digest.profile import PdfDestination, ProfileRepository
     from arxiv_digest.setup import CategorySelection
     from arxiv_digest.web.api import ApiRequest, ApiRouter
     from arxiv_digest.web.lifecycle import LifecycleController
@@ -486,6 +486,8 @@ def test_setup_restart_resumes_exact_shards_and_rehydrates_before_acceptance(
             output=lambda _message: None,
         )
         closeable = runtime.open_database()
+        runtime.setup.clock = lambda: NOW
+        runtime._category_values = ()
         runtime.candidates = CandidateCorpusBuilder(
             source,
             CandidateCache(paths, clock=lambda: NOW),
@@ -512,20 +514,6 @@ def test_setup_restart_resumes_exact_shards_and_rehydrates_before_acceptance(
         assert response.status == 200, payload
         return payload["data"]
 
-    def await_job(router: ApiRouter, job_id: str):
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            status = dispatch(
-                router,
-                "GET",
-                f"/api/v1/setup/jobs/{job_id}",
-            )
-            if status["status"] != "running":
-                assert status["status"] == "completed", status
-                return status
-            time.sleep(0.01)
-        raise AssertionError("candidate job did not reach a terminal state")
-
     initial_source = RestartableCandidateSource()
     first_runtime, first_router, first_closeable = open_runtime(
         initial_source,
@@ -540,18 +528,24 @@ def test_setup_restart_resumes_exact_shards_and_rehydrates_before_acceptance(
         draft = first_runtime.setup.set_initial_coverage(
             draft.revision,
             date(2026, 7, 23),
-            earliest_datestamp=date(2007, 1, 1),
         )
-        started = dispatch(
-            first_router,
-            "POST",
-            "/api/v1/setup/corpus",
-            {"draft_revision": draft.revision, "mode": "restart"},
+        draft = first_runtime.setup.set_pdf_destination(
+            draft.revision, PdfDestination("custom", tmp_path / "pdfs"), tested=True,
         )
-        partial = await_job(first_router, started["job_id"])
-        assert partial["pages_fetched"] == 1
-        assert partial["can_resume"] is True
-        assert partial["corpus_complete"] is False
+        draft = first_runtime.setup.confirm_review(draft.revision)
+        first_runtime.setup.complete(draft.revision, launcher_choice="not_now")
+        original_profile = paths.profile_path.read_bytes()
+        initial = dispatch(first_router, "GET", "/api/v1/interests")
+        assert initial["seed_papers"] == initial["keywords"] == initial["phrases"] == initial["authors"] == []
+        assert initial_source.first_calls == []
+        assert first_runtime._candidate_build is None
+
+        dispatch(first_router, "GET", "/api/v1/interests?refresh=1")
+        partial = first_runtime._candidate_build
+        assert partial.pages_fetched == 1
+        assert partial.can_resume is True
+        assert partial.complete is False
+        assert paths.profile_path.read_bytes() == original_profile
     finally:
         first_closeable.close()
 
@@ -572,27 +566,14 @@ def test_setup_restart_resumes_exact_shards_and_rehydrates_before_acceptance(
     )
     try:
         assert second_runtime._candidate_build is None
-        restarted_draft = dispatch(
-            second_router,
-            "GET",
-            "/api/v1/setup/draft",
-        )
-        assert restarted_draft["current_step"] == "candidate_corpus"
-        assert restarted_draft["corpus_hash"] is None
-        assert restarted_draft["corpus_can_resume"] is True
+        restarted = dispatch(second_router, "GET", "/api/v1/interests")
+        assert restarted["seed_papers"] == []
+        assert resumed_source.first_calls == resumed_source.next_calls == []
 
-        started = dispatch(
-            second_router,
-            "POST",
-            "/api/v1/setup/corpus",
-            {
-                "draft_revision": restarted_draft["revision"],
-                "mode": "resume",
-            },
-        )
-        complete = await_job(second_router, started["job_id"])
-        assert complete["corpus_complete"] is True
-        assert complete["pages_fetched"] == 18
+        completed_suggestions = dispatch(second_router, "GET", "/api/v1/interests?refresh=1")
+        complete = second_runtime._candidate_build
+        assert complete.complete is True
+        assert complete.pages_fetched == 18
         assert resumed_source.next_calls == [
             RestartableCandidateSource.exact_token
         ]
@@ -614,43 +595,14 @@ def test_setup_restart_resumes_exact_shards_and_rehydrates_before_acceptance(
         page_budget=60,
     )
     try:
-        complete_draft = dispatch(
-            third_router,
-            "GET",
-            "/api/v1/setup/draft",
-        )
         assert third_runtime._candidate_build is None
-        assert complete_draft["corpus_hash"] is None
-        assert complete_draft["corpus_can_resume"] is True
-
-        started = dispatch(
-            third_router,
-            "POST",
-            "/api/v1/setup/corpus",
-            {
-                "draft_revision": complete_draft["revision"],
-                "mode": "resume",
-            },
-        )
-        rehydrated = await_job(third_router, started["job_id"])
-        assert rehydrated["corpus_complete"] is True
-        assert rehydrated["pages_fetched"] == 0
+        rehydrated = dispatch(third_router, "GET", "/api/v1/interests")
+        assert rehydrated["suggestions"] == completed_suggestions["suggestions"]
         assert no_network_source.first_calls == []
         assert no_network_source.next_calls == []
-        assert third_runtime._candidate_build.corpus_hash == complete["corpus_hash"]
-
-        accepted = dispatch(
-            third_router,
-            "POST",
-            "/api/v1/setup/corpus/accept",
-            {
-                "draft_revision": complete_draft["revision"],
-                "corpus_hash": rehydrated["corpus_hash"],
-            },
-        )
-        assert accepted["current_step"] == "seed_papers"
-        assert accepted["corpus_complete"] is True
-        assert accepted["corpus_hash"] == rehydrated["corpus_hash"]
+        assert paths.profile_path.read_bytes() == original_profile
+        assert third_runtime.store.canonical_event_count() == 0
+        assert third_runtime.store.saved_paper_metadata() == ()
     finally:
         third_closeable.close()
 

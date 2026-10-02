@@ -28,6 +28,7 @@ class ReleaseFixtureApplication(FixtureApplication):
     def __init__(self) -> None:
         super().__init__()
         self.finishes: list[dict[str, object]] = []
+        self.interest_values = {field: [] for field in self.interest_values}
         spec = _fixture()
         progress = spec["daily_list_progress"]
         confirmed = spec["confirmed_review"]
@@ -72,63 +73,58 @@ class ReleaseFixtureApplication(FixtureApplication):
             ),
         }
 
+    def interests(self, payload: dict[str, object]) -> dict[str, object]:
+        result = super().interests(payload)
+        raw = _fixture()["candidate_corpus"]
+        categories = raw["categories"]
+        papers = []
+        for index in range(int(raw["visible_count"])):
+            category = str(categories[index % len(categories)]["category"])
+            label = category.replace("synthetic.", "Synthetic ").title()
+            papers.append({
+                "arxiv_id": f"2608.{41001 + index:05d}",
+                "title": f"{label} candidate {index + 1:02d}",
+            })
+        result["categories"] = categories
+        result["suggestions"] = {
+            "categories": [],
+            "seed_papers": papers,
+            "keywords": [{"value": str(raw["recurring_keyword"])}],
+            "phrases": [{"value": str(raw["recurring_phrase"])}],
+            "authors": [{"name": str(raw["recurring_author"])}],
+        }
+        return result
+
+    def update_interests(self, payload: dict[str, object]) -> dict[str, object]:
+        projection_revision = self.review_projection_revision
+        result = super().update_interests(payload)
+        # Preference edits change the profile revision without changing category projection.
+        self.review_projection_revision = projection_revision
+        return result
+
+    def review_date(self, payload: dict[str, object]) -> dict[str, object]:
+        result = super().review_date(payload)
+        result["cards"][0]["title"] = "Synthetic $K$-theory <script>not markup</script>"
+        return result
+
     def handlers(self) -> dict[str, object]:
         handlers = super().handlers()
-        spec = _fixture()
-        raw = spec["candidate_corpus"]
-        assert isinstance(raw, dict)
-        raw_categories = raw["categories"]
-        assert isinstance(raw_categories, list)
+        raw = _fixture()["candidate_corpus"]
         categories = [
             {
                 "category": str(item["category"]),
                 "set_spec": str(item["set_spec"]),
                 "label": str(item["category"]).replace("synthetic.", "Synthetic ").title(),
             }
-            for item in raw_categories
+            for item in raw["categories"]
         ]
-        papers = []
-        for index in range(int(raw["visible_count"])):
-            category = str(raw_categories[index % len(raw_categories)]["category"])
-            display_category = category.replace("synthetic.", "Synthetic ").title()
-            title = f"{display_category} candidate {index + 1:02d}"
-            if index == 1:
-                title = f"{display_category} $K$-theory candidate {index + 1:02d}"
-            papers.append(
-                {
-                    "suggestion_id": f"paper_suggestion_{index + 1}",
-                    "title": title,
-                }
-            )
-        handlers.update(
-            {
-                "categories": lambda _payload: categories,
-                "setup_candidate_papers": lambda _payload: {"items": papers},
-                "setup_candidate_terms": lambda _payload: {
-                    "keywords": [
-                        {
-                            "suggestion_id": "keyword_orchard",
-                            "label": str(raw["recurring_keyword"]),
-                        }
-                    ],
-                    "phrases": [
-                        {
-                            "suggestion_id": "phrase_spectral_garden",
-                            "label": str(raw["recurring_phrase"]),
-                        }
-                    ],
-                },
-                "setup_candidate_authors": lambda _payload: {
-                    "items": [
-                        {
-                            "suggestion_id": "author_crosscategory",
-                            "label": str(raw["recurring_author"]),
-                        }
-                    ]
-                },
-                "review_finish": self.finish,
-            }
-        )
+        handlers.update({
+            "categories": lambda payload: [
+                item for item in categories
+                if str(payload.get("q", "")).casefold() in item["label"].casefold()
+            ],
+            "review_finish": self.finish,
+        })
         return handlers
 
 
@@ -182,6 +178,17 @@ def test_release_setup_and_two_hundred_card_review_are_explicit_and_resumable(
         ]
         page.locator("details.category-group-more > summary").click()
         page.get_by_text(category_setup_labels[0], exact=True).wait_for()
+        initial_categories = page.locator(".category-groups").element_handle()
+        assert initial_categories is not None
+        page.get_by_label("Search by category name or code").fill("Synthetic")
+        page.get_by_role("button", name="Search", exact=True).click()
+        # These labels also exist before Search replaces the category list.
+        page.wait_for_function(
+            "categories => !categories.isConnected", arg=initial_categories
+        )
+        page.get_by_text(category_setup_labels[0], exact=True).wait_for()
+        assert page.locator('.suggestion-list input:checked').count() == 0
+        assert application.submissions == []
         category_rows = page.locator(".suggestion-list label")
         first_category = category_rows.filter(
             has_text=category_setup_labels[0]
@@ -200,90 +207,6 @@ def test_release_setup_and_two_hundred_card_review_are_explicit_and_resumable(
         assert coverage_box is not None
         assert coverage_box["width"] <= 320, coverage_box
         _continue(page)
-        page.get_by_role("button", name="Generate corpus").click()
-        page.get_by_text("Corpus ready", exact=True).wait_for()
-        page.get_by_role(
-            "button", name="Use this corpus and continue", exact=True
-        ).click()
-
-        page.get_by_text(
-            f"{category_labels[0]} candidate 01", exact=True
-        ).wait_for()
-        guidance_box = page.locator(".step-guidance").bounding_box()
-        assert guidance_box is not None
-        assert guidance_box["width"] <= 800, guidance_box
-        search_box = page.get_by_label(
-            "Search by title, author, or arXiv ID"
-        ).bounding_box()
-        search_button_box = page.get_by_role(
-            "button", name="Search"
-        ).bounding_box()
-        assert search_box is not None
-        assert search_button_box is not None
-        assert (
-            search_button_box["x"]
-            >= search_box["x"] + search_box["width"] + 8
-        ), (search_box, search_button_box)
-        suggestion_rows = page.locator(".suggestion-list label")
-        assert suggestion_rows.count() == int(raw["visible_count"]) == 30
-        assert page.locator(".suggestion-list .katex").count() == 1
-        row_boxes = suggestion_rows.evaluate_all(
-            """rows => rows.map((row) => {
-                const box = row.getBoundingClientRect();
-                return {top: box.top, bottom: box.bottom};
-            })"""
-        )
-        assert all(
-            row_boxes[index]["top"] >= row_boxes[index - 1]["bottom"] + 4
-            for index in range(1, len(row_boxes))
-        ), row_boxes
-        for label in category_labels:
-            assert suggestion_rows.filter(has_text=label).count() == 10
-        selected_row = suggestion_rows.nth(1)
-        assert selected_row.locator(".katex").count() == 1
-        selected_checkbox = selected_row.locator('input[type="checkbox"]')
-        selected_checkbox.focus()
-        selected_checkbox.press("Space")
-        assert selected_checkbox.is_checked()
-        assert selected_checkbox.evaluate(
-            "checkbox => document.activeElement === checkbox"
-        )
-        add_custom_button = page.get_by_role(
-            "button", name="Add custom paper id"
-        )
-        add_custom_box = add_custom_button.bounding_box()
-        continue_box = page.get_by_role(
-            "button", name="Continue with selected seed papers", exact=True
-        ).bounding_box()
-        assert add_custom_box is not None
-        assert continue_box is not None
-        assert (
-            continue_box["y"]
-            >= add_custom_box["y"] + add_custom_box["height"] + 8
-        ), (add_custom_box, continue_box)
-        add_custom_button.click()
-        page.locator(".custom-entries input").fill("2608.09999")
-        _continue(page)
-
-        page.get_by_text(str(raw["recurring_keyword"]), exact=True).click()
-        page.get_by_text(str(raw["recurring_phrase"]), exact=True).click()
-        page.get_by_role("button", name="Add custom term").click()
-        page.locator(".custom-entries input").nth(0).fill(
-            str(explicit["custom_keyword"])
-        )
-        page.get_by_role("button", name="Add custom term").click()
-        page.locator(".custom-entries input").nth(1).fill(
-            str(explicit["custom_phrase"])
-        )
-        _continue(page)
-
-        page.get_by_text(str(raw["recurring_author"]), exact=True).click()
-        page.get_by_role("button", name="Add custom author").click()
-        page.locator(".custom-entries input").fill(
-            str(explicit["custom_author"])
-        )
-        _continue(page)
-
         page.get_by_role("button", name="Choose PDF folder").wait_for()
         assert page.get_by_role("button", name="Use Downloads").count() == 0
         assert page.get_by_role("button", name="Use Documents").count() == 0
@@ -315,7 +238,7 @@ def test_release_setup_and_two_hundred_card_review_are_explicit_and_resumable(
 
         assert application.launcher_calls == 0
         assert application.completions == [
-            {"draft_revision": 8, "launcher_choice": "not_now"}
+            {"draft_revision": 4, "launcher_choice": "not_now"}
         ]
         assert [
             payload
@@ -331,39 +254,55 @@ def test_release_setup_and_two_hundred_card_review_are_explicit_and_resumable(
             if payload.get("step") == "categories"
         )
         assert categories_payload["selections"] == raw_categories
-        seed_payload = next(
-            payload
-            for payload in application.submissions
-            if payload.get("step") == "seed_papers"
-        )
-        assert seed_payload == {
-            "revision": 3,
-            "step": "seed_papers",
-            "accepted_suggestion_ids": ["paper_suggestion_2"],
-            "custom_arxiv_ids": ["2608.09999"],
-        }
-        term_payload = next(
-            payload
-            for payload in application.submissions
-            if payload.get("step") == "terms"
-        )
-        assert term_payload["accepted_keyword_suggestion_ids"] == [
-            "keyword_orchard"
+        assert [payload["step"] for payload in application.submissions] == [
+            "categories", "coverage", "pdf_destination", "review",
         ]
-        assert term_payload["accepted_phrase_suggestion_ids"] == [
-            "phrase_spectral_garden"
-        ]
-        assert term_payload["custom_keywords"] == [explicit["custom_keyword"]]
-        assert term_payload["custom_phrases"] == [explicit["custom_phrase"]]
-        author_payload = next(
-            payload
-            for payload in application.submissions
-            if payload.get("step") == "authors"
-        )
-        assert author_payload["accepted_suggestion_ids"] == [
-            "author_crosscategory"
-        ]
-        assert author_payload["custom_authors"] == [explicit["custom_author"]]
+        assert not any("/setup/corpus" in url or "/setup/candidates/" in url for url in requests)
+
+        page.get_by_role("button", name="Interests", exact=True).click()
+        page.get_by_role("heading", name="Interests", exact=True).wait_for()
+        save = page.get_by_role("button", name="Update interests", exact=True)
+        assert save.is_disabled()
+        page.get_by_role("button", name="Refresh suggestions", exact=True).click()
+        page.get_by_text("Suggestions refreshed", exact=False).wait_for()
+        assert save.is_disabled()
+        page.get_by_role("button", name="Add seed paper", exact=True).click()
+        suggestion_rows = page.locator('[data-interest-add="seed_papers"] .interest-suggestion')
+        assert suggestion_rows.count() == int(raw["visible_count"]) == 30
+        assert suggestion_rows.locator('input:checked').count() == 0
+        for label in category_labels:
+            assert suggestion_rows.filter(has_text=label).count() == 10
+        selected_checkbox = suggestion_rows.nth(1).locator('input[type="checkbox"]')
+        selected_checkbox.focus()
+        selected_checkbox.press("Space")
+        assert selected_checkbox.is_checked()
+        assert selected_checkbox.evaluate("checkbox => document.activeElement === checkbox")
+        page.get_by_label("Add custom seed papers", exact=True).fill("2608.09999")
+        page.get_by_role("button", name="Add custom seed paper", exact=True).click()
+
+        page.get_by_role("button", name="Add terms", exact=True).click()
+        page.get_by_text(str(raw["recurring_keyword"]), exact=True).click()
+        page.get_by_text(str(raw["recurring_phrase"]), exact=True).click()
+        page.get_by_label("Add custom term", exact=True).fill(str(explicit["custom_keyword"]))
+        page.get_by_role("button", name="Add custom term", exact=True).click()
+        page.get_by_label("Add custom term", exact=True).fill(str(explicit["custom_phrase"]))
+        page.get_by_role("button", name="Add custom term", exact=True).click()
+        page.get_by_role("button", name="Add author", exact=True).click()
+        page.get_by_text(str(raw["recurring_author"]), exact=True).click()
+        page.get_by_label("Add custom authors", exact=True).fill(str(explicit["custom_author"]))
+        page.get_by_role("button", name="Add custom author", exact=True).click()
+        assert not any(operation == "interests_put" for operation, _ in application.dashboard_calls)
+        save.click()
+        page.get_by_text("Interests updated", exact=False).wait_for()
+        submitted = [payload for operation, payload in application.dashboard_calls if operation == "interests_put"]
+        assert len(submitted) == 1
+        assert submitted[0]["expected_revision"] == 5
+        assert submitted[0]["seed_papers"] == ["2608.41002", "2608.09999"]
+        assert submitted[0]["keywords"] == [raw["recurring_keyword"], explicit["custom_keyword"]]
+        assert submitted[0]["phrases"] == [raw["recurring_phrase"], explicit["custom_phrase"]]
+        assert submitted[0]["authors"] == [raw["recurring_author"], explicit["custom_author"]]
+        assert not any(operation == "library_save" for operation, _ in application.dashboard_calls)
+        page.get_by_role("button", name="Review", exact=True).click()
 
         progress_text = (
             "Checking historical daily lists: 18 of 32 dates checked · "
@@ -387,6 +326,9 @@ def test_release_setup_and_two_hundred_card_review_are_explicit_and_resumable(
         page.get_by_role("button", name="Start review").click()
         page.get_by_role("heading", name="Review 2026-07-31").wait_for()
         assert page.locator("article").count() == 20
+        assert page.locator("article").first.locator(".katex").count() == 1
+        assert page.locator("article script").count() == 0
+        assert "<script>not markup</script>" in page.locator("article").first.inner_text()
         review_text = page.locator("#content").inner_text()
         for forbidden in (
             "Current announcement",
@@ -510,7 +452,7 @@ def test_release_setup_and_two_hundred_card_review_are_explicit_and_resumable(
             {
                 "date": "2026-07-31",
                 "snapshot_revision": 77,
-                "profile_revision": 5,
+                "profile_revision": 6,
                 "projection_revision": 9,
             }
         ]

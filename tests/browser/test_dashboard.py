@@ -37,8 +37,6 @@ HARNESS_HTML = b"""<!doctype html>
       <section id="library"></section>
       <section id="interests"></section>
       <section id="settings"></section>
-      <section id="restore"></section>
-      <button id="inspect-fixture" type="button">Inspect fixture backup</button>
       <div id="fixture-status" role="status" aria-live="polite"></div>
     </main>
     <script src="/vendor/katex/katex.min.js"></script>
@@ -54,8 +52,6 @@ import { renderLibraryView } from "/library_view.mjs";
 import { renderMathText } from "/math_view.mjs";
 import {
   SettingsController,
-  renderRestoreError,
-  renderRestoreInspection,
   renderSettingsView,
 } from "/settings_view.mjs";
 
@@ -233,56 +229,6 @@ function showSettings(pickerChoice = null, pickerDisplayName = null) {
 }
 showSettings();
 
-let restoreOptions = null;
-function showInspection(inspection) {
-  renderRestoreInspection(
-    document,
-    document.querySelector("#restore"),
-    inspection,
-    {
-      confirmDestination: (pendingId, choice) =>
-        controller.reconfirmRestoreDestination(pendingId, choice),
-      pickFolder: async () => {
-        const result = await controller.pickFolder();
-        const choice = result.destination_choice ?? result.picker_result_id;
-        showInspection({
-          ...inspection,
-          picker_choice: choice,
-          picker_display_name: result.display_name ?? null,
-        });
-      },
-      restore: async (pendingId, options) => {
-        restoreOptions = options;
-        try {
-          const result = await controller.restoreBackup(pendingId, options);
-          status.textContent = result.pre_restore_backup_created
-            ? "Restore complete after pre-restore backup"
-            : "Unexpected restore response";
-        } catch (error) {
-          renderRestoreError(
-            document,
-            document.querySelector("#restore"),
-            "Restore failed safely; this session remains usable.",
-            async () => {
-              const result = await controller.restoreBackup(pendingId, restoreOptions);
-              status.textContent = result.pre_restore_backup_created
-                ? "Restore retry complete after pre-restore backup"
-                : "Unexpected restore response";
-            },
-          );
-        }
-      },
-    },
-  );
-}
-
-document.querySelector("#inspect-fixture").addEventListener("click", async () => {
-  const inspection = await controller.inspectBackup(
-    new Blob(["synthetic zip"], { type: "application/zip" }),
-  );
-  showInspection(inspection);
-});
-
 globalThis.dashboardHarnessReady = true;
 status.textContent = "Dashboard fixture ready";
 """.encode()
@@ -322,18 +268,10 @@ class DashboardFixture:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.calls: list[tuple[str, dict[str, object]]] = []
-        self.restore_attempts = 0
 
     def record(self, operation: str, payload: dict[str, object]) -> None:
         with self.lock:
             self.calls.append((operation, dict(payload)))
-
-    def restore(self, payload: dict[str, object]) -> dict[str, object]:
-        self.record("backup_restore", payload)
-        self.restore_attempts += 1
-        if self.restore_attempts == 1:
-            raise ValueError("fixture restore failure")
-        return {"restored": True, "pre_restore_backup_created": True}
 
     def handlers(self) -> dict[str, object]:
         def recorded(operation: str, result: dict[str, object]):
@@ -374,14 +312,6 @@ class DashboardFixture:
                     filename="arxiv-digest-browser-fixture.zip",
                 )
             ),
-            "backup_inspect": recorded(
-                "backup_inspect",
-                {
-                    "pending_restore_id": "pending_restore_123",
-                    "summary": {"categories": 1, "saved_papers": 1},
-                },
-            ),
-            "backup_restore": self.restore,
         }
 
 
@@ -539,10 +469,9 @@ def test_dashboard_views_are_accessible_and_responsive(engine: str, width: int) 
         ) <= 0.01
 
 
-def test_backup_folder_cache_and_failed_restore_keep_the_session_usable() -> None:
-    with running_dashboard() as (server, fixture), browser_page(
-        "chromium"
-    ) as page:
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_backup_export_and_cli_restore_instructions_keep_the_session_usable(engine: str) -> None:
+    with running_dashboard() as (server, fixture), browser_page(engine) as page:
         request_bodies: list[tuple[str, str | None]] = []
         page.on(
             "request",
@@ -610,43 +539,8 @@ def test_backup_folder_cache_and_failed_restore_keep_the_session_usable() -> Non
             {},
         ) in fixture.calls
 
-        page.get_by_role("button", name="Inspect fixture backup").click()
-        page.get_by_role("heading", name="Restore inspection").wait_for()
-        assert page.get_by_text("Inspection made no changes", exact=False).is_visible()
-        assert page.locator("#restore label").filter(
-            has_text="I understand a pre-restore backup"
-        ).is_visible()
-        with page.expect_response(
-            lambda response: response.url.endswith("/settings/folder/pick")
-        ):
-            page.locator("#restore").get_by_role(
-                "button", name="Choose PDF folder"
-            ).click()
-        page.locator("#restore").get_by_text(
-            "Selected folder: Research PDFs", exact=True
-        ).wait_for()
-        page.locator("#restore").get_by_role(
-            "button", name="Use this folder"
-        ).click()
-        page.locator(
-            '#restore input[name="confirm-pre-restore-backup"]'
-        ).check()
-        page.get_by_role("button", name="Restore backup").click()
-        page.get_by_text("this session remains usable", exact=False).wait_for()
-        assert page.locator("#settings").get_by_role(
-            "button", name="Open folder"
-        ).is_enabled()
-        page.get_by_role("button", name="Retry restore").click()
-        page.get_by_text(
-            "Restore retry complete after pre-restore backup", exact=True
-        ).wait_for()
-        assert fixture.restore_attempts == 2
-        assert all(
-            payload["destination_choice"] == "picker_87654321"
-            for operation, payload in fixture.calls
-            if operation == "backup_restore"
-        )
-        assert sum(
-            operation == "settings_folder_pick"
-            for operation, _payload in fixture.calls
-        ) == 2
+        assert page.locator("#settings input[type=file]").count() == 0
+        assert page.get_by_role("button", name="Inspect backup").count() == 0
+        assert page.get_by_text("arxiv-digest import BACKUP.zip", exact=True).is_visible()
+        assert page.get_by_text("choose Quit, wait for the app to stop", exact=False).is_visible()
+        assert page.locator("#settings").get_by_role("button", name="Open folder").is_enabled()

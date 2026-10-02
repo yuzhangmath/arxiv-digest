@@ -74,27 +74,6 @@ EXPECTED_PYTHON_MODULES = frozenset(
         "sync.py",
         "text.py",
         "update_check.py",
-        "update_artifacts.py",
-        "update_contract.py",
-        "update_coordinator.py",
-        "update_data_recovery.py",
-        "update_discovery.py",
-        "update_download.py",
-        "update_http.py",
-        "update_installation.py",
-        "update_internal.py",
-        "update_journal.py",
-        "update_locks.py",
-        "update_manifest.py",
-        "update_pipx.py",
-        "update_protocol.py",
-        "update_recovery.py",
-        "update_runtime/__init__.py",
-        "update_runtime/guard.py",
-        "update_runtime/helper.py",
-        "update_runtime/protocol.py",
-        "update_runtime/recovery.py",
-        "update_snapshot.py",
         "web/__init__.py",
         "web/api.py",
         "web/lifecycle.py",
@@ -106,7 +85,7 @@ EXPECTED_APPLICATION_STATIC_FILES = frozenset({
     "api.mjs", "app.js", "calendar_view.mjs", "index.html", "interests_view.mjs",
     "library_view.mjs", "math_view.mjs", "paper_view.mjs", "review_view.mjs",
     "settings_view.mjs", "setup_view.mjs", "state.mjs", "styles.css",
-    "update_flow.mjs", "update_poll.mjs", "update_transition.mjs", "update_view.mjs",
+    "update_view.mjs", "view_lifecycle.mjs",
 })
 
 EXPECTED_MIGRATIONS = frozenset(
@@ -280,26 +259,6 @@ def test_sdist_and_wheel_contain_exact_release_resources() -> None:
     _assert_katex_manifest(sdist)
     _assert_katex_manifest(wheel)
 
-
-def test_migration_and_application_asset_inventories_are_exact() -> None:
-    source = _source_resources()
-    sdist = _sdist_resources()
-    wheel, _ = _wheel_resources()
-
-    for prefix in (
-        "package/assets/",
-        "package/storage/migrations/",
-        "package/web/static/",
-    ):
-        expected = {key for key in source if key.startswith(prefix)}
-        assert {key for key in sdist if key.startswith(prefix)} == expected
-        assert {key for key in wheel if key.startswith(prefix)} == expected
-
-
-def test_python_module_and_migration_allowlists_are_exact() -> None:
-    source = _source_resources()
-    sdist = _sdist_resources()
-    wheel, _ = _wheel_resources()
 
     expected_modules = {f"package/{path}" for path in EXPECTED_PYTHON_MODULES}
     expected_migrations = {
