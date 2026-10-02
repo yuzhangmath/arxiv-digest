@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from dataclasses import replace
 from datetime import date, datetime, timezone
@@ -980,17 +981,25 @@ def test_restore_preserves_inactive_category_sync_history(
     assert categories == [("cs.SE", "idle"), ("math.LO", "idle")]
 
 
+@pytest.mark.parametrize("delimiter", [
+    "#",
+    "%3F",
+    pytest.param("?", marks=pytest.mark.skipif(
+        sys.platform == "win32", reason="Windows filenames cannot contain '?'",
+    )),
+])
 def test_restore_supports_valid_local_paths_with_uri_delimiters(
-    tmp_path: Path,
+    tmp_path: Path, delimiter: str,
 ) -> None:
     from arxiv_digest.backup import export_backup, inspect_backup, restore_backup
 
-    source = initialized_paths(tmp_path / "source?portable")
+    source = initialized_paths(tmp_path / f"source{delimiter}portable")
     archive = tmp_path / "portable.zip"
     export_backup(source, archive, clock=lambda: NOW)
-    target = empty_paths(tmp_path / "target?restore")
+    target_root = tmp_path / f"target{delimiter}restore"
+    target = empty_paths(target_root)
     target.ensure()
-    confirmed = tmp_path / "target?restore" / "Confirmed PDFs"
+    confirmed = target_root / "Confirmed PDFs"
     confirmed.mkdir()
 
     restore_backup(

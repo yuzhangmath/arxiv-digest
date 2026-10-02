@@ -191,8 +191,10 @@ def _is_private_file(metadata: os.stat_result) -> bool:
 
 
 
-def _file_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
+def _file_snapshot(
+    metadata: os.stat_result, *, include_ctime: bool = True,
+) -> tuple[int, ...]:
+    snapshot = (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_uid,
@@ -200,8 +202,8 @@ def _file_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
     )
+    return snapshot + (metadata.st_ctime_ns,) if include_ctime else snapshot
 
 
 
@@ -235,7 +237,12 @@ def _read_private_descriptor(
         raise InstanceSecurityError("runtime descriptor is not private") from error
     try:
         opened = os.fstat(descriptor)
-        if _file_snapshot(opened) != _file_snapshot(initial):
+        # Windows lstat() and fstat() can report different meanings of ctime
+        # (CPython issue #157671). Compare it only within the same API below.
+        compare_ctime = os.name != "nt"
+        if _file_snapshot(opened, include_ctime=compare_ctime) != _file_snapshot(
+            initial, include_ctime=compare_ctime,
+        ):
             raise InstanceSecurityError("runtime descriptor path changed")
         payload = bytearray()
         while True:
@@ -250,7 +257,7 @@ def _read_private_descriptor(
         current = path.lstat()
         if (
             _file_snapshot(final) != _file_snapshot(opened)
-            or _file_snapshot(current) != _file_snapshot(opened)
+            or _file_snapshot(current) != _file_snapshot(initial)
         ):
             raise InstanceSecurityError("runtime descriptor path changed")
         return _decode_descriptor(bytes(payload))

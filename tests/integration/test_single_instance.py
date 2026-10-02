@@ -79,6 +79,8 @@ def test_second_claim_verifies_private_descriptor_and_returns_existing(tmp_path)
     finally:
         owner.release()
 
+    assert not descriptor_path.exists()
+
 
 
 def test_untrusted_lock_or_runtime_metadata_is_rejected(tmp_path) -> None:

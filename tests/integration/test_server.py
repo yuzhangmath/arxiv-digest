@@ -166,7 +166,8 @@ def test_excess_connections_do_not_spawn_unbounded_request_threads() -> None:
                 },
             )
             response = connection.getresponse()
-            response.read()
+            assert response.status == 200
+            assert json.loads(response.read())["data"]["state"] == "ready"
             connection.close()
         except BaseException as error:  # pragma: no cover - reported below
             first_errors.append(error)
@@ -175,22 +176,21 @@ def test_excess_connections_do_not_spawn_unbounded_request_threads() -> None:
     thread.start()
     try:
         assert first_entered.wait(timeout=1)
-        excess = socket.create_connection((server.host, server.port), timeout=1)
-        excess.settimeout(1)
-        excess.sendall(
-            (
-                "GET /api/v1/status HTTP/1.1\r\n"
-                f"Host: {server.host}:{server.port}\r\n"
-                f"Authorization: Bearer {server.token}\r\n\r\n"
-            ).encode("ascii")
-        )
-
-        try:
-            closed = excess.recv(1)
-        except ConnectionResetError:
-            closed = b""
-        assert closed == b""
-        excess.close()
+        with socket.create_connection((server.host, server.port), timeout=1) as excess:
+            excess.settimeout(1)
+            try:
+                excess.sendall(
+                    (
+                        "GET /api/v1/status HTTP/1.1\r\n"
+                        f"Host: {server.host}:{server.port}\r\n"
+                        f"Authorization: Bearer {server.token}\r\n\r\n"
+                    ).encode("ascii")
+                )
+                closed = excess.recv(1)
+            except (ConnectionResetError, ConnectionAbortedError):
+                # Rejection before reading may report a reset or Windows abort.
+                closed = b""
+            assert closed == b""
     finally:
         release_first.set()
         thread.join(timeout=2)

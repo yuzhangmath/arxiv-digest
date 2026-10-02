@@ -225,6 +225,10 @@ def test_proxy_selection_uses_urllib_without_credentials_in_arguments(fake_curl,
     captured = json.loads(capture.read_text())
     assert all("synthetic-secret" not in arg for arg in captured["args"])
     if bypass:
-        assert captured["proxy_env"] == {"no_proxy": "*"}
+        expected_environment = {"no_proxy": "*"}
     else:
-        assert captured["proxy_env"] == {"https_proxy": proxy, "no_proxy": ""}
+        expected_environment = {"https_proxy": proxy, "no_proxy": ""}
+    if sys.platform == "win32":
+        # Python exposes child-process environment keys in uppercase on Windows.
+        expected_environment = {key.upper(): value for key, value in expected_environment.items()}
+    assert captured["proxy_env"] == expected_environment

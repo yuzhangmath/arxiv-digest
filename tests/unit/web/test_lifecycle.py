@@ -1,10 +1,91 @@
 from __future__ import annotations
 
+import json
+import stat
 import threading
 import sys
 from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.fixture
+def windows_descriptor_read(monkeypatch):
+    from arxiv_digest.web import lifecycle
+
+    payload = json.dumps({
+        "pid": 1234, "port": 43123, "startup_nonce": "nonce_abcd12345678",
+        "token": "A" * 43, "started_at": "2026-01-01T00:00:00Z",
+    }).encode()
+    metadata = {
+        "st_dev": 1, "st_ino": 2, "st_uid": 0,
+        "st_mode": stat.S_IFREG | 0o600, "st_nlink": 1,
+        "st_size": len(payload), "st_mtime_ns": 150,
+        "st_ctime_ns": 100, "st_file_attributes": 0,
+    }
+    initial = SimpleNamespace(**metadata)
+    current = SimpleNamespace(**metadata)
+    # Windows Python 3.14 reports creation time through lstat(), but change
+    # time through fstat(), even when both refer to the same unchanged file.
+    metadata["st_ctime_ns"] = 200
+    opened = SimpleNamespace(**metadata)
+    final = SimpleNamespace(**metadata)
+    path_stats = iter([initial, current])
+    handle_stats = iter([opened, final])
+    chunks = iter([payload, b""])
+    closed = []
+    validated = []
+    path = SimpleNamespace(lstat=lambda: next(path_stats))
+    monkeypatch.setattr(lifecycle, "os", SimpleNamespace(
+        name="nt", fstat=lambda fd: next(handle_stats),
+        read=lambda fd, count: next(chunks), close=closed.append,
+    ))
+    monkeypatch.setattr(lifecycle, "open_private_read_file", lambda actual: 42)
+    monkeypatch.setattr(lifecycle, "validate_private_file", validated.append)
+    return SimpleNamespace(
+        path=path, initial=initial, opened=opened, final=final, current=current,
+        closed=closed, validated=validated,
+    )
+
+
+def test_windows_runtime_descriptor_accepts_different_stat_ctime_semantics(
+    windows_descriptor_read,
+):
+    from arxiv_digest.web import lifecycle
+
+    state = windows_descriptor_read
+    descriptor = lifecycle._read_private_descriptor(
+        state.path, expected_identity=(1, 2),
+    )
+
+    assert descriptor.port == 43123
+    assert descriptor.startup_nonce == "nonce_abcd12345678"
+    assert state.validated == [42]
+    assert state.closed == [42]
+
+
+@pytest.mark.parametrize("snapshot, field", [
+    ("opened", "st_ino"),
+    ("final", "st_ctime_ns"),
+    ("final", "st_mtime_ns"),
+    ("current", "st_ctime_ns"),
+    ("current", "st_ino"),
+])
+def test_windows_runtime_descriptor_rejects_changed_file_metadata(
+    windows_descriptor_read, snapshot, field,
+):
+    from arxiv_digest.web import lifecycle
+
+    state = windows_descriptor_read
+    metadata = getattr(state, snapshot)
+    setattr(metadata, field, getattr(metadata, field) + 1)
+
+    with pytest.raises(lifecycle.InstanceSecurityError, match="path changed"):
+        lifecycle._read_private_descriptor(state.path, expected_identity=(1, 2))
+
+    if snapshot != "opened":
+        assert state.validated == [42]
+    assert state.closed == [42]
 
 
 @pytest.mark.parametrize("wait_result, expected", [(258, True), (0, False)])
