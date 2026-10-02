@@ -152,7 +152,7 @@ def _repair_private_acl(handle, *, directory: bool) -> None:
     # Elevated tokens can create Python files/directories owned by the
     # Administrators group. Repair only this process token's default owner;
     # strict validation never changes ownership or accepts this alternative.
-    flags = win32con.FILE_FLAG_OPEN_REPARSE_POINT
+    flags = win32file.FILE_FLAG_OPEN_REPARSE_POINT
     if directory:
         flags |= win32con.FILE_FLAG_BACKUP_SEMANTICS
     ownership_handle = win32file.ReOpenFile(
@@ -182,7 +182,7 @@ def _open(path: Path, *, directory: bool, create: bool = False, writable: bool =
         str(path), access, win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE,
         _security_attributes(directory=directory) if create else None,
         win32con.OPEN_ALWAYS if create else win32con.OPEN_EXISTING,
-        win32con.FILE_FLAG_OPEN_REPARSE_POINT | win32con.FILE_FLAG_BACKUP_SEMANTICS,
+        win32file.FILE_FLAG_OPEN_REPARSE_POINT | win32con.FILE_FLAG_BACKUP_SEMANTICS,
         None,
     )
 
@@ -266,7 +266,7 @@ def set_private_file_permissions(descriptor: int) -> None:
     handle = win32file.ReOpenFile(
         msvcrt.get_osfhandle(descriptor), win32con.READ_CONTROL | win32con.WRITE_DAC,
         win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE,
-        win32con.FILE_FLAG_OPEN_REPARSE_POINT,
+        win32file.FILE_FLAG_OPEN_REPARSE_POINT,
     )
     try:
         _repair_private_acl(handle, directory=False)

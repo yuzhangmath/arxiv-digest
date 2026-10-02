@@ -2173,17 +2173,28 @@ def test_finishing_date_wins_over_inflight_terminal_sync_refresh() -> None:
             application.review_finish_gate.set()
 
 
-def test_review_polling_retries_after_a_transient_status_failure() -> None:
-    with running_fixture() as (server, application), browser_page("chromium") as page:
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_review_polling_retries_after_a_transient_status_failure(engine: str) -> None:
+    with running_fixture() as (server, application), browser_page(engine) as page:
         application.sync_running = True
         application.review_ready = True
 
         page.goto(server.launch_url("review"))
         page.get_by_role("button", name="Start review", exact=True).wait_for()
-        with application.lock:
-            application.sync_status_failures = 1
+        with page.expect_response(
+            lambda response: response.url.endswith("/api/v1/status")
+            and response.status == 500,
+            timeout=5_000,
+        ):
+            with application.lock:
+                application.sync_status_failures = 1
 
-        page.wait_for_timeout(2_700)
+        with page.expect_response(
+            lambda response: response.url.endswith("/api/v1/status")
+            and response.status == 200,
+            timeout=5_000,
+        ):
+            pass
 
         assert application.sync_status_requests >= 3
         page.get_by_role("button", name="Start review", exact=True).wait_for()
